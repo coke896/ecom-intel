@@ -1,0 +1,24 @@
+# 换行符统一为 LF。
+#
+# 为什么需要这个文件：
+#   本项目在 Windows 上开发，但 git 默认会把文本文件在工作区转成 CRLF。
+#   不加这个文件的话，将来在 Linux/macOS 上 clone 下来，
+#   每个文件都会显示成"整个文件被改动"——因为换行符全变了。
+#   那种 diff 没法 review，也会掩盖真正的改动。
+#
+# ★ 对 Python 项目尤其重要：源码里有 f-string 和正则表达式，
+#   换行符混进来会影响正则的 `$` 锚点匹配（$ 在 CRLF 下会匹配到 \r 之前）。
+* text=auto eol=lf
+
+# 二进制文件明确标记，避免 git 试图"合并"它们
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.xlsx binary
+*.db binary
+
+# Windows 批处理必须是 CRLF，否则 cmd.exe 解析会出问题
+*.bat text eol=crlf
+*.cmd text eol=crlf

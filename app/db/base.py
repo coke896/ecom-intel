@@ -1,0 +1,143 @@
+"""数据库基础设施：engine、PRAGMA、会话工厂、时间约定。
+
+这个文件里的每一行几乎都对应一个踩过的坑，注释比代码重要。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import datetime, timezone
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from app.config import settings
+
+
+class Base(DeclarativeBase):
+    """所有 ORM 模型的基类。
+
+    用 SQLAlchemy 2.0 的 DeclarativeBase 风格（而不是 1.x 的 declarative_base()）。
+    配套的是 Mapped[] + mapped_column() 的类型化写法——
+    好处是 mypy / IDE 能真正推断出字段类型，写错属性名当场报错。
+    """
+
+
+# ---------------------------------------------------------------------------
+# engine
+# ---------------------------------------------------------------------------
+
+engine = create_engine(
+    settings.database_url,
+    echo=False,
+    # check_same_thread=False：
+    #   SQLite 默认禁止跨线程复用连接。FastAPI 的同步依赖（get_db）可能在线程池
+    #   的不同线程里执行，所以必须关掉这个检查。真正的并发安全由
+    #   WAL + busy_timeout 保证（见下面的 PRAGMA），而不是靠这个开关。
+    #
+    # timeout=30：
+    #   拿到连接后等待写锁的最长时间（秒）。和下面的 busy_timeout 是两层保险。
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
+    """每建立一条新的物理连接，就设置一遍 PRAGMA。
+
+    ★ 两个容易踩的点：
+
+    坑 1：监听器必须挂在 **engine 实例** 上，不能挂 Engine 类。
+        写成 @event.listens_for(Engine, "connect") 会波及同一进程里
+        所有 SQLAlchemy 引擎——包括测试用的内存库、以及任何第三方库
+        自己创建的引擎。症状是测试里出现莫名其妙的 WAL 文件，
+        或者别人的连接被塞进了我们的 PRAGMA。这是社区反复出现的 bug。
+
+    坑 2：必须在建立任何连接 **之前** 注册。
+        connect 事件只在新建物理连接时触发；如果 engine 已经连过数据库，
+        后续的连接走的是连接池，不会再触发这个回调。
+        所以这段代码放在模块顶层、紧跟 engine 定义之后。
+    """
+    cur = dbapi_connection.cursor()
+
+    # WAL（Write-Ahead Logging）：读写互不阻塞。
+    # 默认的 DELETE 模式下，一个写事务会锁住整个库，读请求全部排队。
+    # 本项目有「worker 持续写入 + Web 端持续查询」的并发场景，必须开 WAL。
+    cur.execute("PRAGMA journal_mode=WAL")
+
+    # WAL 模式下的安全/性能平衡点。
+    # FULL 每次提交都 fsync（慢）；OFF 可能丢数据；NORMAL 在 WAL 下
+    # 只在 checkpoint 时 fsync，崩溃最多丢最近几个事务，
+    # 对"采集到的商品数据"这个量级的损失完全可以接受。
+    cur.execute("PRAGMA synchronous=NORMAL")
+
+    # ★ SQLite 默认 **不校验外键**！这是个历史遗留的兼容性决定。
+    #   不显式打开的话，REFERENCES 只是注释——插入一个指向不存在商品的
+    #   price_history 会静默成功。必须打开。
+    cur.execute("PRAGMA foreign_keys=ON")
+
+    # 等锁超时（毫秒）。两个进程同时写时，后到的会等而不是立刻
+    # 抛 "database is locked"。30 秒足够覆盖本项目最长的批量写入。
+    cur.execute("PRAGMA busy_timeout=30000")
+
+    cur.close()
+
+
+# ---------------------------------------------------------------------------
+# 会话工厂
+# ---------------------------------------------------------------------------
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    # autoflush=False：
+    #   默认行为是「每次查询前先把待写入的对象 flush 到数据库」。
+    #   在多线程/异步混杂的场景里，这会在你意想不到的时刻触发 UPDATE，
+    #   产生难以复现的竞态。我们显式控制 flush 时机。
+    autoflush=False,
+    # expire_on_commit=False：
+    #   默认行为是「commit 后让所有对象属性过期」，下次访问时重新查库。
+    #   在 FastAPI 里表现为：把 ORM 对象转成响应 JSON 时触发额外查询，
+    #   如果会话已经关闭，直接抛 DetachedInstanceError。
+    #   关掉它，commit 后对象仍然可用。
+    expire_on_commit=False,
+)
+
+
+def get_db() -> Iterator[Session]:
+    """FastAPI 依赖注入：每个请求一个会话，请求结束自动关闭。
+
+    写成生成器而不是返回 Session，是为了让 FastAPI 能在请求结束时
+    执行 finally 里的 close()——包括请求抛异常的情况。
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# 时间约定
+# ---------------------------------------------------------------------------
+
+
+def utcnow() -> datetime:
+    """全库统一的时间函数：不带时区的 UTC。
+
+    ★ 为什么去掉 tzinfo：
+      SQLite 没有原生的日期类型，SQLAlchemy 把 DateTime 存成
+      "YYYY-MM-DD HH:MM:SS.ffffff" 字符串。这个格式有个很好的性质——
+      字典序 == 时间序，所以 ORDER BY 和 BETWEEN 都是对的。
+
+      但如果存的是带时区的 datetime，字符串会变成
+      "2026-09-28 05:32:11.123456+00:00"，多出的 "+00:00" 后缀
+      会让字典序和时间序脱钩：比较 "2026-09-28 12:00:00+00:00"
+      和 "2026-09-28 13:00:00" 时，前者反而更小。
+      结果就是 ORDER BY 在跨时区数据上悄悄排错。
+
+      所以：**入库一律不带时区的 UTC，展示时在前端转本地时区。**
+      这个约定必须全项目一致，混用会出上面那种隐蔽 bug。
+
+    命名成 utcnow 而不是 now，是为了让调用处一眼看出拿到的是 UTC 而非本地时间。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
