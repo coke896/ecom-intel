@@ -42,7 +42,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from app.db.models import PriceHistory, Product
+from app.db.base import utcnow
+from app.db.models import PriceHistory, Product, Shop
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,9 @@ class ProductRow:
     sales: int | None = None
     shop_id: int | None = None
     last_crawled_at: datetime | None = None
+    # 灰色地带标记：这条疑似是某个已有商品的重复（归并判定给的是 MARK）。
+    # ★ 只在【插入】时写入，不在冲突更新时刷新——见 _UPSERT_UPDATE_COLS 注释。
+    suspected_duplicate_of: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +98,12 @@ class PricePoint:
 #     这些是"归并判断的输入"。同一篇爆料第二次采集时它们不会变；
 #     而如果变了（源站改了标题），悄悄改掉会让已经做的归并决定失去依据。
 #     真出现这种情况应该走人工确认，不是自动覆盖。
+#
+#   为什么不更新 suspected_duplicate_of：
+#     这个字段是给【人工】用的待办标记。人去核对之后会把它清成 NULL
+#     （"我看过了，不是重复"），而重新采集时如果又把它写回去，
+#     人的工作就被自动覆盖了——清理过的待办会一次次复活。
+#     ★ 所以它是"只在插入时写一次"的字段。
 #
 #   last_crawled_at 是这里最重要的一个：
 #     它承担"这个商品还活着吗"的判断，必须每次采集都刷新。
@@ -121,7 +131,17 @@ def upsert_product(db: Session, row: ProductRow) -> int:
         "price_max": row.price_max,
         "sales": row.sales,
         "shop_id": row.shop_id,
-        "last_crawled_at": row.last_crawled_at,
+        # ★ 这一列的模型定义是 `nullable=False, default=utcnow`，
+        #   但**那个 Python 端默认值永远不会触发**——因为它只在列
+        #   不出现在 INSERT 里时才生效，而这里总是显式传进去。
+        #   于是 ProductRow 的 last_crawled_at 留空（默认 None）时，
+        #   报错是一句 NOT NULL constraint failed: products.last_crawled_at，
+        #   而不是任何跟"你没填 last_crawled_at"有关的话。
+        #
+        #   在这里兜底成 utcnow()，让 dataclass 上 `= None` 这个默认值
+        #   在语义上是诚实的：不填 = "就是现在采集的"。
+        "last_crawled_at": row.last_crawled_at or utcnow(),
+        "suspected_duplicate_of": row.suspected_duplicate_of,
     }
 
     stmt = (
@@ -163,6 +183,42 @@ def find_product_id(db: Session, source: str, source_id: str) -> int | None:
     return db.execute(
         select(Product.id).where(Product.source == source, Product.source_id == source_id)
     ).scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# shops：有名字就 resolve-or-create
+# ---------------------------------------------------------------------------
+
+
+def ensure_shop(db: Session, platform: str, name: str) -> int:
+    """按 (平台, 店名) 找店铺，没有就建一个。返回 shop_id。
+
+    ★ 为什么要"查一遍再建"而不是无条件 insert：
+      shops 有 (platform, name) 唯一约束，无条件插入第二次就撞约束。
+      改用 `INSERT ... ON CONFLICT DO NOTHING` + 回查也能做，
+      但这里读一次就够（店铺总量是几十个量级），没必要上 upsert。
+
+    ★ platform 是必填的，尽管模型上这一列可空。
+      因为 SQLite（以及 SQL 标准）把多个 NULL 视为互不相同——
+      `(NULL, "京东自营")` 能重复插进去好几行，
+      唯一约束在这个组合上**形同虚设**。要求调用方给平台，
+      这个坑就不会被踩到。
+    """
+    if not platform:
+        raise ValueError("ensure_shop 需要 platform：唯一约束在 platform 为 NULL 时失效")
+
+    existing = db.execute(
+        select(Shop.id).where(Shop.platform == platform, Shop.name == name)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return int(existing)
+
+    shop = Shop(name=name, platform=platform)
+    db.add(shop)
+    # ★ flush 而不是 commit：这里要的是自增 id，不是提交事务。
+    #   提交时机由调用方决定（采集任务整批一个事务）。
+    db.flush()
+    return int(shop.id)
 
 
 # ---------------------------------------------------------------------------

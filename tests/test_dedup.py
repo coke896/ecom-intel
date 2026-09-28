@@ -30,6 +30,7 @@ from scraper.dedup import (
     build_signature,
     containment,
     decide,
+    display_brand,
     extract_brand,
     extract_model_tokens,
     models_compatible,
@@ -220,7 +221,7 @@ def test_brands_compatible_matches_any_alias() -> None:
 
 
 @pytest.mark.parametrize(
-    ("title", "expected"),
+    ("brand_field", "expected"),
     [
         ("HLA/海澜之家", "hla|海澜之家"),
         ("华为", "华为"),
@@ -229,8 +230,92 @@ def test_brands_compatible_matches_any_alias() -> None:
         ("  ", None),
     ],
 )
-def test_extract_brand(title: str | None, expected: str | None) -> None:
-    assert extract_brand("", title) == expected
+def test_extract_brand(brand_field: str | None, expected: str | None) -> None:
+    """★ 参数名从 `title` 改成了 `brand_field`。
+
+    改的不是个名字——原来叫 title 是因为早期有个"从标题猜品牌"的方案，
+    那个方案已经被否决了（猜错会同时污染硬门槛和品牌分析）。
+    参数名留着 title，读代码的人会以为这里会去看标题。
+    """
+    assert extract_brand(brand_field) == expected
+
+
+# ---------------------------------------------------------------------------
+# 品牌的双形态：库里存显示形态，比对时现算规范形态
+#
+# ★ 这一节是后补的，来源是一次真实的不一致：
+#   products.brand 这一列同时存在过两种格式（"Soundcore/声阔" 和
+#   "soundcore|声阔"），取决于数据是从 seed 直写还是从采集管道进来的。
+#   后果是同一品牌的商品在硬门槛上永远匹配不上，而**归并失败不报错**。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "canonical",
+    ["soundcore|声阔", "skechers|斯凯奇", "huawei|华为", "华为"],
+)
+def test_extract_brand_is_idempotent(canonical: str) -> None:
+    """★ 幂等：喂规范形态进去，出来的还是它自己。
+
+    这条性质让调用方**不必知道**手上的字符串是哪种形态——
+    采集管道拿的是源站原文，`load_existing` 拿的是库里的显示形态，
+    两边都直接喂进来就对。
+
+    少一个"这个字段现在是什么格式"的隐式约定，
+    就少一整类只在某个入口才出现的 bug。而这类 bug 的特点正是
+    "只有一个入口坏掉"，最难复现。
+
+    ★ 实现上它靠的是：规范形态里没有 "/"，所以按 "/" 拆只得到一段，
+      排序后拼回来还是它自己。这不是巧合，是这个格式被选中的理由之一。
+    """
+    assert extract_brand(canonical) == canonical
+
+
+def test_extract_brand_round_trips_from_display_form() -> None:
+    """显示形态 → 规范形态，两种入口得到同一个结果。
+
+    左边是 seed.py 写的，右边是源站字段，指向同一家品牌。
+    """
+    assert extract_brand("Soundcore/声阔") == extract_brand("soundcore|声阔")
+    # 英文名和中文名的先后顺序不影响结果（实现里做了排序）
+    assert extract_brand("斯凯奇/SKECHERS") == extract_brand("SKECHERS/斯凯奇")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("SKECHERS/斯凯奇", "SKECHERS/斯凯奇"),   # 大小写、斜杠都保留
+        ("  Soundcore/声阔  ", "Soundcore/声阔"),  # 首尾空白压掉
+        ("Soundcore / 声阔", "Soundcore / 声阔"),  # ★ 中间空白**不**动
+        ("", None),
+        (None, None),
+        ("   ", None),
+    ],
+)
+def test_display_brand(raw: str | None, expected: str | None) -> None:
+    """显示形态只做一件事：去首尾空白。**不做**小写、不换分隔符。
+
+    ★ "中间空白不动"是有意为之，它守的是"这个函数的职责边界"。
+      显示形态是给人看的，任何超出"去首尾空白"的改写都会让界面
+      显示出一个源站从没写过的品牌名。
+      归一化是 extract_brand 的活，两者各管各的。
+    """
+    assert display_brand(raw) == expected
+
+
+def test_display_brand_is_idempotent() -> None:
+    """★ 幂等：显示形态喂进去，出来的还是它自己。
+
+    这条性质和 extract_brand 的幂等一样重要，但理由不同：
+    `ingest` 里会对**已经洗过一次**的值再调一次（clean_deal 洗、
+    写库前又洗），不幂等的话品牌名会被反复加工。
+
+    实测会出问题的是全角/半角转换——`normalize_width` 若不幂等，
+    连跑两次会把已经转好的字符再转一遍。
+    """
+    for raw in ["SKECHERS/斯凯奇", "Soundcore/声阔", "华为", "ＨＬＡ"]:
+        once = display_brand(raw)
+        assert display_brand(once) == once, f"{raw!r} 洗两次和洗一次不一样"
 
 
 def test_models_compatible_requires_exact_equality() -> None:

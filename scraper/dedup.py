@@ -182,15 +182,56 @@ def extract_model_tokens(norm_title: str) -> frozenset[str]:
     return frozenset(result)
 
 
-def extract_brand(norm_title: str, brand_field: str | None = None) -> str | None:
-    """确定品牌。
+def display_brand(brand_field: str | None) -> str | None:
+    """品牌的**显示形态** —— 原样保留源站的写法。
 
-    优先用源站给的品牌字段（SMZDM 的 onclick 里有 'brand':'HLA/海澜之家'）。
+    这个函数存在的理由是一次真实的不一致：`products.brand` 这一列
+    曾经有两种格式，取决于数据从哪个入口进来。
+
+        seed.py 直写   →  "Soundcore/声阔"     （双语、保留大小写，给人看的）
+        采集管道写入   →  "soundcore|声阔"     （小写、已排序、给机器比的）
+
+    后果不只是"显示不一样"。`brands_compatible()` 靠 "|" 拆分品牌的两段，
+    而 `"Soundcore/声阔"` 里没有 "|"，会被当成**一个整体**去比——
+    于是同一品牌的 Mock 商品和真实商品在硬门槛上**永远匹配不上**，
+    而这种失败是静默的：归并只是"没合并"，不报错。
+
+    修法是把这两件事彻底分开（和 token 的处理方式完全一样）：
+
+        库里存什么   →  显示形态（这个函数），给人看、给界面用
+        比对时用什么 →  规范形态（extract_brand），现算，从不落库
+
+    这样两种入口写进去的都是同一回事，比对也永远一致。
+    """
+    if not brand_field:
+        return None
+    b = RE_WS.sub(" ", normalize_width(str(brand_field))).strip()
+    return b or None
+
+
+def extract_brand(brand_field: str | None) -> str | None:
+    """确定品牌的**规范形态** —— 比对用。
+
+    只用源站给的品牌字段（SMZDM 的 onclick 里有 'brand':'HLA/海澜之家'）。
     ★ 不从标题里猜品牌——计划里明确否决了这条路：
       猜错了会同时污染硬门槛和品牌分析，而且测试用例根本构造不出来。
 
+    ★ 这个函数以前有一个 `norm_title` 参数，但函数体里**从来没读过它**。
+      那是早期"从标题猜品牌"方案的残留。删掉它，是因为一个用不到的参数
+      会让读代码的人以为这里会看标题——而"品牌只来自源站字段"
+      恰恰是硬门槛能被信任的前提。签名里不该有任何暗示相反行为的痕迹。
+
     源站品牌格式是 "HLA/海澜之家"（英文名/中文名），
     归一化成小写并取两段，便于和标题里的写法对应。
+
+    ★ 这个函数是**幂等**的：喂规范形态进去，出来的还是它自己。
+        "Soundcore/声阔"  → "soundcore|声阔"
+        "soundcore|声阔"  → "soundcore|声阔"   （已经是规范形态）
+
+      幂等很重要，因为它让调用方不必知道手上的字符串是哪种形态——
+      采集管道拿的是源站原文，`load_existing` 拿的是库里的显示形态，
+      两边都直接喂进来就对。少一个"这个字段现在是什么格式"的隐式约定，
+      就少一整类只在某个入口才出现的 bug。
     """
     if not brand_field:
         return None
@@ -314,6 +355,9 @@ class ExistingProduct:
     brand: str | None
     model_tokens: frozenset[str]
     tokens: frozenset[str]
+    # ★ 源站 id。**唯一的作用是让 decide() 能认出自比对**（见下面的守卫）。
+    #   默认 None 是为了兼容不关心这条的调用方与测试。
+    source_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,7 +390,7 @@ def decide(candidate: Candidate, existing: list[ExistingProduct]) -> MergeResult
       趋势图和商品列表对不上——而且这种不一致很难被察觉。
     """
     norm, model_toks, toks = build_signature(candidate)
-    cand_brand = extract_brand(norm, candidate.brand_field)
+    cand_brand = extract_brand(candidate.brand_field)
 
     # 两个"待人工核对"候选，优先级不同：
     #   near_miss —— 硬门槛过了但相似度差一点（差 0.75 一点点）
@@ -357,6 +401,23 @@ def decide(candidate: Candidate, existing: list[ExistingProduct]) -> MergeResult
     conflict: tuple[float, int] | None = None
 
     for prod in existing:
+        # ---- 第 0 层：不能跟自己比对 ----
+        # ★ 这条防线在写测试时才被发现是必需的。
+        #
+        #   池子里装的是"库里已有的商品"，而**这条爆料自己可能就在里面**
+        #   （第二轮采集同一篇爆料时会是这样）。不排除的话，
+        #   候选跟它自己比对：品牌相同、型号 token 相同、包含度 1.0
+        #   → 判定 MERGE，归并到它自己。
+        #
+        #   数据上无害（价格没变、价格点被唯一约束挡掉），
+        #   **所以它完全静默** —— 只是采集报告会变成"新商品 0，归并 100"，
+        #   而这恰好是阶段 4 验收要看的那份报告。
+        #
+        #   主防线在 scraper/ingest.py（那条路径压根不会把已有主的爆料送进来），
+        #   这里是纵深防御：decide() 是公开函数，任何调用方都不该踩这个坑。
+        if prod.source_id is not None and prod.source_id == candidate.source_id:
+            continue
+
         # ---- 第一层：确定性规则，负责排除 ----
         if not brands_compatible(cand_brand, prod.brand):
             continue

@@ -152,6 +152,35 @@ def get_db() -> Iterator[Session]:
 # ---------------------------------------------------------------------------
 
 
+def init_database() -> None:
+    """确保运行时目录存在并建表（幂等）。
+
+    ★ 这个函数放在 db 层而不是 app/main.py 里，是因为**采集 worker 也要用**。
+
+      它原来长在 main.py 里，而 main.py 是 FastAPI 应用的入口——
+      `python -m scraper.worker` 要是为了建表去 import 它，
+      就会把 FastAPI、全部 APIRouter、CORS 中间件一起拖进采集进程。
+      那正好和"采集层独立于 Web 层"的设计相反，而且很难被发现：
+      程序照样能跑，只是采集进程莫名其妙地加载了半个 Web 框架。
+
+    ★ `import app.db.models` 必须是【函数内】的延迟导入。
+      因为 models.py 要 `from app.db.base import Base`，
+      在 base.py 顶层反过来 import 它就是一个循环导入。
+      延迟到调用时再导，循环自然解开。
+
+    ★ 这一行不能删，也不能挪。表的定义写在 app/db/models.py，
+      它是**通过被导入**才把表注册到 Base.metadata 上的；
+      没人导入它，create_all() 就是个空操作，
+      然后在第一条 INSERT 时报 "no such table: price_history"。
+      同一个陷阱在 tests/conftest.py 里也记了一笔——
+      那次的表现更刁钻："单独跑某个测试文件才失败"。
+    """
+    import app.db.models  # noqa: F401  （导入即注册，见上面的说明）
+
+    settings.ensure_dirs()
+    Base.metadata.create_all(engine)
+
+
 def utcnow() -> datetime:
     """全库统一的时间函数：不带时区的 UTC。
 

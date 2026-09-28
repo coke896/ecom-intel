@@ -566,21 +566,50 @@ def gen_price_series(
     return prices
 
 
-def build_products(
-    rng: np.random.Generator, n: int, days: int
-) -> list[dict]:
-    """生成 n 个商品的完整数据（含 90 天价格序列）。
+# ★ 标题去重的最大重抽次数。
+#
+#   池子实测约 4000 个不同标题（40 个种子 × 2000 条累计数出来的），
+#   所以 count=1000 时重抽几次就够。取 200 是给"池子快用完"的情况留足余量，
+#   同时又能在真的抽不出来时快速失败——而不是无限循环挂在那里。
+_MAX_TITLE_RETRIES = 200
 
-    返回的是纯 dict 列表而不是 ORM 对象——
-    因为要一次插入上万行，ORM 对象的实例化开销在这个量级上是浪费。
+
+def _pick_title(
+    rng: np.random.Generator, seen: set[str]
+) -> tuple[str, str, str, str]:
+    """抽一个**没出现过**的标题，返回 (品类, 品牌中文, 品牌英文, 标题)。
+
+    ============================================================================
+    ★ 为什么必须保证唯一：一个藏了三个阶段的缺陷
+    ============================================================================
+    原来的写法是每次独立抽「模板 + 标题片段 + 颜色」，等价于**有放回采样**。
+    后果实测：
+
+        count=100    → 只有 87 个不同标题
+        count=1000   → 只有 583 个不同标题（最多的一个重复了 19 次）
+
+    也就是说"1000 个商品"里 **42% 是重名商品**。
+
+    这个缺陷之所以能藏这么久，是因为**从来没有任何东西拿归并逻辑跑过 Mock 数据**：
+      · 图表不在乎（它只是把 1000 行画出来）
+      · seed 的直写路径不做比对（直接 insert）
+      · 分布断言看的是价格和销量，不看标题
+
+    直到 `scraper/sources/mock.py` 把 Mock 数据送进采集管道，
+    归并逻辑第一次看到这批数据，100 条里立刻合并掉 36 条——
+    "1000 个商品"被静默压成 600 个左右。
+
+    ★ 一个有 42% 重名的商品目录本身就是不真实的数据。
+      真实电商里同名的两条商品记录会被当成同一个商品，
+      所以"生成器保证标题唯一"不是为了让测试好看，
+      而是让这批数据**符合它自己要模拟的那个对象**。
+
+    ★ 重抽会改变随机数流，所以 `test_seed.py` 里依赖价格序列的
+      分布断言需要重新验证一遍。价格基准和销量是**在循环之前**抽的
+      （sample_base_prices / sample_ranked_sales），不受影响；
+      受影响的只有循环内抽的价格序列和店铺。
     """
-    bases = sample_base_prices(rng, n)
-    sales = sample_ranked_sales(rng, n)
-    now = utcnow()
-    start = now - timedelta(days=days)
-
-    out: list[dict] = []
-    for i in range(n):
+    for _ in range(_MAX_TITLE_RETRIES):
         category, brand_cn, brand_en, titles = PRODUCT_TEMPLATES[
             int(rng.integers(0, len(PRODUCT_TEMPLATES)))
         ]
@@ -590,6 +619,41 @@ def build_products(
         if not any(c in title for c in KNOWN_COLORS):
             title += COLOR_SUFFIXES[int(rng.integers(0, len(COLOR_SUFFIXES)))]
         title = title.strip()
+
+        if title not in seen:
+            seen.add(title)
+            return category, brand_cn, brand_en, title
+
+    # ★ 抽不出来时报错，而不是放弃唯一性让重名混进去。
+    #   静默降级的话，"标题唯一"这条性质就变成了"通常唯一"，
+    #   而依赖它的地方（归并、mock 采集）会在数据量大时才出问题。
+    raise RuntimeError(
+        f"连抽 {_MAX_TITLE_RETRIES} 次都没抽到不重复的标题，"
+        f"已用 {len(seen)} 个。说明请求的数量超过了标题池的大小——"
+        f"要么调小 count，要么给 PRODUCT_TEMPLATES 加更多标题片段。"
+    )
+
+
+def build_products(
+    rng: np.random.Generator, n: int, days: int
+) -> list[dict]:
+    """生成 n 个商品的完整数据（含 90 天价格序列）。
+
+    返回的是纯 dict 列表而不是 ORM 对象——
+    因为要一次插入上万行，ORM 对象的实例化开销在这个量级上是浪费。
+
+    ★ 标题**保证互不重复**（见 _pick_title 里的重抽循环）。
+      这条约束是后补的，加它的原因写在 _pick_title 的文档里。
+    """
+    bases = sample_base_prices(rng, n)
+    sales = sample_ranked_sales(rng, n)
+    now = utcnow()
+    start = now - timedelta(days=days)
+
+    out: list[dict] = []
+    seen_titles: set[str] = set()
+    for i in range(n):
+        category, brand_cn, brand_en, title = _pick_title(rng, seen_titles)
 
         base = float(bases[i])
         series = gen_price_series(rng, base, days)

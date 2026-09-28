@@ -41,24 +41,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.analysis.glm_client import key_configured
-from app.api import analysis, products, stats
+from app.api import analysis, products, stats, tasks
 from app.config import settings
-from app.db.base import Base, engine
+from app.db.base import init_database
 
 # ★ 这一行不能删，也不能挪到函数里。
 #   表的定义写在 app/db/models.py，它是**通过被导入**把表注册到
 #   Base.metadata 上的。没人导入它，create_all() 就是个空操作。
 #   （同一个陷阱在 tests/conftest.py 里也记了一笔——
 #     那次的表现是"单独跑某个测试文件才失败"。）
+#
+# ★ 建表逻辑本身已经搬到 app/db/base.py 的 init_database() 了，
+#   因为采集 worker 也要建表，而它不该为了这个去 import FastAPI 应用入口。
+#   这一行留着是因为 Web 层自己也查询这些表，导入即注册的约束对它同样成立。
 import app.db.models  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-
-def init_database() -> None:
-    """确保目录存在并建表（幂等）。"""
-    settings.ensure_dirs()
-    Base.metadata.create_all(engine)
 
 
 def warm_up() -> None:
@@ -140,6 +138,7 @@ app.add_middleware(
 app.include_router(stats.router)
 app.include_router(products.router)
 app.include_router(analysis.router)
+app.include_router(tasks.router)
 
 
 # ★ 这里**曾经**有一份 `_llm_key_configured()` 的实现，和

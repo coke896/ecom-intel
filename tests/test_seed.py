@@ -88,10 +88,13 @@ from scraper.dedup import normalize_title
 from scraper.seed import (
     BIG_PROMO_DAYS,
     DEFAULT_DAYS,
+    DEFAULT_PRODUCT_COUNT,
+    DEFAULT_SEED,
     PRICE_MAX,
     PRICE_MIN,
     PROMO_PROB,
     SALES_ALPHA,
+    build_products,
     gen_price_series,
     sample_base_prices,
     sample_ranked_sales,
@@ -432,6 +435,69 @@ def test_vary_specs_expands_title_space() -> None:
     raw = "安克 充电宝 10000毫安 22.5W快充"
     variants = {vary_specs(raw, rng) for _ in range(200)}
     assert len(variants) > 20, f"200 次只产出 {len(variants)} 种变体，标题空间没打开"
+
+
+def test_titles_are_unique_at_full_scale() -> None:
+    """★★ 回归测试：1000 个商品的标题必须**互不重复**。
+
+    ★ 这个 bug 的症状和原因相隔了三个阶段，值得完整记下来：
+
+      症状：Mock 源采了 100 条爆料，结果只建出 **64 个商品**。
+            报告写"新商品 64"，而库里的 Mock 商品本来是 100 个。
+
+      原因：`build_products` 抽模板、抽片段、抽颜色时是**各自独立**抽的
+            （有放回），42% 的商品拿到了重复标题。
+            实测 count=100 → 87 个不同；count=1000 → 583 个不同（最多重复 19 次）。
+
+      为什么三个阶段都没发现：**从来没有任何东西拿归并逻辑跑过 Mock 数据**。
+            seed 直写只关心 (source, source_id) 唯一约束，标题重不重复无所谓；
+            前端图表也不在乎。直到阶段 4 把采集管道接上 mock 源，
+            归并逻辑第一次看见这批数据——它看到一个 source_id 已有主、
+            但标题和别的商品一模一样，于是判定"这是重复爆料"，静默地少建了 36 个。
+            ★ 归并**少建商品**不报错，这正是它藏了这么久的原因。
+
+      修法：`_pick_title` 维护一个 seen_titles 集合，重抽直到标题唯一；
+            抽不出来（池子真的用尽）就抛带池子大小的 RuntimeError，
+            而不是悄悄返回一个重复的。
+
+    ★ 断言取 1000 而不是 100：100 那次只重了 13%，1000 那次重了 42%，
+      取满量程才能守住真实场景。实测标题池约 4039，撑 1000 有余量。
+    """
+    rng = np.random.default_rng(DEFAULT_SEED)
+    products = build_products(rng, DEFAULT_PRODUCT_COUNT, DEFAULT_DAYS)
+
+    titles = [p["title"] for p in products]
+    assert len(titles) == DEFAULT_PRODUCT_COUNT
+    assert len(set(titles)) == DEFAULT_PRODUCT_COUNT, (
+        f"{len(titles) - len(set(titles))} 个标题重复了——"
+        "采集管道会把它们当成同一条爆料归并掉，商品数凭空少一截"
+    )
+
+    # ★ title_norm 也必须唯一。归并比对看的是归一化后的形式，
+    #   两个标题只要归一化后相同，就一定会被判定成重复——
+    #   哪怕原始标题逐字不同（比如只差一个被当成噪声词去掉的"包邮"）。
+    norms = [p["title_norm"] for p in products]
+    assert len(set(norms)) == DEFAULT_PRODUCT_COUNT, (
+        "原始标题唯一但归一化后重复——归并逻辑用的正是归一化形式"
+    )
+
+
+def test_title_pool_exhaustion_raises_instead_of_repeating() -> None:
+    """★ 池子抽干时必须报错，不能"安静地返回一个重复标题"。
+
+    这条守的是上面那条测试的**实现方式**：如果 _pick_title 在重抽
+    _MAX_TITLE_RETRIES 次之后认命返回重复值，上面那条会红，
+    但错误信息只说"标题重复了"，看不出根因是"池子不够大"。
+
+    ★ 抛错信息里带池子大小，是因为这个错真的会犯：
+      加了几条标题模板就以为池子够大了，实际要 count=10000 时才炸。
+      看到"池子 4039，要抽 10000 个"就能立刻明白该干什么。
+    """
+    from scraper.seed import _MAX_TITLE_RETRIES  # noqa: F401  （存在性断言）
+
+    rng = np.random.default_rng(DEFAULT_SEED)
+    with pytest.raises(RuntimeError, match="标题"):
+        build_products(rng, 100_000, 1)
 
 
 def test_titles_never_have_two_colors() -> None:

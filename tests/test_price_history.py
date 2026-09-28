@@ -40,6 +40,7 @@ from app.db.models import PriceHistory, Product, Shop
 from scraper.store import (
     PricePoint,
     ProductRow,
+    ensure_shop,
     find_product_id,
     record_price,
     record_prices,
@@ -416,3 +417,80 @@ def test_the_two_tables_have_opposite_conflict_semantics(db, shop: Shop) -> None
     # price_history：没变（DO NOTHING）
     assert added is False
     assert after_points == before_points, "price_history 的冲突动作不是 DO NOTHING"
+
+
+# ===========================================================================
+# 四、shops：resolve-or-create（第三个写入路径）
+#
+# ★ 这一节迟到得有点久：shops 是 store.py 里三个写入路径中唯一
+#   一直没有测试的那个。前两个（products / price_history）的坑是
+#   "写反了语义"，这个的坑是"唯一约束形同虚设"——
+#   同属"不报错但数据坏掉"那一类。
+# ===========================================================================
+
+
+def test_ensure_shop_returns_same_id_on_second_call(db) -> None:
+    """同一个 (平台, 店名) 查两次，拿到**同一个** id，且只建了一行。
+
+    ★ 这条看着平淡，但它守的是"采集任务跑到第二页时店铺突然翻倍"。
+      ensure_shop 如果写成无条件 insert，第二次就撞 (platform, name)
+      唯一约束；而如果不加唯一约束又不查重，就是店铺表里一堆重复行，
+      前端"店铺占比"饼图会把它切成互不相干的几块。
+    """
+    first = ensure_shop(db, "京东", "京东自营")
+    second = ensure_shop(db, "京东", "京东自营")
+
+    assert first == second
+    assert db.execute(
+        select(func.count()).select_from(Shop).where(Shop.name == "京东自营")
+    ).scalar_one() == 1
+
+
+def test_ensure_shop_same_name_on_different_platforms_is_two_shops(db) -> None:
+    """★ 店名相同但平台不同 = 两家店。
+
+      "京东自营"和"天猫自营"是两个不同的实体，
+      唯一约束的键是 **(platform, name)** 而不是 name——
+      这正是计划里把它写成二元组而不是店名的原因。
+    """
+    jd = ensure_shop(db, "京东", "品牌自营")
+    tm = ensure_shop(db, "天猫", "品牌自营")
+
+    assert jd != tm
+
+
+def test_ensure_shop_rejects_empty_platform(db) -> None:
+    """★ 空平台必须**抛错**，而不是"安静地建一行 platform 为 NULL 的店"。
+
+    这是本文件的第三个静默坑，也是最刁的：
+    SQLite（以及 SQL 标准）把多个 NULL 视为**互不相同**，
+    所以 `(NULL, "京东自营")` 能重复插进去好几行——
+    `(platform, name)` 唯一约束在这个组合上**形同虚设**。
+
+    ★ 讽刺的是 Mock 数据里恰好有一批店铺是 platform 为 NULL 的
+      （seed 的店铺模板里有不写平台的），所以这个组合是真实存在的，
+      不是理论担忧。要求调用方给平台，这个坑就不会被踩到。
+    """
+    with pytest.raises(ValueError, match="platform"):
+        ensure_shop(db, None, "京东自营")
+    with pytest.raises(ValueError, match="platform"):
+        ensure_shop(db, "", "京东自营")
+
+
+def test_ensure_shop_gives_id_without_committing(db) -> None:
+    """★ ensure_shop 只 flush，不 commit——提交时机由调用方决定。
+
+    采集一批 100 条爆料要整批一个事务（中途失败整批回滚，
+    不留下"前 79 条进去了、后 21 条没进去"的半截状态）。
+    如果 ensure_shop 自己 commit 了，那个事务边界就被从中间切断了。
+
+    ★ 验证方式：调用后**不提交**，直接在新会话里查——查不到才算数。
+      本测试的 db 夹具只有一个会话，所以这里退一步，
+      断言"返回的是有效 id 且不依赖提交"这个可观测部分：
+      id 是自增的、大于 0，说明 flush 确实拿到了主键。
+    """
+    sid = ensure_shop(db, "京东", "京东自营")
+
+    assert sid > 0
+    # flush 之后同一个会话内立刻能查到（说明真的写进了事务，不是空对象）
+    assert db.get(Shop, sid) is not None
