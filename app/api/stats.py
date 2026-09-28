@@ -31,22 +31,17 @@
 
 from __future__ import annotations
 
-import logging
-import math
-import re
-import threading
-from collections import Counter
 from enum import Enum
 from typing import Annotated
 
-import jieba
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, func, select
 
+from app.aggregate import bucket_prices, median, quantile
 from app.api.deps import DbDep, SourceDep, apply_source
-from app.config import settings
 from app.db.models import PriceHistory, Product, Shop
+from app.keywords import rank_keywords
 from app.textutil import elide_middle
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -258,19 +253,6 @@ class KeywordsOut(BaseModel):
 # ===========================================================================
 
 
-def _median(values: list[float]) -> float:
-    """中位数。★ 入参必须已排序。
-
-    SQLite 没有 MEDIAN 聚合函数（PostgreSQL 也没有，要用
-    percentile_cont）。数据量小的时候在 Python 里算是正确的选择。
-    """
-    n = len(values)
-    mid = n // 2
-    if n % 2:
-        return float(values[mid])
-    return (values[mid - 1] + values[mid]) / 2
-
-
 def _fetch_current_prices(db, source) -> tuple[list[float], int]:
     """取回该数据源下所有商品的**当前价**，升序排好。
 
@@ -302,32 +284,10 @@ def _fetch_current_prices(db, source) -> tuple[list[float], int]:
     return prices, int(missing)
 
 
-# 分桶时优先用的"好看"的步长。
-#
-# ★ 为什么要吸附到这些数，而不是 range/16 直接算：
-#   算出来的步长会是 38.4375 这种数，桶边界跟着变成
-#   0 / 38.4 / 76.9 / 115.3…，坐标轴上全是小数，图很脏。
-#   真实的分析图里桶边界一定是 10 的整数倍——不是为了好看，
-#   而是因为读图的人要在脑子里做加法（"100~150 这一段有 200 个商品"），
-#   边界不整的话这个加法做不了。
-_NICE_STEPS: tuple[int, ...] = (5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000)
-
-
-def _bucket_edges(lo: float, hi: float, target: int = 16) -> tuple[float, float, float]:
-    """算出 (起始边界, 步长, 结束边界)。
-
-    算法：先按目标桶数算一个粗略步长，再往上取到最近的"好看"步长，
-    最后把首尾边界向外扩到步长的整数倍。
-    """
-    span = hi - lo
-    raw = span / target if span > 0 else 1.0
-    step = next((s for s in _NICE_STEPS if s >= raw), _NICE_STEPS[-1])
-
-    start = math.floor(lo / step) * step
-    end = math.ceil(hi / step) * step
-    if end <= start:  # 所有价格相同（或只有一个商品）时的退化情况
-        end = start + step
-    return float(start), float(step), float(end)
+# ★ 分桶和分位数的实现在 app/aggregate.py，不在本文件。
+#   阶段 3 的 GLM 报告要喂给模型的价格分布，必须和本接口返回给前端的
+#   是**同一份计算**——否则"图上的直方图"和"报告里的结论"可能对不上，
+#   而且两边都不报错。抽出去的详细理由见 app/aggregate.py 的模块注释。
 
 
 # ===========================================================================
@@ -439,7 +399,7 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
         )
         sales_summary = SalesSummary(
             total=int(sales_total or 0),
-            median=int(_median([float(v) for v in sales_values])),
+            median=int(median([float(v) for v in sales_values])),
             max=int(sales_max or 0),
         )
 
@@ -447,9 +407,9 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
     if prices:
         price_summary = PriceSummary(
             min=round(prices[0], 2),
-            p25=round(_quantile(prices, 0.25), 2),
-            median=round(_median(prices), 2),
-            p75=round(_quantile(prices, 0.75), 2),
+            p25=round(quantile(prices, 0.25), 2),
+            median=round(median(prices), 2),
+            p75=round(quantile(prices, 0.75), 2),
             max=round(prices[-1], 2),
             mean=round(sum(prices) / len(prices), 2),
         )
@@ -476,26 +436,6 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
     )
 
 
-def _quantile(sorted_values: list[float], q: float) -> float:
-    """线性插值分位数（等同于 numpy 的默认算法）。
-
-    ★ 自己实现而不是 import numpy：只为算两个分位点就把 numpy
-      拉进 Web 进程不划算（它在这个进程里唯一的用途就是这两行）。
-      numpy 是 seed.py 的依赖，那是**离线脚本**，两者不该混。
-    """
-    if not sorted_values:
-        raise ValueError("空列表没有分位数")
-    if len(sorted_values) == 1:
-        return float(sorted_values[0])
-    pos = (len(sorted_values) - 1) * q
-    lo = math.floor(pos)
-    hi = math.ceil(pos)
-    if lo == hi:
-        return float(sorted_values[lo])
-    frac = pos - lo
-    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
-
-
 # ===========================================================================
 # 端点 3：价格分布
 # ===========================================================================
@@ -515,31 +455,17 @@ def price_distribution(
             source=source.value, total=0, bucket_step=0, buckets=[], notice=NO_DATA_NOTICE
         )
 
-    start, step, end = _bucket_edges(prices[0], prices[-1], target=target_buckets)
-
-    # 一次遍历分桶。★ 用 min(int((p-start)/step), n-1) 而不是 if/elif 链：
-    #   p 恰好等于最大值 end 时，算出来的下标是 n（越界），
-    #   钳到 n-1 就把最大值放进最后一个桶。这个边界每次都会写错一次。
-    n = int(round((end - start) / step))
-    counts = [0] * n
-    for p in prices:
-        idx = min(int((p - start) / step), n - 1)
-        counts[idx] += 1
-
-    buckets = [
-        PriceBucket(
-            # 标签用整数显示（"100-150" 而不是 "100.0-150.0"）——
-            # 步长一定是整数，显示成小数只会让坐标轴变长。
-            label=f"{int(start + i * step)}-{int(start + (i + 1) * step)}",
-            lower=float(start + i * step),
-            upper=float(start + (i + 1) * step),
-            count=int(counts[i]),
-        )
-        for i in range(n)
-    ]
+    # ★ 分桶交给 app/aggregate.bucket_prices()，它返回的 dict 形状
+    #   恰好就是 PriceBucket 需要的四个字段。
+    #   在这里自己再写一遍分桶，会让"界面上的直方图"和"AI 报告里的直方图"
+    #   有可能算出不同的桶——而且两边都不报错（理由见 app/aggregate.py）。
+    step, buckets = bucket_prices(prices, target=target_buckets)
 
     return PriceDistributionOut(
-        source=source.value, total=len(prices), bucket_step=step, buckets=buckets
+        source=source.value,
+        total=len(prices),
+        bucket_step=step,
+        buckets=[PriceBucket(**b) for b in buckets],
     )
 
 
@@ -704,148 +630,14 @@ def shop_share(
 # ===========================================================================
 
 
-# jieba 的初始化只需要做一次，但它不是线程安全的"只做一次"。
+# ★ 分词相关的全部实现（jieba 初始化、停用词表、分词规则、大小写还原）
+#   已经搬到 app/keywords.py。
 #
-# ★ 为什么要自己加锁：FastAPI 的同步端点跑在线程池里，
-#   服务刚起来时几个请求会并发进来，同时走到这里。
-#   jieba 内部对词典加载有锁，但 `load_userdict` **没有**——
-#   两个线程同时往同一个 trie 里写自定义词，行为未定义。
-#   加锁的成本是几十纳秒，不加的后果是"偶发地少几个自定义词"，
-#   而那种 bug 你查一整天都想不到是并发。
-_jieba_lock = threading.Lock()
-_jieba_ready = False
-
-
-def _ensure_jieba() -> None:
-    """加载自定义词典（幂等）。"""
-    global _jieba_ready
-    if _jieba_ready:
-        return
-    with _jieba_lock:
-        # 双重检查：拿到锁之后要再判一次，否则并发时后面的线程
-        # 会白等一次锁然后重复加载。
-        if _jieba_ready:
-            return
-
-        # ★ 关掉 jieba 的 DEBUG 日志。
-        #   默认级别会在首次分词时打印
-        #   "Building prefix dict from ... Loading model from cache ..."
-        #   这几行会出现在服务日志里，让第一次请求看起来像是卡住了。
-        jieba.setLogLevel(logging.INFO)
-
-        # 词典文件缺失不报错，只是词云会难看一些。
-        # ★ 这里刻意不做"文件不存在就抛异常"：本项目承诺
-        #   `git clone` 下来不配任何东西就能跑起来，而 data/ 是
-        #   gitignore 的候选目录。缺词典应该是"效果打折"而不是"服务起不来"。
-        if settings.userdict_file.exists():
-            jieba.load_userdict(str(settings.userdict_file))
-
-        jieba.initialize()
-        _jieba_ready = True
-
-
-def _load_stopwords() -> frozenset[str]:
-    """读停用词表。每次调用都重读文件——**故意不缓存**。
-
-    ★ 缓存的诱惑很大（几百行的文件，每次请求读一遍），但代价是：
-      调词云的时候要重启服务才生效，而调词云恰恰是一个
-      "改一个词、看一眼图、再改"的高频循环。
-      这里文件只有几十 KB，OS 的页缓存早就把它放在内存里了，
-      open + splitlines 的实际耗时在微秒级。
-      用可测量的微小开销换"改完即生效"，这个交易很划算。
-    """
-    path = settings.stopwords_file
-    if not path.exists():
-        return frozenset()
-    words = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        words.add(line.lower())
-    return frozenset(words)
-
-
-_HAS_CJK = re.compile(r"[一-鿿]")
-# 纯数字（含小数）。"20000" 这种规格数字不该进词云——
-# 它没有词义，而且会让词云上飘着一堆数字。
-_IS_NUMBER = re.compile(r"^\d+(\.\d+)?$")
-# 至少含一个"有意义"的字符，否则整个 token 是标点/符号。
-_HAS_WORDCHAR = re.compile(r"[0-9a-zA-Z一-鿿]")
-
-
-def _tokenize_titles(
-    titles: list[str], stopwords: frozenset[str]
-) -> tuple[Counter[str], dict[str, Counter[str]]]:
-    """分词。返回 `(归一化词频, {归一化词: {原始写法: 次数}})`。
-
-    ★ 归一化规则（每条都对应一个具体的坏结果）：
-      · 大小写归一下沉 —— 不归一的话 `iPhone` / `iphone` / `IPHONE`
-        会作为三个不同的词在词云上各占一块，同一个概念被拆成三份
-      · 中文词长度 >= 2 —— 单字（"宝""器"）没有信息量，
-        而且它们几乎都是分词切错的产物
-      · ASCII 词长度 >= 3 —— ★ 这条不能写成"丢弃纯 ASCII 词"。
-        早期草稿就是这么写的，那会亲手杀掉 iPhone / WiFi / Type-C / USB，
-        而它们恰恰是数码品类里信息量最高的词。
-        真正的噪声（LED、GB）交给停用词表按需处理，不用长度一刀切。
-      · 丢掉纯数字和纯符号
-
-    ★ 为什么同时返回"原始写法"的计数：
-      归一化之后词云上会显示 `iphone`（全小写），而人写的是 `iPhone`。
-      要还原成人类写法，就得知道每种写法各出现过几次。
-      这件事**必须在分词这一趟里顺手记下来**——
-      第一版是事后拿着每个关键词再去 `title.lower().find(key)` 扫一遍全部标题，
-      120 个词 × 1000 条标题 = 12 万次字符串查找，纯粹是白花的开销，
-      而信息在分词的时候本来就摆在手边。
-    """
-    counter: Counter[str] = Counter()
-    forms: dict[str, Counter[str]] = {}
-
-    for title in titles:
-        if not title:
-            continue
-        # cut（精确模式）而不是 cut_for_search：
-        # 后者会额外吐出长词的子串（"蓝牙耳机" → 还给"蓝牙""耳机"），
-        # 词云上会同时出现整体词和它的碎片，看起来像重复统计。
-        for raw in jieba.cut(title):
-            token = raw.strip()
-            if not token or not _HAS_WORDCHAR.search(token):
-                continue
-
-            key = token.lower()
-            if key in stopwords or _IS_NUMBER.match(key):
-                continue
-
-            if _HAS_CJK.search(key):
-                if len(key) < 2:
-                    continue
-                # 中文词没有大小写，不需要记原始写法
-            elif len(key) < 3:
-                continue
-
-            counter[key] += 1
-            if not _HAS_CJK.search(key):
-                forms.setdefault(key, Counter())[token] += 1
-
-    return counter, forms
-
-
-def _display_form(key: str, forms: dict[str, Counter[str]]) -> str:
-    """把 `iphone` 还原成 `iPhone` 这类人类写法。
-
-    取原文里出现次数最多的那种写法。
-    ★ 为什么不取"第一次出现的"：标题是按 id 排的，
-      而排在前面的可能恰好是一条全大写的促销标题（"IPHONE 15 保护壳"），
-      于是整个词云里这个词都会显示成全大写。
-      取众数稳得多，而且这正是"归一化"本该有的逆运算。
-    """
-    candidates = forms.get(key)
-    if not candidates:
-        return key
-    # ★ max 的 key 里带上原文做第二排序键：出现次数相同时，
-    #   结果不能取决于 Counter 的插入顺序（那就又变成不确定了）。
-    best_form, _ = max(candidates.items(), key=lambda kv: (kv[1], kv[0]))
-    return best_form
+#   搬家的原因不是"文件太长了"，而是阶段 3 的 AI 报告也要用分词：
+#   如果让 analysis/payload.py 反过来 import 本模块，分析层就依赖了 Web 层
+#   （它本该能脱离 HTTP 单独跑）；而如果让它自己再写一份分词，
+#   就会出现"词云图上最大的词"和"报告里说的最高频词"不是同一个词，
+#   且两边都不报错。完整理由见 app/keywords.py 的模块注释。
 
 
 @router.get("/keywords", response_model=KeywordsOut)
@@ -871,8 +663,6 @@ def keywords(
       现在不加，是因为缓存会引入"改了停用词表要等 TTL 过期"的困惑，
       而调停用词表恰恰是这个功能最高频的操作。
     """
-    _ensure_jieba()
-
     titles = [
         t
         for t in db.execute(
@@ -886,16 +676,12 @@ def keywords(
             source=source.value, total_titles=0, items=[], notice=NO_DATA_NOTICE
         )
 
-    stopwords = _load_stopwords()
-    counter, forms = _tokenize_titles(titles, stopwords)
+    # ★ 分词、排序、大小写还原全部在 app/keywords.py 里，一处定义。
+    #   返回值是 [(显示形式, 归一化键, 次数)]——
+    #   排序的确定性（同分按字典序）在那边保证，理由见 rank_keywords 的注释。
+    ranked = rank_keywords(titles, limit=limit)
 
-    # ★ 排序必须完全确定：`Counter.most_common()` 在计数相同时的返回顺序
-    #   取决于字典的插入顺序，也就是取决于上面那条 SQL 返回标题的顺序。
-    #   于是"给词云加个排序"这种无关改动会让输出悄悄变样，测试也跟着飘。
-    #   显式按 (-次数, 词) 排，同分时按字典序，结果就唯一了。
-    ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
-
-    items = [KeywordItem(name=_display_form(k, forms), value=int(v)) for k, v in ranked]
+    items = [KeywordItem(name=name, value=count) for name, _key, count in ranked]
 
     return KeywordsOut(
         source=source.value,

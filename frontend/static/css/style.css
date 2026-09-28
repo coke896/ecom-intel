@@ -267,6 +267,95 @@ td.title-cell {
 .pager button:disabled { opacity: .45; cursor: default; }
 
 /* --------------------------------------------------------------------------
+ * 报告页
+ *
+ * ★ 报告正文全部由**模型生成**，渲染时全部走 `textContent`，不碰 innerHTML。
+ *   理由见 analysis.html 里那段注释——简单说：模型输出是**不可信文本**，
+ *   把它当 HTML 解析等于给自己开一个 XSS 口子，
+ *   而开口子的路径是"数据源里某条商品标题里带了 <script>"。
+ * ------------------------------------------------------------------------ */
+
+/* 通用按钮。★ 之前只有 .pager button 和 .switcher button 两套局部样式，
+   报告页需要一对"主操作 + 次操作"，所以抽一个通用的出来。 */
+.btn {
+  font: inherit;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--text);
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 550;
+}
+.btn.primary:hover:not(:disabled) { background: #1d4ed8; color: #fff; }
+/* 禁用态要**看起来**不可点：生成报告要花 token，
+   按钮看起来能点而实际点了没反应，会让人反复点，每次都是一次付费调用。 */
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* 报告正文挂载点。 */
+.report-headline {
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.5;
+  margin: 4px 0 10px;
+}
+
+/* 「这份报告说的是哪个数据源」的提示。
+   数据源切换之后，屏幕上留着的还是上一份报告——这时必须说话。 */
+.report-stale {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.report-section {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.report-section h3 { margin: 0 0 4px; font-size: 14px; font-weight: 620; }
+.report-section p { margin: 0 0 6px; }
+/* 依据：用 monospace + 左边框，视觉上明确区分"判断"和"数字"。
+   这个区分是有意的——报告最常见的失败就是**结论和数字对不上**，
+   分开排版能让人一眼看出"这句判断的依据是什么"。 */
+.report-evidence {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-soft);
+  background: var(--bg);
+  border-left: 3px solid var(--border);
+  padding: 5px 10px;
+  border-radius: 0 6px 6px 0;
+  margin: 0;
+}
+
+.report-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+.report-list h4 { margin: 0 0 6px; font-size: 13px; font-weight: 620; }
+.report-list ul { margin: 0; padding-left: 18px; }
+.report-list li { margin-bottom: 4px; }
+/* ★ 三组列表用颜色分开，其中「数据限制」是**最重要的一组**：
+   它是这份报告最诚实的地方——写清楚"这批数据支撑不了什么结论"。
+   给它最重的边框，是因为它是面试时最该被看到的一段。 */
+.report-list.limits {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.report-list.limits h4 { color: var(--warn-text); }
+.report-list.limits ul { color: var(--warn-text); padding-left: 18px; }
+
+/* --------------------------------------------------------------------------
  * 详情弹窗
  * ------------------------------------------------------------------------ */
 .modal-backdrop {

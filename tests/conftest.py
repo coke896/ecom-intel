@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base, register_sqlite_pragmas
+from tests.factories import product_factory
 
 # ★ 这一行看着像"没用到所以可以删"，但删了会出事——它必须在模块顶层：
 #
@@ -77,3 +78,25 @@ def db(engine: Engine) -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+# ===========================================================================
+# 造数据的共享工厂
+#
+# ★ 实现放在 tests/factories.py 而不是这里。
+#   原因是 conftest 里的东西只能通过夹具取用，不能直接 import
+#   （pytest 不把 tests/ 加进 sys.path，`from conftest import x` 会报
+#    ModuleNotFoundError）；而 test_api_smoke.py 里 40 多个用例
+#   写的是 `_add(db, ...)` 这种普通函数调用形式。
+#   放成独立模块之后，两种用法共用同一个实现，不会分叉。
+# ===========================================================================
+
+
+@pytest.fixture()
+def make_product(db: Session):
+    """夹具形式。用法：
+
+        def test_x(make_product):
+            p = make_product(sid="a-1", title="安克 充电宝", price=99.9, sales=500)
+    """
+    return product_factory(db)

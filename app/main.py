@@ -40,7 +40,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import products, stats
+from app.analysis.glm_client import key_configured
+from app.api import analysis, products, stats
 from app.config import settings
 from app.db.base import Base, engine
 
@@ -72,9 +73,9 @@ def warm_up() -> None:
       不该让整个服务起不来。所以这里吞掉异常只记日志。
     """
     try:
-        from app.api.stats import _ensure_jieba
+        from app.keywords import ensure_jieba
 
-        _ensure_jieba()
+        ensure_jieba()
     except Exception:  # noqa: BLE001 —— 预热是尽力而为，任何失败都不该阻塞启动
         logger.warning("jieba 预热失败，词云接口会在首次请求时再尝试初始化", exc_info=True)
 
@@ -138,33 +139,24 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(stats.router)
 app.include_router(products.router)
+app.include_router(analysis.router)
 
 
-def _llm_key_configured() -> bool:
-    """GLM key 是否已配置可用。
-
-    ★ 只返回布尔值，**绝不回显 key 本身**。
-      健康检查接口经常被随手贴进 issue 或截图里，
-      一旦它把 key 吐出来，就等于泄露了。
-      （这条规则在 aiwenda 上就是这么定的，沿用。）
-
-    ★ 三个要检查的失败模式：
-      · 空 —— `.env` 没填
-      · 非 ASCII —— HTTP 头只允许 ASCII 字符，
-        从网页上复制 key 时经常会带进不可见的中文标点或全角空格，
-        症状是 401 或 `UnicodeEncodeError`，但报错信息指向的是请求头，
-        不会告诉你"key 里混了个全角空格"
-      · 占位符 —— 有人把 .env.example 里的示例值直接当真的填进去了
-    """
-    key = settings.glm_api_key.strip()
-    if not key:
-        return False
-    try:
-        key.encode("ascii")
-    except UnicodeEncodeError:
-        return False
-    placeholders = {"your_key_here", "your-api-key", "changeme", "xxx", "sk-xxx"}
-    return key.lower() not in placeholders
+# ★ 这里**曾经**有一份 `_llm_key_configured()` 的实现，和
+#   `app/analysis/glm_client.key_configured()` 是同一套规则的两份代码。
+#   两份已经**实测分叉**了：对 `replace_me_please` / `example-key-123` /
+#   `xxxxxx` / `TODO_KEY` 这四个值，这里判"已配置"、glm_client 判"未配置"。
+#
+#   后果不是"少拦一个占位符"，而是**两个接口互相矛盾**：
+#     · `/api/health` 说"AI 分析可用" → 前端于是把「生成分析报告」按钮点亮
+#     · 用户点下去 → 分析接口抛"GLM_API_KEY 未配置"
+#   前端按钮的可用状态是照着健康检查来的，所以用户看到的是
+#   "按钮亮着，一点就报错"——最难排查的那类不一致：
+#   两个地方各自都是自洽的，只有放在一起才矛盾。
+#
+#   现在只留一处规则，health 直接问分析模块。同一类问题在本项目里
+#   已经收拢过几次（`apply_source`、`app/aggregate.py`、`app/keywords.py`），
+#   判据都一样：**同一条规则被写第二遍时，它就有了分叉的可能。**
 
 
 @app.get("/api/health", tags=["meta"])
@@ -181,8 +173,10 @@ def health() -> dict[str, object]:
         "status": "ok",
         "app_port": settings.app_port,
         "database": "sqlite",
-        # 前端据此显示"AI 分析可用/未配置"，而不是点下去才报错
-        "llm_configured": _llm_key_configured(),
+        # 前端据此显示"AI 分析可用/未配置"，而不是点下去才报错。
+        # ★ 这里必须调用分析模块自己的判定，理由见上面那段注释——
+        #   两份实现分叉之后，"按钮亮着但一点就报错"就是这么来的。
+        "llm_configured": key_configured(),
     }
 
 

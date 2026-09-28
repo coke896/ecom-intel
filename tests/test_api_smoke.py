@@ -61,70 +61,26 @@ def client(db):
 # ===========================================================================
 
 
+# ★ 实现已经搬到 conftest.py 的 `product_factory` 里，
+#   因为阶段 3 的 test_reporter_cache.py 需要造同一批字段的商品。
+#   这里保留 `_add(db, ...)` / `_shop(db, ...)` 的调用形式
+#   （本文件 40 多个用例都在用它们），只是接到共享实现上。
+#
+#   为什么必须共用一份：两份"造商品"的代码会悄悄分叉，
+#   比如一边给 price_max 填了值、另一边留空，
+#   于是"某个接口的行为"在两组测试里其实测的是两种数据。
+#   这类分叉不报错，只在某天表现为"改了 A 却让 B 的测试变红"。
+from tests.factories import product_factory
+
+
+def _add(db, **kwargs) -> Product:
+    """插一个商品。签名和字段含义见 conftest.product_factory。"""
+    return product_factory(db)(**kwargs)
+
+
 def _shop(db, name: str, platform: str = "京东") -> Shop:
-    existing = db.query(Shop).filter_by(name=name, platform=platform).one_or_none()
-    if existing:
-        return existing
-    shop = Shop(name=name, platform=platform)
-    db.add(shop)
-    db.flush()
-    return shop
-
-
-def _add(
-    db,
-    *,
-    sid: str,
-    title: str,
-    source: str = "mock",
-    price: float | None = 99.9,
-    sales: int | None = 100,
-    category: str | None = "充电器",
-    brand: str | None = "安克",
-    platform: str | None = "京东",
-    shop: str | Shop | None = None,
-    channel: str = "mock",
-    points: int = 0,
-) -> Product:
-    """插一个商品。`points` 是给它造几个价格历史点。"""
-    shop_id = None
-    if isinstance(shop, Shop):
-        shop_id = shop.id
-    elif isinstance(shop, str):
-        shop_id = _shop(db, shop).id
-
-    product = Product(
-        source=source,
-        source_id=sid,
-        source_channel=channel,
-        title=title,
-        # 真实链路里 title_norm 由 cleaner 算；这里直接用小写标题就够了，
-        # 本文件的测试都不依赖归一化的具体结果。
-        title_norm=title.lower(),
-        brand=brand,
-        platform=platform,
-        category=category,
-        price=price,
-        # ★ 单值时 price_max == price（见 models.py 的语义说明）
-        price_max=price,
-        sales=sales,
-        shop_id=shop_id,
-        last_crawled_at=utcnow(),
-    )
-    db.add(product)
-    db.flush()
-
-    for i in range(points):
-        db.add(
-            PriceHistory(
-                product_id=product.id,
-                price=100.0 + i,
-                recorded_at=utcnow() - timedelta(days=points - i),
-                source_ref=None,
-            )
-        )
-    db.flush()
-    return product
+    """取或建一家店铺。"""
+    return product_factory(db).shop(name, platform)
 
 
 def _seed_both_sources(db) -> None:

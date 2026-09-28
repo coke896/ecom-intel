@@ -40,21 +40,28 @@ function setSource(id) {
   history.replaceState(null, '', url);
 }
 
-/** 带 source 参数的 GET。
+/** 带 source 参数的请求。
  *
- *  ★ 所有统计接口都走这里，**没有例外**。
+ *  ★ 所有后端接口都走这里，**没有例外**。
  *    这样"忘了带 source"这件事在代码层面就不可能发生——
  *    因为调用方根本没有机会手写 URL。
  *    （后端那边也是同一个思路：过滤只写在 apply_source 一处。）
+ *
+ *  ★ 为什么 GET 和 POST 共用同一个函数、只差一个 method：
+ *    "source 注入"和"错误翻译"这两件事跟 HTTP 方法毫无关系。
+ *    分开写成两个函数的话，将来给错误处理加一条规则
+ *    （比如 503 要显示成"服务未配置"而不是"出错了"），
+ *    就必须记得改两处——而漏改的那一处不会报错，
+ *    只会让某一类请求的错误提示和别人不一样。
  */
-async function apiGet(path, params = {}) {
+async function apiRequest(method, path, params = {}) {
   const url = new URL(path, location.origin);
   url.searchParams.set('source', currentSource());
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
   }
 
-  const resp = await fetch(url);
+  const resp = await fetch(url, { method });
   if (!resp.ok) {
     // 把后端的 detail 带出来。FastAPI 的 422 是结构化数组，
     // 直接 alert 一个 [object Object] 对排查毫无帮助。
@@ -66,6 +73,21 @@ async function apiGet(path, params = {}) {
     throw new Error(`${resp.status} ${detail || resp.statusText}`);
   }
   return resp.json();
+}
+
+function apiGet(path, params = {}) {
+  return apiRequest('GET', path, params);
+}
+
+/** POST。目前只有「生成分析报告」用它。
+ *
+ *  ★ 生成报告必须用 POST，这不是风格问题：
+ *    它会写一行报告、消耗 token。用 GET 的话，浏览器预取、代理缓存、
+ *    爬虫都可能触发一次**付费调用**——而且在用户没点任何按钮的时候。
+ *    HTTP 语义在这里是有实际后果的：GET 约定"安全、可重复"，而它两条都不满足。
+ */
+function apiPost(path, params = {}) {
+  return apiRequest('POST', path, params);
 }
 
 /* ---------------------------------------------------------------------------
