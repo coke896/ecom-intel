@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 
 import pytest
@@ -57,10 +58,20 @@ def _row(
     price_max: float | None = 199.0,
     sales: int | None = 1000,
     brand: str = "安克",
+    platform: str | None = "京东",
+    category: str | None = "充电器",
     shop: str = "京东自营",
     points: int = 1,
 ) -> dict:
-    """一行商品数据，字段与 `payload.build_payload()` 造出来的完全一致。"""
+    """一行商品数据，字段与 `payload.build_payload()` 造出来的完全一致。
+
+    ★ "完全一致"这句话曾经是**假的**：这里只有 8 个键，而真实行有 10 个
+      （少了 `platform` / `category`，见 payload._sample_products）。
+      假得很有欺骗性——它和指纹的白名单**逐键重合**，
+      于是"payload 里有、指纹里没有"的字段在这三处同时不存在。
+      补上这两个键之后，这句话才是真的（由下面
+      `test_every_field_of_a_real_product_row_reaches_the_fingerprint` 守着）。
+    """
     return {
         "key": key,
         "title": title,
@@ -68,6 +79,8 @@ def _row(
         "price_max": price_max,
         "sales": sales,
         "brand": brand,
+        "platform": platform,
+        "category": category,
         "shop": shop,
         "points": points,
     }
@@ -309,6 +322,8 @@ def test_model_name_is_part_of_the_hash() -> None:
         ("price_max", 259.0),                  # 区间上界变了
         ("sales", 9999),                       # 销量变了
         ("brand", "倍思"),                     # 品牌变了
+        ("platform", "天猫"),                  # ★ 销售平台变了（漏算过）
+        ("category", "移动电源"),              # ★ 类目变了（漏算过）
         ("shop", "天猫超市"),                  # 店铺变了
         ("points", 7),                         # 观测次数变了
     ],
@@ -320,9 +335,14 @@ def test_every_field_in_the_prompt_changes_the_hash(field: str, value: object) -
     更像是个统计量。但它确实在 prompt 里（"这个商品被爆料过几次"），
     所以它变了报告就可能过时。
 
-    ★ 这个用例用参数化一次覆盖七个字段，好处是将来 payload 里加了新字段时，
-      往这个列表里加一行就行——**而忘了加的那一行，就是漏算的入口**。
-      所以配套下面那个"白名单"用例一起看。
+    ★★ 但**别把这份清单当成保障**。它曾经同时漏掉 `platform` 和 `category`：
+      清单是照着 `_row()` 写的，`_row()` 是照着指纹白名单写的，
+      三者互为镜像——漏掉的字段在三处同时不存在，所以清单全绿。
+
+      清单能覆盖"我知道的字段"，覆盖不了"上游将来加的字段"。
+      真正兜底的是下面那条**从真实 payload 推导**的用例
+      （`test_every_field_of_a_real_product_row_reaches_the_fingerprint`），
+      这条清单的价值只剩"断言得更直白、失败信息更好读"。
     """
     changed = _payload()
     changed["top_products"][0][field] = value
@@ -599,6 +619,79 @@ def test_the_real_payload_hash_is_stable_across_rebuilds(db, make_product) -> No
     second = build_fingerprint(build_payload(db, SourceFilter.all), MODEL)
 
     assert first == second
+
+
+def _mutate(value: object) -> object:
+    """给一个字段造一个**与它不同**的值。
+
+    ★ `None` 这一支返回的是**数字 1，不是字符串**，这一点是刻意的：
+      它要同时适用于文本字段和数值字段——
+        文本：`_normalize_text(1)` → "1" ≠ ""
+        数值：`_round_price(1)`  → 1.0 ≠ None
+      换成字符串的话，数值字段会被 `_round_price` 的 except 分支兜成 None，
+      于是"价格根本没进指纹"和"价格进了指纹、只是脏值被归一"两种实现
+      **都会让这个用例通过**——用例变成空转。
+      （本文件开头那条"每次只改一个东西"的规矩，防的就是这类空转。）
+    """
+    if value is None:
+        return 1
+    if isinstance(value, str):
+        return f"{value}·改"
+    return value + 1
+
+
+def test_every_field_of_a_real_product_row_reaches_the_fingerprint(db, make_product) -> None:
+    """★★ 真实商品行里的**每一个**键，改了都必须让指纹变。
+
+    ★ 为什么需要这一条：上面那份参数化清单是**手写的**，
+      而且和 `_row()`、和指纹的白名单互为镜像。
+      "payload 里有、指纹里没有"的字段，在这种镜像里**三处同时不存在**，
+      于是谁也不会发现、清单还是全绿。
+
+      这不是假想：写这条用例之前，`platform` / `category` 正是这样漏掉的
+      （真实行 10 个键，白名单只有 8 个，参数化清单 7 个字段）。
+
+    ★ 所以这里不再列字段，改成**从上游推导**：
+      拿一份真实装配出来的 payload，把 `top_products[0]` 的每个键逐个改一遍，
+      看指纹认不认。payload 将来加了字段，这条自动就覆盖到了——
+      而"上游加字段"恰恰是手写清单永远追不上的那件事。
+
+    ★ 判据仍然只有一条（见 fingerprint.py 的模块注释）：
+      **出现在 prompt 里的每个字段都必须进指纹**。
+      而 `build_user_prompt()` 是把整个 payload 原样序列化发出去的
+      （不筛字段、不重命名），所以"行里有这个键"就等于"模型看得见这个键"。
+      这也是这条用例敢直接从行里推导覆盖范围的依据。
+    """
+    make_product(
+        sid="m-1",
+        title="安克 充电宝 20000毫安",
+        price=199.0,
+        sales=1000,
+        points=2,
+        platform="京东",
+        category="充电器",
+    )
+    payload = build_payload(db, SourceFilter.all)
+
+    row = payload["top_products"][0]
+    # 先确认样本不是空的：空行会让下面的循环一次都不跑，用例静默地什么也没测
+    assert row, "样本是空的，这个用例没有测到任何字段"
+
+    baseline = build_fingerprint(payload, MODEL)
+    # ★ 收集完再断言，而不是撞到第一个就停：
+    #   漏字段往往是一漏一批（platform / category 就是同一行里一起漏的），
+    #   逐个失败会让人修一个跑一次，而每次跑完只被告知下一个。
+    uncovered: list[str] = []
+    for field in sorted(row):
+        changed = copy.deepcopy(payload)
+        changed["top_products"][0][field] = _mutate(row[field])
+        if build_fingerprint(changed, MODEL) == baseline:
+            uncovered.append(field)
+
+    assert not uncovered, (
+        f"这些字段在 prompt 里、却不在指纹的覆盖范围内：{uncovered}。"
+        f"改它们仍然命中旧缓存——报告会拿着过期的数字说话，而且不报错。"
+    )
 
 
 def test_different_sources_produce_different_fingerprints(db, make_product) -> None:

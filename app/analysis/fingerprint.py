@@ -225,6 +225,28 @@ def _normalize_product_row(row: dict[str, Any]) -> dict[str, Any]:
         "price_max": _round_price(row.get("price_max")),
         "sales": _as_int(row.get("sales")),
         "brand": _normalize_text(row.get("brand")),
+        # ★ platform / category 是补进来的两个字段。它们的判据和 `points` 完全一样
+        #   （见下），所以漏掉的后果也完全一样——但它们**为什么能漏掉**值得记一笔：
+        #
+        #   验证"每个字段都进指纹"那句话的测试清单，是照着这个白名单写的
+        #   （tests/test_fingerprint.py 的 _row() 8 个键、参数化清单 7 个字段），
+        #   而白名单又和真实行高度重合。于是"真实行里有、这里没有"的字段
+        #   在实现、夹具、清单**三处同时不存在**，谁也不会发现——
+        #   本文件把"必须在指纹里"写了两遍（模块注释里那条不变式
+        #   "指纹覆盖的范围 == 模型看到的范围"，以及下面 points 那一段），
+        #   而两处都只是**声明**，没有任何一条路径把声明和真实行对起来。
+        #
+        #   ★ 所以补完之后，保障换成了从真实 payload 推导的那条用例：
+        #     tests/test_fingerprint.py::test_every_field_of_a_real_product_row_reaches_the_fingerprint
+        #     （逐个键改一遍，看指纹认不认）。声明和现实对上之后，
+        #     漏字段这件事才第一次有了会变红的路径。
+        #
+        #   注：`platform`/`category` 进指纹会让**同一批数据的指纹值与从前不同**，
+        #   于是库里已有的旧报告不会再被命中（它们本身没错，只是键对不上了）。
+        #   这是安全的方向——多算一次，而不是拿旧结论冒充新的。
+        #   不需要动 PROMPT_VERSION：prompt 本身一个字没改。
+        "platform": _normalize_text(row.get("platform")),
+        "category": _normalize_text(row.get("category")),
         "shop": _normalize_text(row.get("shop")),
         # ★ `points`（该商品被爆料过几次）也要进指纹，因为它确实在 prompt 里。
         #   这一条的判据始终是同一个：**出现在 prompt 里的每个字段都必须进指纹**。
