@@ -696,3 +696,73 @@ def test_once_mode_runs_an_alert_check(db, add_product, add_rule, monkeypatch):
 
     assert exit_code == 0
     assert count_alerts(db) == 1
+
+
+class _StopLoop(Exception):
+    """从 worker 真实的 `while True` 里跳出来。
+
+    ★ 用一个自己的异常，不用 `KeyboardInterrupt`——那个会被 main() 捕获
+      并变成 `return 130`，于是"循环被中断"和"正常退出"就分不清了。
+    """
+
+
+def test_the_loop_checks_alerts_right_after_startup(db, monkeypatch):
+    """★ 启动后的**第一次**告警检查，不能取决于"这台机器开了多久"。
+
+    修之前：`last_alert_check` 初始化成 `0.0`，而下面用的是
+    `time.monotonic()`，它的原点是**开机时刻**（Windows 上是开机以来的秒数）。
+    于是 `now - 0.0 >= 300` 悄悄变成了「开机时长 ≥ 300 秒」。
+
+    实测（把 monotonic 换成一个受控的值，跑真实的 main() 循环）：
+
+        开机       0.0 秒后启动 worker → ★ 没查
+        开机     120.0 秒后启动 worker → ★ 没查
+        开机     299.0 秒后启动 worker → ★ 没查
+        开机     300.0 秒后启动 worker → 查了
+
+    ★ 这个 bug 的形状值得记一笔：注释写的是"一启动就先查一次"，
+      代码也**看起来**是在表达那个意思（0.0 = 很久以前），
+      而它实际的含义完全取决于这个函数选的时间原点。
+      换成 `time.time()` 它就是对的——所以它也是那种"改一行看似无关的
+      代码就会忽然坏掉"的地方，必须有测试钉住。
+
+    ★ 和最上面那条 `--once` 的测试是两种启动方式，都要守：
+      那条守"别漏掉这个动作"，这条守"别等到开机满 5 分钟才做"。
+    """
+    import scraper.worker as worker
+
+    called: list[int] = []
+
+    monkeypatch.setattr(worker, "init_database", lambda: None)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "recover_stale_tasks", lambda _db: 0)
+    # 没有任务可跑 → 循环会走到 sleep，正好在那里跳出来
+    monkeypatch.setattr(worker, "run_once", lambda _db, **kw: 0)
+    monkeypatch.setattr(worker, "check_alerts_once", lambda _db: called.append(1))
+
+    class FreshBoot:
+        """模拟"刚开机 30 秒就启动了 worker"。
+
+        ★ 整块替换 worker 模块里的 `time` 引用，而不是去改
+          `time.monotonic` 这个属性——后者改的是**全局 time 模块**，
+          会把整个进程（包括 pytest 自己的计时）一起改掉。
+        """
+
+        @staticmethod
+        def monotonic() -> float:
+            return 30.0
+
+        @staticmethod
+        def sleep(_seconds: float) -> None:
+            raise _StopLoop
+
+    monkeypatch.setattr(worker, "time", FreshBoot)
+
+    with pytest.raises(_StopLoop):
+        worker.main([])
+
+    assert called == [1], (
+        "worker 启动后没有立刻查一次告警。"
+        "★ 先去看 last_alert_check 的初值是不是又写成了 0.0："
+        "monotonic 的原点是开机时刻，0.0 的意思是『刚开机』而不是『很久以前』。"
+    )

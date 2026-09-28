@@ -738,9 +738,32 @@ def main(argv: list[str] | None = None) -> int:
             "允许" if args.allow_network else "禁止（仅 --replay 可用）",
             ALERT_CHECK_INTERVAL,
         )
-        # ★ 初始化为 0（而不是"当前时间"），让 worker 一启动就先查一次告警。
+        # ★ 让 worker 一启动就先查一次告警：
         #   否则改完规则要等 5 分钟才看到结果，而人的第一反应是"是不是没生效"。
-        last_alert_check = 0.0
+        #
+        # ★★ 这里**不能**初始化为 0.0（虽然它看起来正是"很久以前"的意思）。
+        #    下面用的是 `time.monotonic()`，而 monotonic 的原点是**开机时刻**
+        #    （Windows 上是开机以来的秒数）。于是 `now - 0.0` 不是"隔了很久"，
+        #    而是"这台机器已经开机多久"——判断悄悄变成了
+        #    `开机时长 >= 300 秒`。
+        #
+        #    实测（把 monotonic 换成一个受控的值，跑真实的 main() 循环）：
+        #
+        #        开机       0.0 秒后启动 worker → ★ 没查
+        #        开机     120.0 秒后启动 worker → ★ 没查
+        #        开机     299.0 秒后启动 worker → ★ 没查
+        #        开机     300.0 秒后启动 worker → 查了
+        #        开机     600.0 秒后启动 worker → 查了
+        #
+        #    也就是说：**刚开机不到 5 分钟就启动 worker 时，第一次告警检查
+        #    会被推迟到开机满 5 分钟**。而这恰恰是最容易发生的场景——
+        #    开机、打开终端、python -m scraper.worker，然后就没有然后了。
+        #    用户看到的是"我改了规则，它没反应"，于是去怀疑规则、阈值、商品，
+        #    不会有人想到"这取决于 Windows 开了多久"。
+        #
+        #    写成 `现在 - 间隔` 就没有这个问题：它的意思是"做得像上一次检查
+        #    刚好在 5 分钟前"，和 monotonic 的原点在哪里完全无关。
+        last_alert_check = time.monotonic() - ALERT_CHECK_INTERVAL
         while True:
             ran = run_once(db, pages=args.pages, allow_network=args.allow_network)
             # ★ 用 monotonic 而不是 time.time()：
