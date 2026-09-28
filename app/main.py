@@ -41,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.analysis.glm_client import key_configured
-from app.api import analysis, products, stats, tasks
+from app.api import alerts, analysis, products, stats, tasks
 from app.config import settings
 from app.db.base import init_database
 
@@ -139,6 +139,11 @@ app.include_router(stats.router)
 app.include_router(products.router)
 app.include_router(analysis.router)
 app.include_router(tasks.router)
+# ★ 告警有"接口"和"检查器"两半，分居两个进程：
+#   接口（本文件）负责配置和查询，检查器（scraper/check_alerts.py）
+#   由采集 worker 每 5 分钟叫一次。接口里那个 POST /api/alerts/check
+#   只是**手动**叫一次同一个函数，不是第二份实现。
+app.include_router(alerts.router)
 
 
 # ★ 这里**曾经**有一份 `_llm_key_configured()` 的实现，和

@@ -84,6 +84,7 @@ from sqlalchemy.orm import Session
 from app.db.base import SessionLocal, init_database, utcnow
 from app.db.models import CrawlTask
 from scraper import ingest
+from scraper.check_alerts import check_alerts
 from scraper.base import (
     CrawlReport,
     DataSource,
@@ -113,6 +114,19 @@ STALE_TASK_MINUTES = 10
 # 轮询间隔（秒）。表做队列没有"有新任务就通知我"的机制，只能轮询。
 # 1 秒足够让前端觉得"提交完马上就开始了"，又不至于空转烧 CPU。
 POLL_INTERVAL = 1.0
+
+# 告警检查的间隔（秒）。
+#
+# ★ 为什么是"每 N 秒"而不是计划里写的"每 N 轮"：
+#   轮询间隔是可以通过 --interval 配的，"轮数"换算出来的实际间隔会跟着变。
+#   而"5 分钟查一次告警"是一个关于**时间**的需求，不该由另一个参数间接决定——
+#   否则有人把 --interval 调成 0.1 之后，告警就变成每 30 秒查一次，
+#   谁也不会往那个方向想。
+#
+# ★ 为什么不每轮都查：告警看的是"价格跌破阈值"这种一天发生几次的事件，
+#   而采集的轮询是秒级的。每秒查一次 = 每秒一次无用查询 + 日志噪声，
+#   还会让 SQLite 的写锁被这个只读检查白白抢占。
+ALERT_CHECK_INTERVAL = 300.0
 
 # ★ 离线重放的语料目录。
 #
@@ -575,6 +589,46 @@ def run_once(
         logger.info("任务 #%s 完成：%s", task.id, task.message)
 
 
+# ===========================================================================
+# 告警检查（每个 N 秒做一次，和采集共用这个进程）
+# ===========================================================================
+
+
+def check_alerts_once(db: Session) -> None:
+    """跑一轮告警检查，把结果写进日志。
+
+    ★ 只记日志，不做任何"推送"——本项目没有外部通知渠道。
+      触发记录落在 alerts 表里，用户打开界面看得到（是【拉】，不是【推】）。
+      这件事在 app/db/models.py 和 scraper/check_alerts.py 里都写明了。
+
+    ★ 异常必须在这里被吞掉（只记日志），理由和 run_once 里那条一样：
+      告警检查是循环里的**附带动作**，它出问题不该让整个 worker 停摆。
+      一旦让异常冒到 main() 的循环外，采集也就一起停了——
+      而"告警查不出来"和"采集停了"是完全不同的两个故障等级。
+
+    ★ 而且必须先 rollback。检查过程中可能已经执行了一半的写操作
+      （比如状态改成 fired、alerts 里加了一行），异常抛出时那个事务是**开着的**。
+      不回滚的话，这个会话后续的每一次操作都会在一个已经出错的事务里跑，
+      报的错会离真正的原因越来越远。
+    """
+    try:
+        report = check_alerts(db)
+    except Exception:  # noqa: BLE001 —— 见上面：附带动作不能拖垮主循环
+        db.rollback()
+        logger.exception("告警检查失败，本轮跳过（下一轮会重试）")
+        return
+
+    # ★ 只在"有事发生"时打 INFO。
+    #   每 5 分钟打一行"检查了 3 条规则，无变化"会让日志里真正重要的
+    #   那两行（触发、重新武装）被淹没——而告警的全部价值就在那两行上。
+    if report.fired or report.rearmed or report.undecidable:
+        logger.info("告警检查：%s", report.as_message())
+        for reason in report.reasons:
+            logger.warning("告警规则判不了：%s", reason)
+    else:
+        logger.debug("告警检查：%s", report.as_message())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m scraper.worker",
@@ -656,17 +710,34 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.once:
             n = run_once(db, pages=args.pages, allow_network=args.allow_network)
+            # ★ --once 也要跑一次告警检查。
+            #   它的语义是"把该做的事做一遍就走"，而告警检查是循环里
+            #   唯一不依赖任务队列的周期性动作。不跑的话，
+            #   "我手动跑一次试试告警"会什么也不发生——而那正是演示时的用法。
+            check_alerts_once(db)
             logger.info("共处理 %d 个任务，退出", n)
             return 0
 
         logger.info(
-            "worker 已启动：轮询间隔 %.1fs，每任务 %d 页，联网=%s",
+            "worker 已启动：轮询间隔 %.1fs，每任务 %d 页，联网=%s，告警每 %.0fs 查一次",
             args.interval,
             args.pages,
             "允许" if args.allow_network else "禁止（仅 --replay 可用）",
+            ALERT_CHECK_INTERVAL,
         )
+        # ★ 初始化为 0（而不是"当前时间"），让 worker 一启动就先查一次告警。
+        #   否则改完规则要等 5 分钟才看到结果，而人的第一反应是"是不是没生效"。
+        last_alert_check = 0.0
         while True:
             ran = run_once(db, pages=args.pages, allow_network=args.allow_network)
+            # ★ 用 monotonic 而不是 time.time()：
+            #   系统时间被 NTP 往回拨时，time.time() 会倒退，
+            #   于是这个判断会变成"还没到时间"并一直等下去（或反过来连查多次）。
+            #   monotonic 只保证单调递增，这正是"隔了多久"需要的语义。
+            now = time.monotonic()
+            if now - last_alert_check >= ALERT_CHECK_INTERVAL:
+                check_alerts_once(db)
+                last_alert_check = now
             if ran == 0:
                 time.sleep(args.interval)
     except KeyboardInterrupt:
