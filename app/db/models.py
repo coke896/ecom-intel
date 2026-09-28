@@ -1,3 +1,4 @@
+
 """ORM 模型：7 张表。
 
 设计要点（每一条都对应一个具体的失败场景，不是"规范要求"）：
@@ -115,10 +116,33 @@ class Product(Base):
     image_url: Mapped[str | None] = mapped_column(Text)
 
     # ---- 价格 -----------------------------------------------------------------
-    # price 是最低价（或唯一价），price_max 是最高价。
-    # ★ 为什么一开始就要有 price_max：
-    #   parse_price 返回二元组（券后价可能是个区间），如果建表时只有 price，
-    #   阶段③ 写 prompt 时才发现价格有区间，就要改表 + 改 prompt + 重跑。
+    # ★ 这两列描述的是【当前这一次成交/爆料的价格区间】，不是历史统计量。
+    #
+    #   price     = 区间下限（或唯一价）
+    #   price_max = 区间上限（单值时两者【相等】，不是 NULL）
+    #
+    #   来源是 cleaner.parse_price() 返回的二元组：
+    #     "199元"          → (199.0, 199.0)
+    #     "券后199-299"     → (199.0, 299.0)
+    #     "199元起"        → (199.0, None)   ← 开区间，上限未知
+    #
+    # ★ 这一点必须写死，因为它有一个非常隐蔽的出错方式：
+    #
+    #   "上限"和"历史最高价"看起来是同一件事，但它们是两回事。
+    #   Mock 数据一度把 price_max 填成了 90 天序列的最大值
+    #   （本意是"历史最高价"），而真实采集路径按 parse_price 填区间上限。
+    #   于是**同一个列在 ?source=mock 和 ?source=smzdm 下含义不同**，
+    #   混在一起做「价格区间宽度」这类图时会得到毫无意义的数字，
+    #   而且不报错、没有日志。
+    #
+    #   → 历史最高/最低价一律【从 price_history 现算】（MAX/MIN 聚合），
+    #     那才是唯一的真相来源，而且对两个数据源语义一致。
+    #     tests/test_seed.py::test_price_max_is_the_deal_range_not_a_historical_high
+    #     守着这条。
+    #
+    # ★ 为什么建表时就要有 price_max：
+    #   如果只有 price，阶段③ 写 prompt 时才发现价格有区间，
+    #   就要改表 + 改 prompt + 重跑。
     price: Mapped[float | None] = mapped_column(Float)
     price_max: Mapped[float | None] = mapped_column(Float)
 

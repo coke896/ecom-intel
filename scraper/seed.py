@@ -561,7 +561,24 @@ def build_products(
             #   不是基准价。列表页显示的和趋势图末端必须是同一个数，
             #   否则用户会发现"表格写着 199，点进去曲线末端是 249"。
             "price": series[-1],
-            "price_max": max(series),
+
+            # ★ price_max 与 price【相等】，因为这是一次单值成交。
+            #
+            #   这里一度写的是 max(series)——把 price_max 当成"90 天最高价"用了。
+            #   看着更"有用"（列表页能显示"较最高价降了 40%"），但它是错的：
+            #
+            #   真实采集路径按 cleaner.parse_price() 的返回值填这个字段，
+            #   语义是【当前这次爆料的优惠价区间上限】（"券后199-299" → 299）。
+            #   两种语义混在同一个列里，后果是 ?source=mock 和 ?source=smzdm
+            #   下的 price_max 含义不同，混在一起算"价格区间宽度"会得到
+            #   毫无意义的数字，而且不报错。
+            #
+            #   历史最高价不是丢了——它随时可以从 price_history 现算：
+            #       SELECT MAX(price) FROM price_history WHERE product_id=?
+            #   那才是唯一的真相来源，且对两个数据源语义一致。
+            #
+            #   详见 app/db/models.py 里 PriceHistory/Product 的价格注释。
+            "price_max": series[-1],
             "sales": int(sales[i]),
             "last_crawled_at": now,
 

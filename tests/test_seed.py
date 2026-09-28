@@ -495,15 +495,85 @@ def test_price_column_equals_last_point_of_series(db) -> None:
         assert product.price == pytest.approx(last), f"商品 {product.id} 当前价与末点不一致"
 
 
-def test_price_max_matches_series_maximum(db) -> None:
-    """price_max 必须是序列最大值——"历史最低价"这类功能全靠它。"""
+def test_price_max_is_the_deal_range_not_a_historical_high(db) -> None:
+    """★ price_max 的语义必须与真实采集路径一致：**单值成交时等于 price**。
+
+    ★ 这条测试替换掉了之前的 test_price_max_matches_series_maximum，
+      后者把 price_max 断言成"90 天序列最大值"——**那是错的语义**。
+
+    为什么错：真实采集路径按 cleaner.parse_price() 的返回值填这个字段，
+    含义是【当前这次爆料的优惠价区间上限】（"券后199-299" → 299）。
+    而"90 天最高价"是另一个东西（历史统计量）。
+    两种语义塞进同一个列，后果是 ?source=mock 和 ?source=smzdm 下
+    price_max 含义不同，混在一起算"价格区间宽度"会得到无意义的数字，
+    而且**不报错、没有日志**。这正是本项目的 source 字段要防的那类问题。
+
+    历史最高价没丢：从 price_history 现算（下面第二段就演示了怎么算）。
+
+    ★ 判别式：把 seed 里的 price_max 改回 max(series)，这条测试会失败。
+      为了让断言不空洞，先确认这些商品的价格序列**确实有波动**
+      （否则 max(series) == series[-1]，两种实现无法区分）。
+    """
     seed_mod.seed(db, count=T_COUNT, days=T_DAYS)
 
+    checked = 0
     for product in db.execute(select(Product).where(Product.source == "mock")).scalars():
-        top = db.execute(
-            select(func.max(PriceHistory.price)).where(PriceHistory.product_id == product.id)
-        ).scalar_one()
-        assert product.price_max == pytest.approx(top)
+        top, bottom = db.execute(
+            select(func.max(PriceHistory.price), func.min(PriceHistory.price))
+            .where(PriceHistory.product_id == product.id)
+        ).one()
+
+        # ★ 只挑"序列确实波动过"的商品来断言——
+        #   对一条平线来说 max(series) == series[-1]，
+        #   两种实现给出同样的值，断言就没有判别力了。
+        if top == bottom:
+            continue
+        checked += 1
+
+        assert product.price_max == pytest.approx(product.price), (
+            f"商品 {product.id} 的 price_max={product.price_max} != price={product.price}。"
+            "price_max 被填成了历史最高价——那会让 mock 和 smzdm 的同名列语义不同。"
+            "历史最高价应当从 price_history 现算（本测试上面就在算）。"
+        )
+
+    assert checked > T_COUNT // 2, (
+        f"只有 {checked}/{T_COUNT} 个商品的价格序列有波动，"
+        "断言覆盖不足——检查 DAILY_SIGMA / PROMO_PROB 是不是被调成了 0"
+    )
+
+
+def test_historical_high_is_available_from_price_history(db) -> None:
+    """★ price_max 不再承载"历史最高价"之后，那个数必须仍然拿得到。
+
+    这条不测实现，而是把"替代方案可用"这件事**演示成可执行的断言**：
+    从 price_history 聚合出的 MAX/MIN 就是历史最高/最低价，
+    而且它对 mock 和 smzdm 两个数据源语义一致（都是"见过的价格的极值"）。
+
+    ★ 为什么值得单独写一条：改 price_max 语义时最容易的失误是
+      "把列改对了，但没人记得历史最高价要从哪儿拿"，
+      然后在阶段② 做"较最高价降幅"这个卡片时才发现数据没了。
+    """
+    seed_mod.seed(db, count=T_COUNT, days=T_DAYS)
+
+    rows = db.execute(
+        select(
+            Product.id,
+            Product.price,
+            func.max(PriceHistory.price),
+            func.min(PriceHistory.price),
+        )
+        .join(PriceHistory, PriceHistory.product_id == Product.id)
+        .where(Product.source == "mock")
+        .group_by(Product.id)
+    ).all()
+
+    assert rows
+    for pid, current, high, low in rows:
+        assert low <= current <= high, f"商品 {pid} 的当前价 {current} 不在历史区间 [{low}, {high}] 内"
+        # 至少要有商品真的降过价，否则"降幅"这个卖点没有数据支撑
+    assert any(current < high for _, current, high, _ in rows), (
+        "所有商品的当前价都等于历史最高价——没有任何促销，降幅类图表会全空"
+    )
 
 
 def test_title_norm_is_produced_by_the_shared_normalizer(db) -> None:

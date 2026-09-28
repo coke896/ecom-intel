@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
@@ -41,9 +43,44 @@ engine = create_engine(
 )
 
 
-@event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
-    """每建立一条新的物理连接，就设置一遍 PRAGMA。
+# ---------------------------------------------------------------------------
+# PRAGMA
+# ---------------------------------------------------------------------------
+
+# ★ 这份清单是【唯一一份】，生产 engine 和测试夹具都用它。
+#
+#   为什么要抽出来：这几项 PRAGMA 都是 **per-connection** 的
+#   （只有 journal_mode 会写进文件头持久化，其余三项每条新连接都要重设）。
+#   如果测试夹具自己抄一份，两边就会悄悄分叉——
+#   典型症状是"测试全绿，线上外键不生效"。
+#
+#   验证方式：tests/test_db_base.py 在**真实文件库**上逐项断言这四条。
+#   （不能用内存库验证 journal_mode：`:memory:` 不支持 WAL，会静默退回 memory 模式。）
+SQLITE_PRAGMAS: tuple[str, ...] = (
+    # WAL（Write-Ahead Logging）：读写互不阻塞。
+    # 默认的 DELETE 模式下，一个写事务会锁住整个库，读请求全部排队。
+    # 本项目有「worker 持续写入 + Web 端持续查询」的并发场景，必须开 WAL。
+    "PRAGMA journal_mode=WAL",
+
+    # WAL 模式下的安全/性能平衡点。
+    # FULL 每次提交都 fsync（慢）；OFF 可能丢数据；NORMAL 在 WAL 下
+    # 只在 checkpoint 时 fsync，崩溃最多丢最近几个事务，
+    # 对"采集到的商品数据"这个量级的损失完全可以接受。
+    "PRAGMA synchronous=NORMAL",
+
+    # ★ SQLite 默认 **不校验外键**！这是个历史遗留的兼容性决定。
+    #   不显式打开的话，REFERENCES 只是注释——插入一个指向不存在商品的
+    #   price_history 会静默成功。必须打开。
+    "PRAGMA foreign_keys=ON",
+
+    # 等锁超时（毫秒）。两个进程同时写时，后到的会等而不是立刻
+    # 抛 "database is locked"。30 秒足够覆盖本项目最长的批量写入。
+    "PRAGMA busy_timeout=30000",
+)
+
+
+def register_sqlite_pragmas(target: Engine) -> Callable[..., None]:
+    """把 PRAGMA 清单挂到 **engine 实例** 的 connect 事件上，返回处理函数。
 
     ★ 两个容易踩的点：
 
@@ -56,31 +93,25 @@ def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
     坑 2：必须在建立任何连接 **之前** 注册。
         connect 事件只在新建物理连接时触发；如果 engine 已经连过数据库，
         后续的连接走的是连接池，不会再触发这个回调。
-        所以这段代码放在模块顶层、紧跟 engine 定义之后。
+        所以调用它的代码必须放在模块顶层、紧跟 engine 定义之后。
+
+    ★ 返回处理函数是为了让测试能断言"监听器确实挂上了"：
+        `event.contains(engine, "connect", handler)`。
+      不返回的话，就没法在不打开真实数据库的前提下检查这件事。
     """
-    cur = dbapi_connection.cursor()
 
-    # WAL（Write-Ahead Logging）：读写互不阻塞。
-    # 默认的 DELETE 模式下，一个写事务会锁住整个库，读请求全部排队。
-    # 本项目有「worker 持续写入 + Web 端持续查询」的并发场景，必须开 WAL。
-    cur.execute("PRAGMA journal_mode=WAL")
+    @event.listens_for(target, "connect")
+    def _apply_pragmas(dbapi_connection: Any, connection_record: Any) -> None:
+        cur = dbapi_connection.cursor()
+        for statement in SQLITE_PRAGMAS:
+            cur.execute(statement)
+        cur.close()
 
-    # WAL 模式下的安全/性能平衡点。
-    # FULL 每次提交都 fsync（慢）；OFF 可能丢数据；NORMAL 在 WAL 下
-    # 只在 checkpoint 时 fsync，崩溃最多丢最近几个事务，
-    # 对"采集到的商品数据"这个量级的损失完全可以接受。
-    cur.execute("PRAGMA synchronous=NORMAL")
+    return _apply_pragmas
 
-    # ★ SQLite 默认 **不校验外键**！这是个历史遗留的兼容性决定。
-    #   不显式打开的话，REFERENCES 只是注释——插入一个指向不存在商品的
-    #   price_history 会静默成功。必须打开。
-    cur.execute("PRAGMA foreign_keys=ON")
 
-    # 等锁超时（毫秒）。两个进程同时写时，后到的会等而不是立刻
-    # 抛 "database is locked"。30 秒足够覆盖本项目最长的批量写入。
-    cur.execute("PRAGMA busy_timeout=30000")
-
-    cur.close()
+# 模块顶层立刻注册（坑 2：必须在任何连接建立之前）
+_apply_pragmas = register_sqlite_pragmas(engine)
 
 
 # ---------------------------------------------------------------------------
