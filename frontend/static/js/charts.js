@@ -275,7 +275,16 @@ function renderShopShare(elId, emptyId, noticeId, data) {
           `<b>${escapeHtml(it.shop)}</b>`,
           it.platform ? `平台：${escapeHtml(it.platform)}` : null,
           `商品数：<b>${it.product_count}</b>（${fmtPct(it.share)}）`,
-          it.avg_price !== null ? `均价：${fmtPrice(it.avg_price)}` : null,
+          // ★ 无价商品会被排除在均价之外（均价只能对算得出来的价格求平均），
+          //   所以两者不等时**必须把分母写出来**。不写的话
+          //   "商品数 100 ｜ 均价 ¥99"会被读成"100 件商品的均价是 99"，
+          //   而真实采集源今天就是这个情况（100 条里 2 条解析不出价格）。
+          it.avg_price !== null
+            ? `均价：${fmtPrice(it.avg_price)}` +
+              (it.priced_count < it.product_count
+                ? `<span style="color:#9ca3af">（基于 ${it.priced_count} 件有价商品）</span>`
+                : '')
+            : null,
         ].filter(Boolean).join('<br/>');
       },
     },

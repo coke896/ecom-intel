@@ -33,6 +33,7 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from app.db.base import get_db, utcnow
 from app.db.models import PriceHistory, Product, Shop
@@ -617,6 +618,136 @@ def test_shop_share_folds_the_tail_into_others_instead_of_dropping_it(client, db
     # 各扇区之和仍然是 100%
     assert abs(sum(it["share"] for it in body["items"]) - 1.0) < 1e-6
     assert sum(it["product_count"] for it in body["items"]) == 8
+
+
+def test_others_avg_price_weights_by_priced_products_not_by_all_products(client, db) -> None:
+    """★ "其他"那一块的均价，权重必须是**有价商品数**。
+
+    ★ 这条不能用"手算一个数写进断言"来测：手算的数只能证明今天的实现
+      跟我的心算一致，证明不了它算的是对的东西。所以期望值由**一条 SQL**
+      给出——直接对尾部所有有价商品求平均。能这么做是因为
+
+          Σ(avgᵢ · nᵢ) / Σnᵢ  ≡  ΣSUMᵢ / Σnᵢ        （avgᵢ = SUMᵢ/nᵢ）
+
+      权重取对有价商品数 nᵢ 时，加权平均与"直接平均"**严格相等**；
+      取错权重（含无价商品的 count）时就不等了。
+      换句话说：**这条等式是唯一能自动区分正确与错误权重的办法。**
+
+    实测这组数据：
+      小店0：3 件商品，1 件有价 ¥300，2 件无价  → SQL 均价 300，权重应为 1
+      小店1：2 件商品，2 件有价 ¥100          → SQL 均价 100，权重应为 2
+      正确 (300·1 + 100·2)/3 = 166.67
+      错误 (300·3 + 100·2)/5 = 220.00
+    ★ 差 32%，而两个数看起来都"像个均价"——这种错没有任何外在症状，
+      只有把口径算一遍才发现。
+
+    ★ 缺价格不是假想情况：真实采集源今天就是 100 条里 2 条解析不出价格，
+      而这个比例没有下限（见 ShopShareOut.total 的 docstring）。
+    """
+    # 大店 3 家各 4 件商品，全部有价 → 按 count 降序排时稳定占住 head
+    for i in range(3):
+        for j in range(4):
+            _add(db, sid=f"big{i}-{j}", title=f"大店{i} 商品{j}", price=100.0, shop=f"大店{i}")
+    # 尾部两家小店，其中"小店0"只有 1 件有价
+    _add(db, sid="s0-priced", title="小店0 唯一有价的", price=300.0, shop="小店0")
+    _add(db, sid="s0-np1", title="小店0 无价1", price=None, shop="小店0")
+    _add(db, sid="s0-np2", title="小店0 无价2", price=None, shop="小店0")
+    _add(db, sid="s1-p1", title="小店1 有价1", price=100.0, shop="小店1")
+    _add(db, sid="s1-p2", title="小店1 有价2", price=100.0, shop="小店1")
+    db.commit()
+
+    body = _get(client, "/api/stats/shop-share", source="mock", limit=3)
+    others = body["items"][-1]
+
+    # ★ 先确认"尾部确实是我以为的那两家"，再断言均价。
+    #   反过来的话，一旦排序规则变了（比如并列时的兜底列改了），
+    #   这条用例会拿另一个数去比，失败信息完全指不出原因。
+    assert others["shop"].startswith("其他"), "尾部没落在两家小店上，这条用例没测到东西"
+    assert (others["product_count"], others["priced_count"]) == (5, 3)
+
+    tail_ids = [
+        s.id for s in db.query(Shop).filter(Shop.name.in_(["小店0", "小店1"])).all()
+    ]
+    expected = db.execute(
+        select(func.avg(Product.price)).where(Product.shop_id.in_(tail_ids))
+    ).scalar_one()
+
+    assert others["avg_price"] == pytest.approx(round(float(expected), 2))
+
+
+def test_every_item_says_how_many_products_its_avg_price_covers(client, db) -> None:
+    """★ 均价的**分母**必须对调用方可见，而且加起来要能对上账。
+
+    ★ 这是"口径对不上时，把差额一并交给调用方"那条规矩的兑现点——
+      同一个文件里的 `/price-distribution` 就是这么做的（它返回 price_missing）。
+      `avg_price` 只能对算得出来的价格求平均，所以它覆盖的范围
+      **必然**小于等于 product_count；不给出分母的话，界面上
+      "商品数 100 ｜ 均价 ¥99"会被理所当然地读成"100 件商品的均价"。
+
+    ★ 断言的是**恒等式**而不是具体数字：
+      Σ priced_count 必须等于该数据源里有价商品的**总数**。
+      折叠成"其他"之后这个和仍然成立（"其他"块的 priced_count 是尾部之和），
+      所以这条能挡住"折叠时漏掉某一家的分母"这类错误——
+      那种错会让账面上凭空多出几件"不知道有没有价格"的商品。
+    """
+    _add(db, sid="a1", title="甲1", price=10.0, shop="甲")
+    _add(db, sid="a2", title="甲2", price=None, shop="甲")
+    _add(db, sid="b1", title="乙1", price=20.0, shop="乙")
+    _add(db, sid="b2", title="乙2", price=30.0, shop="乙")
+    _add(db, sid="c1", title="丙1", price=None, shop="丙")
+    _add(db, sid="d1", title="丁1", price=40.0, shop="丁")
+    _add(db, sid="e1", title="戊1", price=50.0, shop="戊")
+    db.commit()
+
+    # 5 家店、limit=2 → 2 家进 head，3 家折叠成"其他"
+    body = _get(client, "/api/stats/shop-share", source="mock", limit=2)
+    assert body["others_count"] == 3
+
+    for it in body["items"]:
+        assert it["priced_count"] <= it["product_count"]
+        # 均价的三个状态必须自洽：有均价 ⟺ 有分母；没均价 ⟺ 没有任何有价商品
+        assert (it["avg_price"] is not None) == (it["priced_count"] > 0)
+
+    priced_in_db = db.execute(
+        select(func.count(Product.price)).where(Product.source == "mock")
+    ).scalar_one()
+    assert sum(it["priced_count"] for it in body["items"]) == priced_in_db
+    assert sum(it["product_count"] for it in body["items"]) == 7
+
+
+def test_shop_share_total_and_price_distribution_total_reconcile(client, db) -> None:
+    """★ 两个接口的 `total` **口径不同**，但差额必须对得上账。
+
+    ★ 口径不同的理由是画法不同（详见 ShopShareOut.total 的 docstring）：
+      饼图的每一块是"这个店铺占多少商品"，无价商品**同样占地方**，
+      排除掉会让扇区凭空变小；而直方图的每一根柱子是
+      "多少商品落在这个价位"，无价商品**落不进任何一根柱子**。
+
+    ★ 但"口径不同"不能变成"对不上"。等式
+
+          shop-share.total == price-distribution.total + price-distribution.price_missing
+
+      把两者的关系变成一条**可核对的账**——这正是 priced_count 和
+      price_missing 这两个"差额字段"存在的意义：
+      让调用方不必读文档、也不必相信文档，就能确认手里两个数是什么关系。
+
+    ★ 这条用例同时也是那两个字段的**存在理由**：谁删掉任一个，
+      等式就写不出来，这里会红。
+    ★ 实测（真实库，source=smzdm）：饼图 total=100，直方图 total=98 +
+      price_missing=2 —— 今天的偏差就在界面上，不是假想。
+    """
+    _add(db, sid="p1", title="有价的", price=100.0, shop="甲")
+    _add(db, sid="p2", title="有价的2", price=200.0, shop="甲")
+    _add(db, sid="n1", title="无价的", price=None, shop="乙")
+    db.commit()
+
+    pie = _get(client, "/api/stats/shop-share", source="mock")
+    hist = _get(client, "/api/stats/price-distribution", source="mock")
+
+    assert pie["total"] == 3, "饼图的口径是含无价商品"
+    assert hist["total"] == 2, "直方图的口径是只含有价商品"
+    assert hist["price_missing"] == 1
+    assert pie["total"] == hist["total"] + hist["price_missing"]
 
 
 # ===========================================================================

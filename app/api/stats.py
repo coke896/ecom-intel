@@ -266,15 +266,49 @@ class ShopShareItem(BaseModel):
     shop: str
     platform: str | None
     product_count: int
+    """该店铺在本数据源下的商品数。★ **含无价商品**（口径见 ShopShareOut.total）。"""
+
+    priced_count: int
+    """其中有价格的商品数。
+
+    ★ 这个字段存在的唯一理由是给 `avg_price` 一个**可见的分母**。
+      `product_count` 是 100、`avg_price` 只基于其中 98 件，
+      而界面上写着"商品数 100 ｜ 均价 ¥99"——读者会理所当然地
+      把那个均价当成 100 件商品的均价。
+      真实采集源今天就有这种情况（100 条里 2 条解析不出价格），
+      而且这个比例**没有下限**。
+
+      和 `/price-distribution` 返回 `price_missing` 是同一个动作：
+      口径对不上的时候，把差额一并交给调用方，
+      而不是让它从一个孤零零的 `total` 里去猜。
+    """
+
     # 0~1 之间的小数，前端乘 100 显示。★ 不返回已经乘过 100 的数：
     # 一旦前端再乘一次就是 8700%，这种 bug 很常见。
     share: float
     avg_price: float | None
+    """该店铺的均价。★ 只覆盖 `priced_count` 件，不是 `product_count` 件。"""
 
 
 class ShopShareOut(BaseModel):
     source: str
     total: int
+    """商品数。★ **含无价商品**——与 `/price-distribution` 的 `total`
+    （只含**有价**商品）**不是同一个口径**，两者不能直接比。
+
+    ★ 这里刻意跟直方图取不同的口径，理由在两张图的画法里：
+      饼图的每一块是"这个店铺占多少商品"，无价商品**同样占地方**，
+      排除掉会让扇区凭空变小、各扇区之和不再是全部商品；
+      而直方图的每一根柱子是"多少商品落在这个价位"，
+      无价商品**落不进任何一根柱子**，所以它只能在 total 之外，
+      并靠 `price_missing` 把差额说出来。
+
+    ★ 代价就是同一个字段名在两个接口里含义不同。所以两边都写明口径，
+      并且都额外返回一个"差额"字段（这里是 `priced_count` 之和、
+      那里是 `price_missing`），
+      让"total 到底含不含无价商品"不靠读文档、靠读数据就能确认。
+    """
+
     # 被折叠进"其他"的店铺家数。前端可以显示"其他（12 家）"。
     others_count: int
     items: list[ShopShareItem]
@@ -625,6 +659,22 @@ def shop_share(
             Shop.platform.label("platform"),
             func.count(Product.id).label("cnt"),
             func.avg(Product.price).label("avg_price"),
+            # ★ 这个 count 是**下面加权平均的权重**，必须是"有价商品数"。
+            #
+            #   `avg(Product.price)` 在 SQL 里等于 SUM(price)/COUNT(price)，
+            #   分母是**非空**价格的个数——所以把若干个店铺的均价合成一个
+            #   总均价时，权重只能是各自的 COUNT(price)。
+            #
+            #   一旦用 COUNT(Product.id)（含无价商品）当权重，缺价格的商品
+            #   就会**以"它没有参与的那份均价"的名义**去加码：
+            #   一个 100 件商品里只有 1 件有价的店铺，它的均价会被当成
+            #   100 件商品的均价来加权。而缺价格正是真实采集的常态
+            #   （SMZDM 好价卡片 100 条里有 2 条解析不出价格）。
+            #
+            #   ★ 用对权重之后，这个加权平均**恰好等于**尾部所有有价商品的
+            #     直接平均（Σavgᵢ·nᵢ / Σnᵢ = ΣSUMᵢ / Σnᵢ），
+            #     于是它可以拿一条 SQL 直接核对——见 test_api_smoke.py。
+            func.count(Product.price).label("priced_cnt"),
         )
         .select_from(Product)
         # ★ LEFT JOIN 而不是 JOIN：price 为空 / shop 为空的商品也必须被统计。
@@ -649,6 +699,7 @@ def shop_share(
             shop=r.shop,
             platform=r.platform,
             product_count=int(r.cnt),
+            priced_count=int(r.priced_cnt),
             share=round(int(r.cnt) / total, 4) if total else 0.0,
             avg_price=round(float(r.avg_price), 2) if r.avg_price is not None else None,
         )
@@ -661,17 +712,23 @@ def shop_share(
         tail_count = sum(int(r.cnt) for r in tail)
         # 加权平均：不能用 avg(avg_price)，那是"平均的平均"，
         # 会让只有 1 个商品的小店和 300 个商品的大店等权。
-        weighted = [r for r in tail if r.avg_price is not None and r.cnt]
+        #
+        # ★ 权重是 priced_cnt 而**不是** cnt——见上面 select 里那段注释。
+        #   用 count(price) 当权重之后，这个式子与"尾部所有有价商品
+        #   直接求平均"严格相等（Σavgᵢ·nᵢ / Σnᵢ = ΣSUMᵢ / Σnᵢ），
+        #   所以 test_api_smoke.py 里可以拿一条 SQL 直接核对它。
+        weighted = [r for r in tail if r.avg_price is not None and r.priced_cnt]
         avg = None
         if weighted:
-            wsum = sum(float(r.avg_price) * int(r.cnt) for r in weighted)
-            wcnt = sum(int(r.cnt) for r in weighted)
+            wsum = sum(float(r.avg_price) * int(r.priced_cnt) for r in weighted)
+            wcnt = sum(int(r.priced_cnt) for r in weighted)
             avg = round(wsum / wcnt, 2) if wcnt else None
         items.append(
             ShopShareItem(
                 shop=f"其他（{others_count} 家）",
                 platform=None,
                 product_count=tail_count,
+                priced_count=sum(int(r.priced_cnt) for r in tail),
                 share=round(tail_count / total, 4) if total else 0.0,
                 avg_price=avg,
             )
