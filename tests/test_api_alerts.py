@@ -797,6 +797,111 @@ def test_list_alerts_respects_limit(client, db, make):
     assert client.get("/api/alerts?limit=2").json()["total"] == 2
 
 
+def test_editing_a_rule_does_not_rewrite_its_past_records(client, db, make):
+    """改了规则之后，**历史记录**仍然说自己触发时的那个条件。
+
+    ★ 这条守的是一句话：**事件的字段不该随配置变**。
+
+      `PATCH /rules/{id}` 是**就地**改 `rule_type` / `threshold` 的，
+      它不碰 alerts 表（只有 DELETE 规则才连带删记录）。所以历史记录
+      如果去读规则表的当前值，就会出现：
+
+          价格低于 ¥50 ｜ 触发价 ¥89.9     ← 89.9 < 50 是假
+
+      这条记录在**宣称一条条件不成立的规则触发过**。而前端那一列
+      （frontend/alerts.html 的 ruleText）就是拿这两个值渲染的，
+      矛盾会直接显示给人看。
+
+    ★ 用真实触发路径之外的工厂造记录是有意的：
+      这里要测的是**读取侧**怎么取这两个值，不是触发侧怎么写。
+      触发侧由 test_alerts.py::test_trigger_writes_the_rule_snapshot 守。
+    """
+    product, _ = make
+    rule_id = create_rule(client, product.id, threshold=100.0)["id"]
+    add_alert(db, rule_id, price=89.9)
+
+    # 前提：改之前是自洽的
+    before = client.get("/api/alerts").json()["items"][0]
+    assert before["threshold"] == 100.0
+    assert before["price_at_trigger"] < before["threshold"]
+
+    resp = client.patch(f"/api/alerts/rules/{rule_id}", json={"threshold": 50.0})
+    assert resp.status_code == 200, resp.text
+
+    # 规则本身确实被改了——不先断言这个的话，一个"PATCH 根本没生效"的
+    # 实现也能让下面的断言全绿（那就成了空转）
+    assert resp.json()["threshold"] == 50.0
+
+    after = client.get("/api/alerts").json()["items"][0]
+    assert after["threshold"] == 100.0, (
+        "历史记录跟着规则一起变了——它现在会显示成"
+        f"『价格低于 ¥{after['threshold']} ｜ 触发价 ¥{after['price_at_trigger']}』，"
+        "而这句话里的不等式是假的"
+    )
+    assert after["rule_type"] == "price_below"
+
+
+def test_editing_the_rule_type_does_not_rewrite_its_past_records(client, db, make):
+    """改成跌幅规则后，历史记录仍然说"价格低于"，不说"跌了百分之多少"。
+
+    ★ 和上一条是同一个病，但形状不同，所以单独测：
+      改的是**类型**而不是阈值，症状从"不等式是假的"变成
+      **"触发价"这一列对百分比规则根本没有意义**——
+      跌幅规则里没有"触发价低于阈值"这回事，阈值是百分比。
+    """
+    product, _ = make
+    rule_id = create_rule(client, product.id, threshold=100.0)["id"]
+    add_alert(db, rule_id, price=89.9)
+
+    resp = client.patch(
+        f"/api/alerts/rules/{rule_id}",
+        json={"rule_type": "price_drop_pct", "threshold": 20.0},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rule_type"] == "price_drop_pct"
+
+    after = client.get("/api/alerts").json()["items"][0]
+    assert after["rule_type"] == "price_below", (
+        f"历史记录的类型跟着规则变成了 {after['rule_type']!r}——"
+        "它现在会渲染成『相对历史最高价跌 20% ｜ 触发价 ¥89.9』，"
+        "而『触发价』这一列对百分比规则是句没有意义的话"
+    )
+    assert after["threshold"] == 100.0
+
+
+def test_a_record_without_a_snapshot_falls_back_to_the_current_rule(client, db, make):
+    """加列之前写下的记录（快照为 NULL）回退到规则当前值。
+
+    ★ 为什么这个回退是对的，而不是"编一个值"：
+      这些记录本来就没有快照，回退到当前值 = **回到加列之前的行为**。
+      另一条路（迁移时把"当前值"回填进去）才是编造——它把"不知道"
+      伪装成"知道"，而且伪装得很好：界面上看不出任何区别。
+      见 app/db/migrate.py 里"故意不做数据回填"那段。
+
+    ★ `snapshot=False` 必须显式写出来，这是工厂的默认值刻意的反面
+      （默认造真实形状，老形状要明说）。
+    """
+    product, _ = make
+    rule_id = create_rule(client, product.id, threshold=100.0)["id"]
+    add_alert(db, rule_id, price=89.9, snapshot=False)
+
+    # 前提：这一行**真的**没有快照。不先断言这个的话，
+    # 一个"工厂忘了写 NULL"的实现会让这条用例测到别的路径却照样绿。
+    stored = db.get(Alert, client.get("/api/alerts").json()["items"][0]["id"])
+    assert stored.rule_type_at_trigger is None
+    assert stored.threshold_at_trigger is None
+
+    item = client.get("/api/alerts").json()["items"][0]
+    assert item["threshold"] == 100.0
+    assert item["rule_type"] == "price_below"
+
+    # ★ 反着再走一步：改成 50 之后，这条**没有快照**的记录是会跟着变的
+    #   （它的值只能来自规则表）。把它断言出来，是为了让"回退"这件事
+    #   的代价是可见的——而不是让人以为老记录也被保护了。
+    client.patch(f"/api/alerts/rules/{rule_id}", json={"threshold": 50.0})
+    assert client.get("/api/alerts").json()["items"][0]["threshold"] == 50.0
+
+
 # ===========================================================================
 # 六、手动查一轮
 # ===========================================================================

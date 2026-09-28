@@ -267,6 +267,14 @@ def check_alerts(db: Session, *, now: datetime | None = None) -> AlertReport:
                     rule_id=rule.id,
                     triggered_at=when,
                     price_at_trigger=product.price,
+                    # ★ 规则快照。必须在**触发这一刻**取，不能等以后去 join 规则表——
+                    #   规则是可以改的（PATCH 就地改 threshold / rule_type，
+                    #   不会动 alerts 表），事后 join 拿到的是"现在"的规则，
+                    #   于是历史记录会跟着变，甚至会变成自相矛盾的一句话
+                    #   （"价格低于 ¥50 ｜ 触发价 ¥89.9"，而 89.9 < 50 是假）。
+                    #   实测过，见 models.Alert 上那段注释。
+                    rule_type_at_trigger=rule.rule_type,
+                    threshold_at_trigger=rule.threshold,
                     # ★ 恒为 False：本项目**没有外部推送渠道**
                     #   （不发邮件、不发 webhook）。日志和界面上的列表
                     #   都是【拉】的，不是【推】的——用户打开页面才看得到。

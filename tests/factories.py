@@ -268,18 +268,45 @@ def count_alerts(db: Session) -> int:
     return int(db.scalar(select(func.count()).select_from(Alert)) or 0)
 
 
-def add_alert(db: Session, rule: AlertRule | int, price: float = 88.0) -> Alert:
+def add_alert(
+    db: Session,
+    rule: AlertRule | int,
+    price: float = 88.0,
+    *,
+    snapshot: bool = True,
+) -> Alert:
     """直接插一条触发记录。
 
     ★ 用来构造"已经触发过一次"的历史。走 `check_alerts` 当然也能造出来，
       但那要求测试先把价格和轮次都摆对——而想测的东西可能只是
       "列表接口怎么显示这条记录"。
+
+    ★ `snapshot=True`（默认）会把**触发时的规则值**一并写进快照列，
+      这才是真实触发的形状——`check_alerts` 写出来的每条记录都带快照。
+      默认值是 True 而不是 False，是因为**默认该造出真实的形状**：
+      默认造"加列之前的老记录"的话，几乎所有用例都会在测一条
+      "库被迁移过但数据没回填"的边缘路径，而它们本来想测的不是这个。
+
+    ★ `snapshot=False` 造的是**迁移前的老记录**（两列 NULL）。
+      这个形状只应该被"NULL 兜底"那条用例用到，所以它必须显式写出来——
+      写出来的时候读代码的人就知道"这里在故意造老数据"。
     """
-    rule_id = rule if isinstance(rule, int) else rule.id
+    rule_obj = rule if isinstance(rule, AlertRule) else db.get(AlertRule, rule)
+    if rule_obj is None:
+        # ★ 别让它退化成"外键指向不存在的规则"然后过一个用例：
+        #   SQLite 开了 foreign_keys=ON 时这会抛 IntegrityError，
+        #   但错误信息只会说外键，不会说"你传错了 id"。
+        raise AssertionError(f"add_alert：规则 #{rule} 不存在，测试数据摆错了")
+
     alert = Alert(
-        rule_id=rule_id,
+        rule_id=rule_obj.id,
         triggered_at=utcnow(),
         price_at_trigger=price,
+        # ★ 和 scraper/check_alerts.py 的触发路径写的是同一对值。
+        #   两边必须一致，否则工厂造出来的"历史记录"和真实产生的
+        #   记录形状不同，用工厂写的用例就测不到真实路径。
+        rule_type_at_trigger=rule_obj.rule_type if snapshot else None,
+        threshold_at_trigger=rule_obj.threshold if snapshot else None,
         # ★ 恒为 False：本项目没有外部推送渠道。见 models.py 与
         #   scraper/check_alerts.py 里的说明。
         notified=False,

@@ -409,6 +409,65 @@ def test_records_the_price_at_trigger_time(db, add_product, add_rule):
     assert alert.price_at_trigger == pytest.approx(88.5)
 
 
+def test_trigger_writes_the_rule_snapshot(db, add_product, add_rule):
+    """触发时必须把**当时生效的规则**一起写进记录。
+
+    ★ 这是"记录触发原因"的另一半。`price_at_trigger` 只答了
+      "当时多少钱"，答不了"当时在比什么"——而那要两个数：
+      价格（有了）和**当时生效的阈值 / 规则类型**（这条在测的）。
+
+    ★ 写进去的必须真的是**规则对象上的值**，不是重新查一遍库：
+      这里让规则和参数故意不一致（建规则传 threshold=100.0，
+      但断言的是记录里存的 100.0 而不是某个默认值），
+      并且断言的是规则本身的值——两边一致才说明取的是同一处。
+    """
+    p = add_product(sid="a-1", title="安克 充电宝", price=88.5)
+    rule = add_rule(product=p, rule_type=RULE_PRICE_BELOW, threshold=100.0)
+
+    check_alerts(db)
+
+    alert = db.execute(select(Alert)).scalar_one()
+    assert alert.rule_type_at_trigger == RULE_PRICE_BELOW
+    assert alert.threshold_at_trigger == pytest.approx(100.0)
+    # 前提：这两列不该是"恰好和规则一样"的巧合——规则本身就是这个值
+    assert rule.threshold == pytest.approx(100.0)
+
+
+def test_the_snapshot_survives_a_later_rule_change(db, add_product, add_rule):
+    """★ 端到端地把这个 bug 复现一遍，然后确认它没有了。
+
+    这是**实测复现过**的那个场景（真库上跑的）：
+    商品跌到 89.9 触发 → 用户把阈值改成 50 → 那条历史记录
+    原本会变成"价格低于 ¥50 ｜ 触发价 ¥89.9"，一个假命题。
+
+    ★ 和 test_api_alerts.py 里那条的区别：这条从**真实触发**开始，
+      走完整的「触发 → 改规则 → 读库」路径。接口那条是单测读取侧。
+      两条都要有——否则"触发时没写快照"和"读的时候没读快照"
+      这两种坏法，只会各被其中一条抓到。
+    """
+    p = add_product(sid="a-1", title="安克 充电宝", price=89.9)
+    rule = add_rule(product=p, rule_type=RULE_PRICE_BELOW, threshold=100.0)
+    check_alerts(db)
+    alert_id = db.execute(select(Alert.id)).scalar_one()
+
+    # 模拟 PATCH：就地改规则（接口层做的事就是这两行赋值）
+    rule.threshold = 50.0
+    db.commit()
+
+    # ★ expire_all() 不能省：测试的会话是 expire_on_commit=False，
+    #   commit 不会让 Alert 对象过期——上面那次 commit 改的是 alert_rules，
+    #   但 Alert 对象仍留在会话的身份映射里。不 expire 的话，下面读到的是
+    #   **内存里那份**，而这条用例要证明的恰恰是"库里那行没被改"。
+    #   同一件事 check_alerts 自己也做了一次（见 docs 16.10）。
+    db.expire_all()
+    stored = db.get(Alert, alert_id)
+    assert stored.threshold_at_trigger == pytest.approx(100.0), (
+        "阈值被追溯改写了：记录现在会说『价格低于 ¥50 ｜ 触发价 ¥89.9』，"
+        "而 89.9 < 50 是假的"
+    )
+    assert stored.price_at_trigger == pytest.approx(89.9)
+
+
 def test_notified_stays_false_because_there_is_no_push_channel(db, add_product, add_rule):
     """★ 锁定一个**当前不成立的功能**：本项目没有外部推送渠道。
 

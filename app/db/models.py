@@ -332,6 +332,34 @@ class Alert(Base):
     #   要去反查时间点，既慢又可能因为数据清理而查不到。
     price_at_trigger: Mapped[float | None] = mapped_column(Float)
 
+    # ★★ 触发时的**规则**，同样必须冗余存下来——上面那句话只做了一半。
+    #
+    #   "事后想还原当时为什么触发"需要两个数：当时的价格（有了）和
+    #   **当时生效的阈值 / 规则类型**（原先没有）。缺了后者的后果是
+    #   `GET /api/alerts` 会拿规则**现在**的样子去渲染历史记录——
+    #   而规则是可以改的（PATCH /rules/{id} 就地改 threshold 和 rule_type，
+    #   且**不动 alerts 表**，只有 DELETE 规则才连带删除记录）。
+    #
+    #   实测复现过（真库数据，改一次规则即可）：
+    #     原始记录     价格低于 ¥100 ｜ 触发价 ¥89.9   ← 自洽
+    #     阈值改成 50  价格低于 ¥50  ｜ 触发价 ¥89.9   ← 89.9<50 是假：
+    #                                                  记录在宣称一条条件
+    #                                                  不成立的规则触发过
+    #     改成跌幅规则 相对最高价跌 20% ｜ 触发价 ¥89.9 ← "触发价"对
+    #                                                  百分比规则没有意义
+    #   而前端那一列就是按这两个字段渲染的（frontend/alerts.html 的
+    #   ruleText），也就是说矛盾会直接显示给人看。
+    #
+    #   ★ 同一个道理这个项目已经写过一次：告警拆成"规则"（配置实体）和
+    #     "触发记录"（事件实体）两张表。**事件的字段不该随配置变**——
+    #     否则它就不是事件记录了，而是一张"当前配置的视图"。
+    #
+    #   ★ 可空的原因只有一个：这两列是后加的，加列之前写下的记录没有值
+    #     （见 app/db/migrate.py）。读取时对 NULL 兜底用当前规则的值，
+    #     也就是回到加列之前的行为。**新写入的记录一律填值。**
+    rule_type_at_trigger: Mapped[str | None] = mapped_column(String(32))
+    threshold_at_trigger: Mapped[float | None] = mapped_column(Float)
+
     notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     rule: Mapped[AlertRule] = relationship(back_populates="alerts")

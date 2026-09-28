@@ -181,7 +181,25 @@ class AlertOut(BaseModel):
     product_id: int
     product_title: str
     rule_type: str
+    """★ **触发时**的规则类型，不是规则现在的类型。
+
+    两者会不一样，因为规则是可以改的：`PATCH /rules/{id}` 就地改
+    `rule_type` / `threshold`，而**不碰 alerts 表**。改完之后，
+    这条历史记录如果去读规则表的当前值，就会变成一句自相矛盾的话——
+    实测过的两种形态：
+
+        价格低于 ¥50 ｜ 触发价 ¥89.9        ← 89.9 < 50 是假
+        相对最高价跌 20% ｜ 触发价 ¥89.9    ← "触发价"对百分比规则没有意义
+
+    所以本接口读的是 alerts 行里的快照（见 models.Alert 的注释）。
+    加列之前写下的记录没有快照，这时回退到规则当前值——
+    也就是回到加列之前的行为，而不是编一个值出来。
+    """
+
     threshold: float
+    """★ 同上，是**触发时**的阈值。含义随 rule_type 而定：
+    `price_below` 是元，`price_drop_pct` 是百分比。"""
+
     triggered_at: datetime
     price_at_trigger: float | None
 
@@ -566,7 +584,15 @@ def list_alerts(
     source: SourceDep,
     limit: int = Query(50, ge=1, le=500, description="最多返回几条"),
 ) -> AlertListOut:
-    """触发记录，最新的在前。★ 同样支持 `?source=`（理由见 list_rules）。"""
+    """触发记录，最新的在前。★ 同样支持 `?source=`（理由见 list_rules）。
+
+    ★ 每条的 `rule_type` / `threshold` 取的是**触发时的快照**，不是规则当前的值。
+      理由见 AlertOut 的字段说明——一句话：规则能改，事件不能跟着改。
+
+      `rule` 仍然要 join，但只为了两件事：取 `product_id` 和 `product_title`
+      （商品也会有名字，但那是商品自己的属性，不是"配置"），
+      以及 `?source=` 过滤要走 product 这一层。
+    """
     stmt = (
         select(Alert, AlertRule, Product)
         .join(AlertRule, AlertRule.id == Alert.rule_id)
@@ -583,8 +609,35 @@ def list_alerts(
                 rule_id=alert.rule_id,
                 product_id=rule.product_id,
                 product_title=product.title,
-                rule_type=rule.rule_type,
-                threshold=rule.threshold,
+                # ★ 快照优先，没有快照才回退到规则当前值。
+                #
+                #   ★ 判空一律用 `is not None`，**不用 `or`**。
+                #     这两列里 threshold 是浮点数，而 `0.0` 是 falsy——
+                #     写成 `alert.threshold_at_trigger or rule.threshold`
+                #     的话，一条阈值为 0 的历史记录会被当成"没有快照"，
+                #     静默换成一个**别的数字**显示出来。
+                #
+                #     今天库里没有阈值为 0 的规则（实测：alert_rules 只有 1 行，
+                #     price_below / 100.0），POST/PATCH 也把 gt=0 挡在门外。
+                #     所以这不是在修一个已知的坏数据，是在避开一类**看不见**的
+                #     错法：它的表现是界面上显示了一个完全正常的数字，
+                #     没有报错、没有日志、和正确结果长得一模一样。
+                #     多打 6 个字符换掉这种可能性，划算。
+                #
+                #   ★ 走 else 分支的只可能是**加列之前**写下的记录。
+                #     迁移故意不做数据回填（见 app/db/migrate.py 的边界说明），
+                #     所以这里回退到"当前规则值"——也就是回到加列之前的行为，
+                #     而不是编一个值出来冒充快照。
+                rule_type=(
+                    alert.rule_type_at_trigger
+                    if alert.rule_type_at_trigger is not None
+                    else rule.rule_type
+                ),
+                threshold=(
+                    alert.threshold_at_trigger
+                    if alert.threshold_at_trigger is not None
+                    else rule.threshold
+                ),
                 triggered_at=alert.triggered_at,
                 price_at_trigger=alert.price_at_trigger,
                 notified=alert.notified,

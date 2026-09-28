@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import settings
+from app.db.migrate import migrate
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -179,6 +183,15 @@ def init_database() -> None:
 
     settings.ensure_dirs()
     Base.metadata.create_all(engine)
+
+    # ★ 光有 create_all 不够：它只建不存在的**表**，不给已存在的表加**列**。
+    #   所以 models.py 每加一个字段，老库都需要这里补一刀（见 app/db/migrate.py）。
+    #   放在这个函数里，是因为它**两个入口都会走**：
+    #   Web 进程（app/main.py）和采集 worker（scraper/worker.py）——
+    #   只挂在其中一个上的话，另一个先启动就会报"no such column"。
+    applied = migrate(engine)
+    if applied:
+        logger.warning("已补齐库结构：%s", "、".join(applied))
 
 
 def utcnow() -> datetime:
