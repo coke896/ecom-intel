@@ -80,7 +80,7 @@ import sys
 from datetime import timedelta
 
 import numpy as np
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.db.base import SessionLocal, utcnow
@@ -742,6 +742,13 @@ def build_products(
 #   ★ 这条顺序有两组，而"记得改"是不可靠的——alerts → alert_rules 那一组
 #     就漏过一次，代价是"给 mock 商品建过一条规则"之后整个 seed 直接不可用。
 #
+# ★ 还有第三种，它**不是顺序问题**，所以不在上面那张表里：
+#   products.suspected_duplicate_of 是**自引用**外键（商品指着商品）。
+#   指着 mock 商品的那一行不在被删的这一批里，没有"谁先谁后"可调——
+#   只能先显式把它置空。详见下面 3) 那段注释。
+#   ★ 一条"顺序"清单容易让人以为"顺序对了就万事大吉"，
+#     所以这里把不属于顺序的那一类也点出来。
+#
 # ★ 只删 source='mock' 的，绝不动真实数据。
 #   这正是 db/models.py 里把 source 拆成独立字段的价值——
 #   双数据源隔离不只是给统计图用的，也是给数据管理用的。
@@ -785,10 +792,45 @@ def reset_mock_data(db: Session) -> dict[str, int]:
         delete(AlertRule).where(AlertRule.product_id.in_(mock_ids))
     ).rowcount
 
-    # 3) products
+    # 3) ★ 先解开"指向 mock 商品的疑似重复指针"，再删商品。
+    #
+    #    `products.suspected_duplicate_of` 是**自引用外键**，而且没有 ondelete
+    #    （建表时就没写，改它要重建整张表，见下面的说明），
+    #    所以只要有任意一行的指针指着即将被删掉的 mock 商品，
+    #    下面那句 DELETE 就会被外键挡住。实测：
+    #
+    #        IntegrityError: (sqlite3.IntegrityError) FOREIGN KEY constraint failed
+    #
+    #    ★ 这和上面 alerts → alert_rules 是同一族（都是"删之前先解开引用"），
+    #      但形状不同、更阴：那一族是**两张表**，靠调整两个 DELETE 的先后能解开；
+    #      这一条父子在同一张表里，指着 mock 的那行**不在被删的那一批里**，
+    #      没有"谁先谁后"可调，只能显式把指针置空。
+    #
+    #    ★ 为什么是置空而不是拒绝：这个字段的语义是"待人工核对的疑似重复"，
+    #      而它指向的商品正被删掉（用户明确要求重新生成 mock 数据）——
+    #      这条线索按定义已经失效了，留着反而是悬空指向。
+    #
+    #    ★ 为什么不给 FK 加 ondelete="SET NULL" 一劳永逸：
+    #      SQLite 改不了已有的外键约束（要重建整张表并搬 9 万行价格历史），
+    #      而 create_all() 建出来的**新库**会立刻带上它、老库不会——
+    #      同一个字段两种删除行为，且没有任何地方会提示这件事。
+    #      这个项目已经反复记录过"库与代码悄悄分叉"的形态（docs 16.10），
+    #      不在这里再造一个。显式置空对新库老库行为一致。
+    db.execute(
+        update(Product)
+        .where(Product.suspected_duplicate_of.in_(mock_ids))
+        .values(suspected_duplicate_of=None)
+    )
+
+    # 3b) products
     deleted_products = db.execute(
         delete(Product).where(Product.source == "mock")
     ).rowcount
+
+    # ★ 上面那次 update 的行数不取、也不进返回值：这个函数的返回值是
+    #   "删除的行数"（main() 直接把它打印成完成清单），而这是一次更新。
+    #   而且"有几条疑似重复线索失效了"不是可操作的信息——
+    #   它们指向的商品已经不存在了。
 
     # 4) 孤儿店铺：删掉没有任何商品挂靠的店铺。
     #    ★ 不能无条件删光 shops——真实数据的店铺可能还在用。

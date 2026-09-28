@@ -857,6 +857,69 @@ def test_reset_deletes_alerts_before_their_rules(db) -> None:
     assert [a.rule_id for a in remaining_alerts] == [real_rule.id], "真实数据的触发记录被删了"
 
 
+def test_reset_survives_a_pointer_into_the_products_it_deletes(db) -> None:
+    """★ 有别的商品用 suspected_duplicate_of 指着 mock 商品时，reset 还能不能跑。
+
+    ★ 这是上面那条（alerts → alert_rules）的**同族但不同形状**：
+      那一族是两张表之间的父子，靠调两个 DELETE 的先后就能解开；
+      这一条父子在**同一张表**里（商品指着商品），而指着 mock 的那一行
+      **不在被删的那一批里**——没有先后可调，只能显式把指针置空。
+      （所以 reset_mock_data 顶部那张"顺序清单"里没有它，那里现在点名说了。）
+
+    ★ 实测（内存库，PRAGMA foreign_keys=ON）：
+        DELETE ... WHERE id = 被指向的那一个   → IntegrityError（外键挡住）
+        DELETE ... WHERE source = 'smzdm'      → 成功
+      ★★ 第二条反直觉，所以写在这里：SQLite 的**立即**外键约束是在
+         **语句结束时**判定的，不是逐行判定。于是"指向的和被指的在同一批里"
+         的时候，一条 DELETE 把它们一起删掉反而不报错——同一个数据集，
+         删法不同，一个成功一个失败。这种"看你分几条语句删"的约束
+         没法靠试出来，只能知道。
+
+    ★ 今天的可达性：**不可达**，如实记下三条理由——
+      · dedup 的候选池是按 source 读的（scraper/ingest.py 的 load_existing
+        里 `where(Product.source == source)`），所以 smzdm 的爆料只可能
+        指向 smzdm 的商品；
+      · mock 商品从不写这个字段（seed.py 里根本没出现过它）；
+      · 没有任何代码路径删 smzdm 商品。
+      但一旦被触发，症状是 **seed 整个跑不动**（reset 是每次 seed 的必经之路）：
+      它的 commit 在最后，所以数据不会丢，但 seed 从此每次都抛异常。
+      修起来只是三行，所以按可达处理，而不是等它发生。
+
+    ★ 为什么不用 ondelete="SET NULL" 一劳永逸：SQLite 改不了已有的外键约束
+      （要重建整张表、搬 9 万行价格历史），而 create_all() 建出来的**新库**
+      会立刻带上它、老库不会——同一个字段两种删除行为，且没有任何地方提示。
+      这个项目反复记录过"库与代码悄悄分叉"（docs 16.10），不在这里再造一个：
+      显式置空对新库老库行为一致。
+    """
+    seed_mod.seed(db, count=2, days=1)
+    victim = db.execute(select(Product).order_by(Product.id)).scalars().first()
+
+    # 一个真实采集的商品，指着上面那个 mock 商品
+    # （模拟"将来跨源归并"的样子——今天不可达，见 docstring）
+    spy = Product(
+        source="smzdm",
+        source_id="real-9",
+        title="疑似重复的真实商品",
+        price=50.0,
+        suspected_duplicate_of=victim.id,
+    )
+    db.add(spy)
+    db.commit()
+
+    stats = seed_mod.reset_mock_data(db)  # ★ 修复前这里抛 IntegrityError
+
+    assert stats["products"] == 2
+
+    # ★ expire_all()：会话是 expire_on_commit=False 的，
+    #   直接读 spy.suspected_duplicate_of 会命中身份映射里的旧值。
+    db.expire_all()
+
+    # 隔离：只删了 mock，真实数据还在
+    assert db.execute(select(func.count()).select_from(Product)).scalar_one() == 1
+    # ★ 指针必须被**解开**，而不是留成一个指向已删商品的悬空值
+    assert spy.suspected_duplicate_of is None
+
+
 def test_seed_cleans_up_orphan_shops(db) -> None:
     """孤儿店铺要被清掉，但有商品挂靠的店铺必须留下。
 
