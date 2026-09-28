@@ -412,6 +412,77 @@ def test_price_distribution_on_identical_prices_does_not_divides_by_zero(client,
     assert sum(b["count"] for b in body["buckets"]) == 5
 
 
+def test_price_distribution_discloses_the_products_it_cannot_bucket(client, db) -> None:
+    """★ 没有价格的商品**没法放进任何一根柱子**，所以它们必须被说出来。
+
+    ★ 这条是照着同一个文件里的店铺占比立的规矩
+      （`app/api/stats.py` 的 UNKNOWN_SHOP）：
+      饼图把"没有店铺信息的商品"显式归到一档，理由是
+      "不能让它们悄悄消失……否则图上看起来少了 15%，而没人知道那 15% 去哪了"。
+      直方图面对的是同一件事，却把那个数字**算了之后丢掉**
+      （`prices, _ = _fetch_current_prices(...)`）。
+
+    ★ 它为什么比饼图更隐蔽：各柱之和**是**等于 total 的，
+      图自身毫无破绽。出问题的是读者对百分比的理解——
+      前端拿 total 当分母（frontend/static/js/charts.js），
+      于是"这个价位占 X%"被读成占全部商品，而分母里根本没有那些无价格的商品。
+      实测偏差：真实采集源 2.0%（100 个里 2 个）、all 0.2%、mock 0.0%。
+      **这个数今天不大**，所以这条不是数据错误，是"没说清楚"——
+      但它没有下限，且 `total` 是对外公开的接口字段，调用方无从知道这件事。
+    """
+    for i in range(3):
+        _add(db, sid=f"ok{i}", title=f"有价{i}", price=100.0 + i * 50)
+    _add(db, sid="np1", title="暂无报价的商品", price=None)
+    _add(db, sid="np2", title="另一个没价格的", price=None)
+    db.commit()
+
+    body = _get(client, "/api/stats/price-distribution", source="mock")
+
+    assert body["total"] == 3, "total 是「能进桶的商品数」，不含无价格的"
+    assert body["price_missing"] == 2
+    # ★ 先断言"有那句话"再断言"那句话里有数字"：
+    #   反过来写的话，notice 为 None 时会抛
+    #   TypeError: argument of type 'NoneType' is not iterable——
+    #   读起来像测试自己写错了，而不像"后端一个字都没说"。
+    assert body["notice"], "有商品没能进桶却一句话都没有，图上看不出来"
+    # 两个数字都要出现在那句话里，否则读者算不出分母是多少
+    assert "2" in body["notice"] and "3" in body["notice"], (
+        f"提醒里必须同时给出「没价格的数量」和「分母」，实际是：{body['notice']!r}"
+    )
+
+
+def test_price_distribution_does_not_say_no_data_when_products_exist(client, db) -> None:
+    """★★ 有商品、但一个价格都没有时，**不能说「暂无数据（尚未采集）」**。
+
+    ★ 这是同一份文件里已经为销量图表立过的规矩（见
+      `test_empty_source_notice_semantics` 上方那条断言的注释）：
+      "有商品的数据源不该再说「暂无数据」——那会让用户以为采集失败了"。
+      可它俩指向的动作完全相反：
+        · 尚未采集   → 去跑一次采集
+        · 有商品无价格 → 页面结构变了 / 解析器坏了 / 这个源不公开价格
+
+    ★ 触发路径不是假设：smzdm 的商品价格来自列表页的 `z-highlight`，
+      解析器一旦不匹配，所有价格都会变成 None——
+      而那种情况下这张图会说「尚未采集」，
+      同时上面的卡片写着「商品数 100」，两块屏幕自相矛盾。
+    """
+    for i in range(3):
+        _add(db, sid=f"np{i}", title=f"没价格{i}", price=None)
+    db.commit()
+
+    body = _get(client, "/api/stats/price-distribution", source="mock")
+
+    assert body["total"] == 0
+    # ★ 先断言用户读到的那句话，再断言数字：这句话才是这个用例要防的东西，
+    #   而且失败信息里会带上它的原文，省得为了看一眼文案再跑一次。
+    assert body["notice"], "必须给一句解释，否则前端只能画一张白图"
+    assert "暂无数据" not in body["notice"], (
+        f"有 3 个商品的数据源说了「暂无数据」——会把排查方向带跑：{body['notice']!r}"
+    )
+    assert "3" in body["notice"]
+    assert body["price_missing"] == 3
+
+
 # ===========================================================================
 # 六、销量排行
 # ===========================================================================

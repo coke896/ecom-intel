@@ -101,9 +101,21 @@ function toggleEmpty(chartElId, emptyElId, isEmpty, message) {
  * ------------------------------------------------------------------------ */
 
 function renderPriceDistribution(elId, emptyId, noticeId, data) {
-  showNotice(noticeId, data.notice);
+  // ★ 提醒的**颜色**按"图画没画出来"分：这是全项目第一处"提醒和已经画好的图同屏"。
+  //
+  //   其余几处的提醒都只在空态出现，所以默认的黄色告警色是对的。
+  //   但这里有两类完全不同的情况：
+  //     图是空的（一个价格都没有）→ 真的有问题，黄色
+  //     图已经画出来了，只是有几个商品没价格 → 只是说明，蓝色
+  //   把后者也涂成黄色，等于为一个 2% 的偏差拉响警报——
+  //   而告警一旦变成噪音，真正该看的那个就没人看了（同 dedup 里
+  //   "灰色地带不能塞满假阳性"那条取舍）。
+  //
+  //   判断依据就是"有没有柱子"，不需要后端再多返回一个字段。
+  const hasBars = !!(data.buckets && data.buckets.length);
+  showNotice(noticeId, data.notice, hasBars ? 'info' : 'warn');
 
-  if (!data.buckets || !data.buckets.length) {
+  if (!hasBars) {
     toggleEmpty(elId, emptyId, true, data.notice || '暂无价格数据');
     return;
   }

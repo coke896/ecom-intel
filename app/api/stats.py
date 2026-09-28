@@ -87,6 +87,43 @@ def _empty_notice(product_count: int) -> str:
     """
     return SALES_UNAVAILABLE_NOTICE if product_count > 0 else NO_DATA_NOTICE
 
+
+def _price_notice(price_missing: int, charted: int) -> str | None:
+    """价格分布图那句话的**唯一来源**（三种状态，只有一处拼字符串）。
+
+    ★ 抽成函数而不是在端点里拼，理由和 `_empty_notice` 完全相同：
+      这张图有三种状态，而它们指向的**动作完全不同**：
+
+        · 没有数据（尚未采集）        → 去跑一次采集
+        · 有商品、但一个价格都没有    → 查解析器 / 确认这个源公不公开价格
+        · 有价格、但有几个漏的        → 知道百分比的分母是多少就行
+
+      写成三处各拼一句，就会像当初 sales-top 那样漏掉一处；
+      而漏掉的表现不是报错，是**一句听起来很合理、却把人带向错误方向的话**。
+
+    ★ `charted` 和 `price_missing` 都出现在文案里，这不是啰嗦：
+      读者要能自己算出"那个百分比的分母到底是几"。
+      只写"另有 N 个没有价格"，他仍然不知道分母是 933 还是 1000。
+    """
+    if charted == 0:
+        if price_missing == 0:
+            return NO_DATA_NOTICE
+        # ★ 这一句是补上的，它防的是"把'解析不出价格'说成'尚未采集'"：
+        #   实测过——3 个商品全部无价格时，接口原本返回的是
+        #   "该数据源暂无数据（尚未采集）。"，而同一屏的卡片写着"商品数 3"。
+        #   触发路径不是假设：smzdm 的价格来自列表页的 z-highlight，
+        #   解析器一旦不匹配，全部价格都会变 None。
+        return (
+            f"该数据源的 {price_missing} 个商品全部没有价格，画不出分布图。"
+            f"这不是「尚未采集」——请检查价格解析器，或确认该数据源是否公开价格。"
+        )
+    if price_missing:
+        return (
+            f"另有 {price_missing} 个商品没有价格，无法归入任何价格区间，未计入本图；"
+            f"图中的百分比以 {charted} 个有价格的商品为分母。"
+        )
+    return None
+
 # 店铺占比里"没有店铺信息的商品"归到这一档。
 # ★ 必须有这一档，不能让它们悄悄消失：饼图的各扇区之和必须等于 100%，
 #   否则图上看起来"少了 15%"，而没人知道那 15% 去哪了。
@@ -180,7 +217,15 @@ class PriceDistributionOut(BaseModel):
     #   "当前价"（每个商品一个点）和"历史价"（每个商品 90 个点）画出来
     #   形状完全不同，不写清楚就会出现"这个图和那张表对不上"的困惑。
     basis: str = "current_price_per_product"
+    # ★ `total` 是**能进桶的商品数**，不是这个数据源的商品总数。
+    #   两者在有商品缺价格时会不相等（overview 的 product_count 才是总数），
+    #   而这件事原先没有任何一处说明——接口字段叫 total，前端拿它当分母，
+    #   读的人自然以为是"占全部商品"。
     total: int
+    # ★ 有商品、但没有价格的商品数（= 进不了任何柱子的那些）。
+    #   名字跟 overview 的 `price_missing` 保持一致——同一个事实在两个接口上
+    #   必须同名，否则前端要同时记住两个名字，而人只会记住一个。
+    price_missing: int = 0
     bucket_step: float
     buckets: list[PriceBucket]
     # ★ 这个字段是测试逼出来的：空数据源下 `buckets: []` 返回 200，
@@ -447,12 +492,33 @@ def price_distribution(
     source: SourceDep,
     target_buckets: Annotated[int, Query(ge=5, le=40)] = 16,
 ) -> PriceDistributionOut:
-    """价格分布直方图。"""
-    prices, _ = _fetch_current_prices(db, source)
+    """价格分布直方图。
+
+    ★ 没有价格的商品**进不了任何一根柱子**，所以它们既不在 `total` 里、
+      也不在任何一个桶里。这件事必须说出来——同一个文件里的店铺占比
+      就是这么处理的（见 UNKNOWN_SHOP），理由写在那边：
+      "不能让它们悄悄消失……否则图上看起来少了 15%，而没人知道那 15% 去哪了"。
+
+      直方图这一侧比饼图更隐蔽：各柱之和**是**等于 total 的，
+      图自身毫无破绽。出错的是读者对百分比的理解——
+      前端拿 total 当分母（frontend/static/js/charts.js），
+      于是"这个价位占 X%"被读成占全部商品。
+      实测偏差：真实采集源 2.0%（100 个里 2 个）、all 0.2%、mock 0.0%。
+
+      **这个数今天不大**，所以它不是数据错误，是"没说清楚"。
+      但它没有下限（取决于源里有多少商品缺价格），而 total 是对外公开的
+      接口字段，调用方无从知道这件事。
+    """
+    prices, price_missing = _fetch_current_prices(db, source)
 
     if not prices:
         return PriceDistributionOut(
-            source=source.value, total=0, bucket_step=0, buckets=[], notice=NO_DATA_NOTICE
+            source=source.value,
+            total=0,
+            price_missing=price_missing,
+            bucket_step=0,
+            buckets=[],
+            notice=_price_notice(price_missing, charted=0),
         )
 
     # ★ 分桶交给 app/aggregate.bucket_prices()，它返回的 dict 形状
@@ -464,8 +530,10 @@ def price_distribution(
     return PriceDistributionOut(
         source=source.value,
         total=len(prices),
+        price_missing=price_missing,
         bucket_step=step,
         buckets=[PriceBucket(**b) for b in buckets],
+        notice=_price_notice(price_missing, charted=len(prices)),
     )
 
 
