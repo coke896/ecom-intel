@@ -405,6 +405,41 @@ def first_fetch_message(task: CrawlTask) -> str:
     return task.message or ""
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "keyword", "why"),
+    [
+        ({"pages_blocked": 1}, "拦截", "被 WAF 拦了"),
+        ({"pages_ugc": 1}, "分类页", "URL 填错了"),
+        ({"pages_unparsed": 1}, "结构", "页面改版了"),
+    ],
+)
+def test_partial_fetch_message_still_says_which_kind(db, kwargs, keyword, why):
+    """★★ **只坏了一页**的时候，那句话同样必须出现。
+
+    ★ 这是上一条用例的补集，而它才是页面改版真正发生时的样子：
+      改版不会让 5 页全部同时坏掉，通常是"4 页还好、1 页解析出 0 条"。
+
+      在这个形态下：
+        · 任务状态是 success（有数据入库，不是空抓）——**这是对的**
+        · 但消息里原先一个字都不提那一页，
+          于是任务看起来完全正常，而 20 条数据已经静默地不在了。
+
+    ★ 计数器默默涨着却没有一条路径把它送到人眼前，等于没计。
+      这个项目里同一类问题已经出现过好几次（注解承诺了、代码没做），
+      所以这条用例断言的是**消息里有那个词**，而不是"计数器等于 1"——
+      计数器一直是对的，错的是它没人看见。
+    """
+    task = add_task(db)
+
+    # count=20：有数据入库 → 走 success 分支 → 消息来自 as_message()
+    run = worker.run_task(db, task, source=FakeSource(count=20, pages_ok=4, **kwargs), pages=5)
+    worker.finish_task(db, task, run)
+
+    assert task.status == "success", "「只坏了一页」不该被判成失败"
+    msg = first_fetch_message(task)
+    assert keyword in msg, f"{why}：部分成功时 message 里没提这回事（{msg!r}）"
+
+
 # ===========================================================================
 # 四、失败路径
 # ===========================================================================

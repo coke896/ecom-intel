@@ -332,8 +332,15 @@ def run_task(
         )
 
     report = _ingest_in_batches(db, task, deals, source.name, progress_every)
+    # ★ 四个页数统计**一个都不能漏**。原先只并了 ok / blocked 两个，
+    #   于是"5 页里 1 页结构变了"的任务：状态 success、消息里不提，
+    #   而那一页的 20 条数据已经静默地不在了。
     report = replace(
-        report, pages_ok=stats.pages_ok, pages_blocked=stats.pages_blocked
+        report,
+        pages_ok=stats.pages_ok,
+        pages_blocked=stats.pages_blocked,
+        pages_ugc=stats.pages_ugc,
+        pages_unparsed=stats.pages_unparsed,
     )
     return TaskRun(task_id=task.id, layer=layer, report=report, stats=stats)
 
@@ -547,8 +554,14 @@ def replay(
     # ★ 把抓取阶段的页数统计并进报告：`as_message()` 会在有页面被拦时
     #   追加一句"★ N 页被拦截"。重放 6 个文件里有 1 个是 WAF 拦截页，
     #   不并进去的话那句话不会出现，看起来像"6 个文件全都解析成功了"。
+    #   ★ 另外两个统计同理——演示走的正是这条重放路径，
+    #     消息里少一句"有页面没解析出来"，看起来就像全部成功了。
     return replace(
-        report, pages_ok=stats.pages_ok, pages_blocked=stats.pages_blocked
+        report,
+        pages_ok=stats.pages_ok,
+        pages_blocked=stats.pages_blocked,
+        pages_ugc=stats.pages_ugc,
+        pages_unparsed=stats.pages_unparsed,
     )
 
 

@@ -139,6 +139,19 @@ class CrawlReport:
     prices_new: int = 0         # 真正新增的价格点（数据库反馈）
     pages_ok: int = 0
     pages_blocked: int = 0
+    # ★ 下面两个也必须在【报告】里，不能只留在 FetchStats。
+    #
+    #   理由和 pages_blocked 一样（三种"没产出数据"的处置完全不同），
+    #   而且更隐蔽：它们原先只在**一页都没抓到**的时候才被人看见
+    #   （那条路径走 worker._describe_empty_fetch），
+    #   而"5 页里坏了 1 页"恰恰是页面改版最常见的形态——
+    #   那种情况下任务显示 success、消息里一个字都不提，
+    #   于是解析器慢慢腐烂而没人知道。
+    #
+    #   计数器默默涨着、却没有任何一条路径把它送到人眼前，
+    #   等于没计。这一条是本项目反复出现的同一类问题。
+    pages_ugc: int = 0
+    pages_unparsed: int = 0
 
     def as_message(self) -> str:
         """给 crawl_tasks.message 用的一句话摘要（前端直接显示）。"""
@@ -159,8 +172,16 @@ class CrawlReport:
         if self.products_refreshed:
             parts.append(f"刷新 {self.products_refreshed}")
         parts.append(f"新增价格点 {self.prices_new}")
+        # ★ 三种"这一页没产出数据"都要报，而且必须分开报：
+        #   被拦 → 别重试、别加频率；URL 填错 → 改配置；结构变了 → 改解析器。
+        #   合成一句"有页面没抓到"的话，人会跑去研究 WAF。
+        #   前缀的 ★ 是给前端看的：这条消息里带 ★ 就说明有需要处理的事。
         if self.pages_blocked:
             parts.append(f"★ {self.pages_blocked} 页被拦截")
+        if self.pages_ugc:
+            parts.append(f"★ {self.pages_ugc} 页是分类页/UGC（URL 填错了？）")
+        if self.pages_unparsed:
+            parts.append(f"★ {self.pages_unparsed} 页解析出 0 条（页面结构可能变了）")
         return "，".join(parts)
 
 
