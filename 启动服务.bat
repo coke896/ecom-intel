@@ -13,9 +13,15 @@ echo   2) 采集 worker —— 认领采集任务、每 5 分钟检查一次告�
 echo.
 echo ★ 只起 Web 服务的话，采集任务会永远停在 pending。
 echo   这不是 bug：Playwright 不能在 API 进程里跑（原因见 app/api/tasks.py 顶部）。
-echo ★ worker 默认用 --replay（重放本地已抓好的真实页面）：
-echo   不联网、不消耗 SMZDM 的请求额度，演示足够用。
-echo   想真的联网采集就加 --allow-network，但请先读 README 的合规那一节。
+echo.
+echo 启动完成后：
+echo   · 页面上点"采集" → 入队任务 → 这个 worker 会认领并执行。
+echo     mock 源离线可用；smzdm 源默认拒绝联网，会明确告诉你
+echo     "未联网（不是被拦截）"以及怎么开——那不是报错，是刻意的开关。
+echo   · 想灌入真实数据（重放本地已抓好的真实页面，不联网、不消耗额度）：
+echo       另开一个窗口跑  .venv\Scripts\python.exe -m scraper.worker --replay
+echo     ★ 它是"灌一次就退出"，不是常驻——常驻的是本脚本起的这个 worker。
+echo   · 想真的联网采集就给它加 --allow-network，但请先读 README 的合规那一节。
 echo.
 echo 关闭哪个窗口就停止哪个进程，两个都关才彻底停。
 echo.
@@ -40,9 +46,14 @@ if not exist "data\ecom.db" (
 )
 
 echo 正在启动采集 worker...
+rem ★ 这里【不加】--replay：--replay 是"灌一次数据就退出"，
+rem   进了那条分支就不会进轮询循环——既不会认领任务，也不会检查告警。
+rem   所以它给不了上面那些承诺。要灌真实数据请按提示另开窗口跑。
+rem   （这条是写脚本时实测出来的：默认参数的 worker --once 能认领并跑完
+rem     mock 任务，而 --replay 打印完"重放完成"就直接退出了。）
 rem ★ 新窗口要自己再设一次编码：chcp 是每个控制台各自的状态，
 rem   不会被子进程继承。少了这段，worker 的中文日志在那边可能是乱码。
-start "ecom-intel worker" cmd /k "chcp 65001>nul && .venv\Scripts\python.exe -m scraper.worker --replay"
+start "ecom-intel worker" cmd /k "chcp 65001>nul && .venv\Scripts\python.exe -m scraper.worker"
 
 rem 等 worker 把库初始化好再起 Web，避免两个进程同时建表。
 timeout /t 2 /nobreak >nul

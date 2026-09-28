@@ -37,11 +37,17 @@ curl -X POST http://localhost:8001/api/analysis/run     # 第二次应 from_cach
 用的是 `glm-4-flash`——长期免费且不限量，整个项目跑下来 API 成本为零。
 **没有 key 时该接口返回 503 并说明原因，其余功能完全不受影响**（不会静默降级成假报告）。
 
-真实数据那条路径是**离线重放**，不联网、不消耗任何额度：
+真实数据那条路径是**离线重放**，不联网、不消耗任何额度。它把 5 个真实抓取页
+灌进库里然后**退出**（是"灌一次"，不是常驻）：
 
 ```bash
-python -m scraper.worker --replay       # 重放 tests/fixtures/ 里的 5 个真实抓取页
+python -m scraper.worker --replay       # 灌入 100 条真实数据，跑完即退出
+python -m scraper.worker                # 常驻：认领页面上的采集任务 + 每 5 分钟检查告警
 ```
+
+★ 默认参数的 worker **拒绝联网**：页面上入队的 `smzdm` 任务会明确失败，并告诉你
+"未联网（不是被拦截）"以及怎么打开——这不是报错，是刻意的开关。
+只有 `mock` 源离线可用。要真联网得显式加 `--allow-network`，请先读下面的合规那节。
 
 ## 架构
 
