@@ -136,10 +136,10 @@ async function renderSwitcher() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.setAttribute('aria-pressed', String(s.id === active));
-    // all 的计数是各源之和，接口不单独返回，这里自己加
-    const n = s.id === 'all'
-      ? Object.values(counts).reduce((a, b) => a + b, 0)
-      : counts[s.id];
+    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 一处——
+    //   这里原本自己求和，另外两页写 counts['all']（恒 undefined），
+    //   于是同一个按钮在四个页面上有四种表现。见那个函数的注释。
+    const n = sourceCount(s.id, counts);
     btn.innerHTML = n === undefined
       ? s.label
       : `${s.label}<span class="count">${n === 0 ? '空' : n}</span>`;
@@ -226,9 +226,15 @@ async function loadCharts() {
     renderCards(ov);
     showNotice('global-notice', ov.notice);
   } catch (err) {
+    // ★ err.message 也要转义。它不是我们写的句子：api.js 会把后端的
+    //   `detail` 原样带进来，而 FastAPI 的 422 里那个结构包含
+    //   `"input": <请求里传的原值>`——也就是说这串文字里可能出现
+    //   别处来的内容。目前没有能把 URL 参数喂到这里的路径
+    //   （?source= 和 ?product_id= 都在读进来时就校验/转数字了），
+    //   所以这条现在是防御性的；但"来源不是自己"这一点不会变。
     document.getElementById('cards').innerHTML =
       `<div class="card"><div class="label">加载失败</div>
-       <div class="value">—</div><div class="sub">${err.message}</div></div>`;
+       <div class="value">—</div><div class="sub">${escapeHtml(err.message)}</div></div>`;
   }
 
   await loadCharts();

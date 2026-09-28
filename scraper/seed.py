@@ -83,7 +83,7 @@ from sqlalchemy import delete, insert, select
 from sqlalchemy.orm import Session
 
 from app.db.base import SessionLocal, utcnow
-from app.db.models import AlertRule, PriceHistory, Product, Shop
+from app.db.models import Alert, AlertRule, PriceHistory, Product, Shop
 from scraper.dedup import normalize_title
 from scraper.store import PricePoint, record_prices
 
@@ -733,9 +733,13 @@ def build_products(
 #   调参阶段每次改参数都要排查一遍，非常浪费时间。
 #
 # ★ 清空顺序受外键约束限制（PRAGMA foreign_keys=ON 是开着的）：
-#   price_history 引用 products，products 引用 shops。
-#   所以必须从叶子往根删：price_history → products → shops。
+#   price_history 引用 products，products 引用 shops，
+#   alerts 引用 alert_rules。
+#   所以必须从叶子往根删：
+#     price_history / alerts → alert_rules / products → shops
 #   反过来删会被外键挡住。
+#   ★ 这条顺序有两组，而"记得改"是不可靠的——alerts → alert_rules 那一组
+#     就漏过一次，代价是"给 mock 商品建过一条规则"之后整个 seed 直接不可用。
 #
 # ★ 只删 source='mock' 的，绝不动真实数据。
 #   这正是 db/models.py 里把 source 拆成独立字段的价值——
@@ -754,7 +758,28 @@ def reset_mock_data(db: Session) -> dict[str, int]:
         delete(PriceHistory).where(PriceHistory.product_id.in_(mock_ids))
     ).rowcount
 
-    # 2) alert_rules / alerts 也指向 mock 商品，先清掉避免外键报错
+    # 2) alerts → alert_rules：**顺序不能反**。
+    #
+    #    `alerts.rule_id` 指向 `alert_rules.id`，而 PRAGMA foreign_keys=ON
+    #    是开着的（见 app/db/base.py），所以先删规则会被外键挡住、
+    #    抛 IntegrityError。
+    #
+    #    ★ 这里原来只删了 alert_rules，注释却写着"alert_rules / alerts 也指向
+    #      mock 商品，先清掉"——注释比代码多承诺了一件事，而多出来的那条
+    #      恰好是决定这段代码能不能跑的那条。（同一个顺序在
+    #      app/api/alerts.py 的 DELETE /rules/{id} 里是对的：先删 Alert
+    #      再删规则。seed 这边漏了。）
+    #
+    #    ★ 触发条件很低：给任意一个 mock 商品建条规则、等它触发一次
+    #      （worker 每 5 分钟扫一遍），此后任何一次 `python -m scraper.seed`
+    #      都会直接死在第一步，整个 seed 不可用。
+    mock_rule_ids = (
+        select(AlertRule.id).where(AlertRule.product_id.in_(mock_ids)).scalar_subquery()
+    )
+    deleted_alerts = db.execute(
+        delete(Alert).where(Alert.rule_id.in_(mock_rule_ids))
+    ).rowcount
+
     deleted_rules = db.execute(
         delete(AlertRule).where(AlertRule.product_id.in_(mock_ids))
     ).rowcount
@@ -775,6 +800,7 @@ def reset_mock_data(db: Session) -> dict[str, int]:
     db.commit()
     return {
         "price_history": deleted_ph,
+        "alerts": deleted_alerts,
         "alert_rules": deleted_rules,
         "products": deleted_products,
         "shops": deleted_shops,

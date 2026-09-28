@@ -21,6 +21,11 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/images/
+# ★ data/backups/ 必须单独写一条：上面三条是 data/*.db 这种**单层**通配，
+#   匹配不到 data/backups/xxx.db。少了这一条，手工改库前留的快照
+#   会被 git add 悄悄带进仓库——同一个理由（运行时数据，可再生），
+#   而且它比 ecom.db 更没留下的必要。
+data/backups/
 
 # ---- Python 缓存 ------------------------------------------------------------
 __pycache__/

@@ -40,6 +40,35 @@ function setSource(id) {
   history.replaceState(null, '', url);
 }
 
+/** 数据源按钮上该显示的数字。拿不到就返回 undefined（= 不显示数字）。
+ *
+ * ★ 「全部」的计数是**前端自己算的**：`/api/stats/sources` 只按库里
+ *   实际存在的 source 逐条返回（见 app/api/stats.py 里那个 group_by），
+ *   **不单独给一个 `all` 项**。
+ *
+ * ★ 这个函数存在的唯一理由是：这条规则原本在四个页面里各写了一遍，
+ *   然后分叉了——
+ *     · index.html / products.html 自己求和 → 「全部」显示数字
+ *     · analysis.html / alerts.html 写成 `counts['all']` → 恒为 undefined，
+ *       于是「全部」按钮上**一直没有数字**，而且因为 `n === undefined`
+ *       被当成"加载失败"处理，界面上看不出任何异常
+ *   （analysis.html 原来的注释还写着"接口单独给的"——那句是错的，
+ *     它在为一段已经退化成空白的代码辩护。注释写错了比没写更糟。）
+ *
+ *   四种表现收敛成一种，靠的不是"记得改四处"，而是这条规则只存在一处。
+ *
+ * ★ 一个源都没拿到时返回 undefined，**不能返回 0**：
+ *   `Object.values({}).reduce(…)` 得到的是 0，而 0 会被渲染成"空"——
+ *   于是"接口挂了、计数不知道"被显示成"这个数据源是空的"。
+ *   这两件事完全不同，而后者是**看起来很正常**的错误答案。
+ */
+function sourceCount(id, counts) {
+  const known = Object.values(counts || {});
+  if (!known.length) return undefined;
+  if (id !== 'all') return counts[id];
+  return known.reduce((a, b) => a + b, 0);
+}
+
 /** 带 source 参数的请求。
  *
  *  ★ 所有后端接口都走这里，**没有例外**。
@@ -206,4 +235,40 @@ function fmtPct(x) {
 function fmtTime(s) {
   if (!s) return '—';
   return s.slice(0, 16).replace('T', ' ') + ' UTC';
+}
+
+/* ---------------------------------------------------------------------------
+ * 转义
+ *
+ * ★ 这两个函数原本只写在 products.html 里，是**漏在 charts.js 上的**。
+ *   原因是本项目有一条"用 textContent 而不是 innerHTML"的纪律，
+ *   而那条纪律**覆盖不到这里**——理由值得写下来：
+ *
+ *     ECharts 的 tooltip formatter 返回的是**字符串**，
+ *     由 echarts 自己把它赋给 tooltip 节点的 innerHTML。
+ *     也就是说，那段字符串既不在我们的 DOM 拼接路径上，
+ *     也就不受"我们不用 innerHTML"这条纪律的约束，
+ *     但它最终**照样进 innerHTML**。
+ *
+ *   一句话：**不用 innerHTML ≠ 没有 innerHTML。**
+ *   库内部的 HTML 出口，得由喂给库的字符串自己负责。
+ *
+ *   这也是为什么把它放在 api.js：三个页面都引这个文件，
+ *   而这类工具一旦有两份拷贝，就有了分叉的可能（本项目已经栽过几次）。
+ * ------------------------------------------------------------------------ */
+
+/* ★ 必须走 textContent 而不是手写 replace 链。
+ *   手写的那种总是会漏字符，而漏掉的字符是**静默**漏的。
+ */
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+/** 属性值用。★ 和 escapeHtml 的差别只在引号——
+ *  textContent 那条路不处理引号（它生成的是文本节点，不是属性值）。 */
+function escapeAttr(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

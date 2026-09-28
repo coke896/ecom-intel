@@ -141,7 +141,12 @@ class PriceHistoryOut(BaseModel):
         description="x 轴到底画的是什么时间。语义随 source_channel 变化，必须显示给用户。"
     )
     notice: str | None = Field(
-        default=None, description="只有一个数据点时无法画趋势，这里给出解释"
+        default=None,
+        description=(
+            "没有价格点、只有一个点（无法构成趋势）、或点数超过 limit 被截断时，"
+            "这里给出解释。★ 前两种前端要知道，第三种更要——"
+            "「图上没有这一段」和「数据里没有这一段」是完全不同的两件事。"
+        ),
     )
 
 
@@ -351,21 +356,50 @@ def price_history(
       折线图本来也画不了几千个点——真到那个量级应该在后端按周聚合
       （`GROUP BY strftime('%Y-%W', recorded_at)`）再返回。
       现在不做的原因和 stats.py 一样：当前数据量下没必要。
+
+    ★ `limit` 截断时取的是**最新**的 N 个点，且 `total` / `min_price` /
+      `max_price` / 首末时间都算在**全量**上——两件事都必须这样，理由写在
+      下面那两段注释里。截断本身会通过 `notice` 说出来。
     """
     product = db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail=f"商品 {product_id} 不存在")
 
+    # ---- 全量口径：总数与极值算在整张表上，不是算在下面那个窗口上 ----
+    # ★ 必须分两笔查，不能在截断后的列表上现算。
+    #   因为 `/api/products/{id}` 那边走的是 SQL 的 MIN/MAX（全量，无 limit），
+    #   而前端 openDetail 是 Promise.all 同时取这两个接口、渲染在**同一屏**上。
+    #   如果这里算在窗口上，同一屏就会出现：
+    #     左边 KPI 卡「价格点数 600」「历史最低 / 最高 100.00 / 699.00」
+    #     右边折线图的「最高」标记停在 499.00，而且只有 400 个点
+    #   两个接口各自都没写错，只有并排放在一起才矛盾——而用户看到的正是并排。
+    total = db.execute(
+        select(func.count(PriceHistory.id)).where(PriceHistory.product_id == product_id)
+    ).scalar_one()
+
+    hist_min, hist_max, first_at, last_at = db.execute(
+        select(
+            func.min(PriceHistory.price),
+            func.max(PriceHistory.price),
+            func.min(PriceHistory.recorded_at),
+            func.max(PriceHistory.recorded_at),
+        ).where(PriceHistory.product_id == product_id)
+    ).one()
+
+    # ---- 取【最新】的 limit 个点 ----
+    # ★ 排序必须是 desc。原来写的是 asc 配 limit，取到的是**最旧**的
+    #   400 个，把最新的点全部丢掉——一张丢掉了近期数据的价格趋势图，
+    #   恰恰丢掉了它唯一想显示的东西。而这件事是静默发生的：
+    #   `points` 非空、`notice` 为 None，界面上没有任何异常迹象。
+    # ★ 第二排序键 id：recorded_at 只精确到秒，
+    #   同一秒的两条记录（Mock 不会，真实采集会）顺序不能靠运气。
     points = db.execute(
         select(PriceHistory)
         .where(PriceHistory.product_id == product_id)
-        # ★ 第二排序键 id：recorded_at 只精确到秒，
-        #   同一秒的两条记录（Mock 不会，真实采集会）顺序不能靠运气。
-        .order_by(PriceHistory.recorded_at.asc(), PriceHistory.id.asc())
+        .order_by(PriceHistory.recorded_at.desc(), PriceHistory.id.desc())
         .limit(limit)
     ).scalars().all()
-
-    prices = [float(p.price) for p in points]
+    points.reverse()  # 翻回升序：折线图要从左到右按时间画
 
     # ★ 这段提示是"诚实呈现"的一部分，不是客套话。
     #   真实采集来的商品绝大多数只有一个价格点（只被爆料过一次），
@@ -374,8 +408,15 @@ def price_history(
     #   而"事件归并"要解决的就是这件事——同一商品被反复爆料时，
     #   这里就会长出第二个、第三个点。
     notice = None
-    if not points:
+    if total == 0:
         notice = "该商品没有任何价格记录。"
+    elif total > len(points):
+        # ★ 截断了就要说。不说的话，图上少一截而没有任何人知道——
+        #   而"图上没有这段"和"数据里没有这段"是完全不同的两件事。
+        notice = (
+            f"该商品共 {total} 个价格点，图上画的是最近 {len(points)} 个；"
+            f"「历史最低 / 最高」两个数字是整个区间的。"
+        )
     elif len(points) == 1:
         notice = "该商品目前只有一个价格记录点，无法构成趋势。真实采集中这很常见：只有一个爆料提到过它。"
 
@@ -384,7 +425,7 @@ def price_history(
         title=product.title,
         source=product.source,
         source_channel=product.source_channel,
-        total=len(points),
+        total=int(total),
         points=[
             PricePointOut(
                 recorded_at=p.recorded_at.isoformat(sep=" "),
@@ -393,10 +434,10 @@ def price_history(
             )
             for p in points
         ],
-        first_recorded_at=points[0].recorded_at.isoformat(sep=" ") if points else None,
-        last_recorded_at=points[-1].recorded_at.isoformat(sep=" ") if points else None,
-        min_price=round(min(prices), 2) if prices else None,
-        max_price=round(max(prices), 2) if prices else None,
+        first_recorded_at=first_at.isoformat(sep=" ") if first_at else None,
+        last_recorded_at=last_at.isoformat(sep=" ") if last_at else None,
+        min_price=round(float(hist_min), 2) if hist_min is not None else None,
+        max_price=round(float(hist_max), 2) if hist_max is not None else None,
         x_axis_label=_x_axis_label(product.source_channel),
         notice=notice,
     )

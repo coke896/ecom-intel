@@ -92,6 +92,15 @@ class RawDeal:
     brand: str | None = None
     platform: str | None = None
     category: str | None = None
+    # ★ 我方采集通道，由**数据源自己**声明。取值必须落在 db/models.py
+    #   声明的那一族里（mock / jingxuan / fenlei），因为这个值决定了
+    #   price_history.recorded_at 的语义，前端坐标轴的标签也按它查表。
+    #
+    # ★ 这行注释是补上的。原先这个字段**一个字都没有**，而缺注释的代价
+    #   很快就兑现了：smzdm 源往这里填了源站自己的 `'channel':'youhui'`
+    #   标记（那是源站对文章的类型分类，和这个字段只是名字撞了），
+    #   于是 100 条真实数据的 source_channel 全部落在声明取值族之外。
+    #   "字段没有写清语义"和"字段被填错"之间，只隔了一个人。
     channel: str | None = None
 
     # ★ 销量。**允许 None，而且 None 是常态。**

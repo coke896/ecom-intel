@@ -51,8 +51,14 @@ def deal(
     price_raw: str | None = "199元",
     recorded_at: datetime | None = BASE_TIME,
     brand: str | None = None,
-    channel: str | None = None,
+    # ★ 默认值就是"源站声明的通道"——真实的 smzdm 源自己填 "jingxuan"。
+    #   这里写死成 None 的话，用例实际上是在依赖管道兜底，
+    #   而那个兜底正是把 'youhui' 写进库里的那条路（见下面两条用例）。
+    channel: str | None = "jingxuan",
     url: str | None = None,
+    # ★ 默认 None 是有意的：真实数据里"这条爆料没有图"是**常态之一**
+    #   （实测 100 条里 3 条卡片上没有 <img>），所以默认值就该是它。
+    image_url: str | None = None,
     source: str = "smzdm",
 ) -> RawDeal:
     """造一条爆料。默认值挑成"最普通的那一条"，用例只写它关心的字段。"""
@@ -65,6 +71,7 @@ def deal(
         brand=brand,
         channel=channel,
         url=url,
+        image_url=image_url,
     )
 
 
@@ -120,17 +127,39 @@ def test_one_deal_creates_one_product_and_one_price_point(db: Session):
     assert ph[0].recorded_at == BASE_TIME
 
 
-def test_source_channel_falls_back_to_jingxuan(db: Session):
-    """没给 channel 时回退到 'jingxuan'。
+def test_source_channel_comes_from_the_source_not_the_pipeline(db: Session):
+    """★ 通道由**数据源**声明，公共管道不替它猜。
 
-    真实数据里 channel 来自 onclick 的第 4 个参数，值是 'youhui'。
-    回退值存在是为了"源站哪天不给了"时不至于写进 NULL——
-    source_channel 是列表页筛选用的，NULL 会让筛选漏掉这些行。
+    ★ 这条测试原来叫 `test_source_channel_falls_back_to_jingxuan`，
+      断言的正是 `channel="youhui"` 的爆料入库后 `source_channel == "youhui"`——
+      也就是**把缺陷当成预期行为钉死了**，所以它一直没被发现。
+
+      它的 docstring 还给这个行为编了个理由："source_channel 是列表页筛选用的，
+      NULL 会让筛选漏掉这些行"。这句是错的：全项目**没有任何地方**按
+      source_channel 过滤（`?source=` 过滤的是 Product.source）。
+      这个字段真正的用途写在 models.py 第 208-212 行——它决定
+      recorded_at 的语义（爆料发布时间 / 采集时间 / 模拟时间），
+      前端据此标注坐标轴，而 'youhui' 不在声明的取值族里，
+      于是 100 条真实数据的坐标轴全部退化成兜底的"记录时间"。
+
+      'youhui' 是源站对文章的**类型分类**，和我们这个字段只是名字撞了。
+
+    ★ 一条把 bug 当预期的测试，比没有测试更糟：它会让下一个人
+      （包括未来的我）在看到真实数据不对劲时，先去怀疑别的地方。
     """
-    ingest.ingest_deals(db, [deal("1001", "安克 充电宝"), deal("1002", "小米 手环", channel="youhui")])
+    ingest.ingest_deals(db, [deal("1001", "安克 充电宝")])
 
     assert product_by_source_id(db, "1001").source_channel == "jingxuan"
-    assert product_by_source_id(db, "1002").source_channel == "youhui"
+
+
+def test_pipeline_refuses_a_deal_without_a_channel(db: Session):
+    """源站没声明通道时要**响**，不能替它猜一个。
+
+    区别在于"标错"和"未知"：兜底成某个具体源的名字，写进去的值
+    看起来一切正常，而 recorded_at 的语义已经错了——那是最难发现的一类。
+    """
+    with pytest.raises(ValueError, match="没有声明 channel"):
+        ingest.ingest_deals(db, [deal("1009", "没声明通道的爆料", channel=None)])
 
 
 def test_price_is_parsed_from_raw_not_guessed(db: Session):
@@ -553,6 +582,159 @@ def test_ingest_is_idempotent_across_many_rounds(db: Session):
 
 
 # ===========================================================================
+# ★ 不能拿"不知道"去覆盖"已知"
+# ===========================================================================
+
+IMG = "https://y.zdmimg.com/20260927/abc123.jpg_a320.jpg"
+
+
+def test_a_deal_without_an_image_does_not_erase_the_existing_one(db: Session):
+    """更新的那条爆料没带图时，不能把商品已经有的缩略图抹成 NULL。
+
+    ★ 顺序是这条用例的全部意义所在，先说清楚：
+        更新的那条【没图】 → 会走到 UPDATE → 于是有机会抹掉已有的图
+        更新的那条【有图】 → 更旧的那条被"不用更旧的覆盖更新的"挡在门外，
+                             根本走不到 UPDATE，这个 bug 不会出现
+      所以必须按"先有图、后无图（且更新）"来构造。
+
+    ★ "这条没图"不是异常输入：实测 100 条真实爆料里有 3 条卡片上没有 <img>。
+      同一商品的两次爆料里出现一次没图，是完全正常的。
+
+    ★ 判据和 sales / shop_id 不在更新列里是同一条——**不能拿"不知道"
+      去覆盖"已知"**。那两个字段是靠"不列进更新列"做到的，
+      url / image_url 因为要跟着最新爆料走，只能靠"值非空才写"来做到。
+    """
+    # 先来一条更旧的、**有图**的爆料，把商品的图立起来
+    ingest.ingest_deals(
+        db,
+        [
+            deal(
+                "C1",
+                "罗技 MX Master 3S 无线鼠标",
+                price_raw="599元",
+                recorded_at=BASE_TIME - timedelta(days=2),
+                brand="罗技",
+                image_url=IMG,
+            )
+        ],
+    )
+    db.commit()
+    assert product_by_source_id(db, "C1").image_url == IMG, "前置条件没立起来"
+
+    # 再来一条**更新**的、没图的爆料（另一次 ingest_deals 调用 = 另一个批次）
+    ingest.ingest_deals(
+        db,
+        [
+            deal(
+                "C2",
+                "罗技 MX Master 3S 无线鼠标",
+                price_raw="549元",
+                recorded_at=BASE_TIME,          # ★ 比上一条新 → 会真的走 UPDATE
+                brand="罗技",
+                image_url=None,                 # ★ 这条没带图
+            )
+        ],
+    )
+    db.commit()
+
+    p = product_by_source_id(db, "C1")
+    # 价格该更新（这就是归并的意义）
+    assert p.price == pytest.approx(549.0)
+    # ★ 图不该被抹掉
+    assert p.image_url == IMG, "没有图的爆料把商品已有的缩略图抹掉了"
+
+
+# ===========================================================================
+# ★ 分批次：worker 不是一次把 100 条交给 ingest_deals 的
+# ===========================================================================
+
+
+def test_newest_price_survives_across_batches(db: Session):
+    """同一个商品的两条爆料落在**不同批次**时，留下的必须是更新的那条的价格。
+
+    ★ 这个用例是被一次实测复现逼出来的。worker 每 PROGRESS_EVERY（20）条
+      调一次 ingest_deals（worker.py 的 `for start in range(0, len(deals), ...)`），
+      而"见过的最新时间"（newest_seen）当初是**每次调用新建**的字典——
+      第 2 批看不到第 1 批记下的时间，于是：
+
+          同一个商品，500 元的爆料排在第 1 位（第 1 批），
+          100 元的排在第 26 位（第 2 批），
+          按 20 条一批跑完 → product.price = 100。
+
+      而 price_history 里最新的一点是 500。于是列表页显示 100、
+      详情页趋势图最新点是 500——**【一】说的那类不一致，只是换了个位置出现**：
+      两边单看都"对"，并排才矛盾。
+
+    ★ 为什么列表是"新的在前"：/jingxuan/ 的 feed 就是时间倒序的，
+      所以这个 bug 的触发方向正好是最坏的那个——越靠后的批次越旧。
+
+    ★ 断言不看中间计数，只看最终落库的价格和价格点。计数器可以"调对"，
+      数据一致性不行。
+    """
+    deals_with_padding = [
+        # A1：最新的那条，落在第 1 批
+        deal("A1", "安克 充电宝 20000毫安 快充", price_raw="500元",
+             recorded_at=BASE_TIME, brand="安克"),
+        # 中间 24 条无关爆料：品牌各不相同 → 硬门槛一票否决 → 各自新建。
+        # 它们存在只是为了把 A2 挤出第 1 批，不参与本用例的断言。
+        *[
+            deal(f"F{i:02d}", f"填充商品 {i} 型号{i}", price_raw=f"{10 + i}元",
+                 recorded_at=BASE_TIME - timedelta(days=1), brand=f"牌子{i}")
+            for i in range(24)
+        ],
+        # A2：更旧的那条，落在第 2 批（26 条按 20 条一批 = 第 2 批装 20~25 位）
+        deal("A2", "安克 充电宝 20000毫安 快充", price_raw="100元",
+             recorded_at=BASE_TIME - timedelta(hours=11), brand="安克"),
+    ]
+    assert len(deals_with_padding) == 26
+
+    # ★ 完全照 worker 的循环来，而不是"一次全交"——一次全交的话
+    #   内存里那份 newest_seen 还在，用例就绕过了要测的那个场景。
+    for start in range(0, len(deals_with_padding), 20):
+        ingest.ingest_deals(db, deals_with_padding[start : start + 20])
+        db.commit()
+
+    p = product_by_source_id(db, "A1")
+    assert p.price == pytest.approx(500.0), "被更旧的爆料覆盖了"
+    # 26 条爆料里有 2 条是同一个商品 → 25 个商品。
+    assert count(db, Product) == 25
+    # ★ 但价格点是 **26** 个，不是 25 个：A2 虽然没能改商品价格，
+    #   它带来的那个价格点依然是一条真实数据，必须留下。
+    #   （这条断言是修这个 bug 时最容易顺手写错的地方——
+    #     "不覆盖价格"和"不记录这个点"完全是两件事，
+    #     写成 25 就会把"价格历史永久少一个点"锁成预期行为。）
+    assert count(db, PriceHistory) == 26
+
+
+def test_older_deal_still_contributes_its_price_point(db: Session):
+    """更旧的那条爆料不更新商品价格，但**它的价格点必须保留**。
+
+    ★ 这两件事是独立的，很容易被一起砍掉：
+      商品行的 price 是"当前价"（该取最新的），
+      price_history 是"发生过什么"（每一条都是真实数据）。
+      因为后者不该被覆盖而顺手把前者也丢掉，价格序列就永久少一个点——
+      而且这种丢失是静默的，只能靠人眼比对才发现。
+    """
+    newest = deal("B1", "小米 手环 8 NFC版", price_raw="299元",
+                  recorded_at=BASE_TIME, brand="小米")
+    older = deal("B2", "小米 手环 8 NFC版", price_raw="249元",
+                 recorded_at=BASE_TIME - timedelta(days=3), brand="小米")
+
+    ingest.ingest_deals(db, [newest])
+    db.commit()
+    ingest.ingest_deals(db, [older])   # 第 2 次调用 = 另一个批次
+    db.commit()
+
+    p = product_by_source_id(db, "B1")
+    assert p.price == pytest.approx(299.0), "商品价格被更旧的爆料改旧了"
+
+    points = db.execute(
+        select(PriceHistory).where(PriceHistory.product_id == p.id)
+    ).scalars().all()
+    assert sorted(pt.price for pt in points) == [249.0, 299.0], "更旧那条的价格点丢了"
+
+
+# ===========================================================================
 # ★ 纵深防御：decide() 不能把候选归并到它自己
 # ===========================================================================
 
@@ -766,6 +948,25 @@ def test_real_pages_parse_to_the_measured_count(real_deals: list[RawDeal]):
     """
     assert len(real_deals) == 100
     assert len({d.source_id for d in real_deals}) == 100, "解析出了重复的 articleid"
+
+
+def test_every_real_deal_declares_the_smzdm_channel(real_deals: list[RawDeal]):
+    """★ 100 条真实爆料都必须由**源自己**声明通道，且声明的是 'jingxuan'。
+
+    这条是上一条缺陷的正面回归。曾经这里的值是 'youhui'——那是源站对文章的
+    类型分类，被 onclick 参数顺手抓了进来，而 RawDeal.channel 当时**一个字
+    注释都没有**，没人看得出填错了。后果是 100/100 条真实数据的
+    source_channel 落在声明取值族（mock / jingxuan / fenlei）之外：
+    坐标轴标签查不到表，全部退化成兜底的"记录时间"。
+
+    ★ 为什么断言写在**真实 fixture** 上而不是自己造一条 RawDeal：
+      造的那条只能证明"我填什么就是什么"。真实页面里 onclick 的第 4 个参数
+      到底长什么样、以后会不会变，只有真页面能回答。
+    """
+    channels = {d.channel for d in real_deals}
+    assert channels == {"jingxuan"}, f"真实数据的通道声明变了：{channels}"
+    # 顺手把"那个错的值"钉住：它一旦回来，这条测试会指名道姓地说出问题。
+    assert "youhui" not in channels, "源站的类型分类被当成我方通道填进来了（老缺陷复发）"
 
 
 def test_real_data_ingests_cleanly(db: Session, real_deals: list[RawDeal]):

@@ -121,6 +121,10 @@ class FakeSource:
                 # 每条一个品牌 → 硬门槛一票否决 → 全部 NEW，不受灰区影响
                 brand=f"FakeBrand{i}/假牌{i}",
                 platform="京东",
+                # ★ 通道必须由源自己声明，管道不兜底（见 scraper/ingest.py 里
+                #   那段 ValueError）。这个假源叫什么就填什么，不用假装是
+                #   mock/jingxuan——那些名字有语义，冒用反而会掩盖问题。
+                channel="fake",
             )
             for i in range(self.count)
         ]

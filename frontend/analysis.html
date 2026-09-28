@@ -124,7 +124,12 @@ function setBusy(busy, message) {
   //   会发出第二个请求，两个请求同时跑、各花一次 token，最后谁赢看运气。
   runBtn.disabled = busy;
   rerunBtn.disabled = busy;
-  setStatus(message || '');
+  // ★ 只有**明确给了文案**才动状态栏，不能写成 `setStatus(message || '')`。
+  //   后者的问题：generate() 结尾是 `finally { setBusy(false) }`，
+  //   而它上一句刚写下"分析完成，本次消耗 N token"——
+  //   两行在同一个 tick 里跑，那句话写完立刻被自己的 finally 擦成空串，
+  //   用户永远看不到。而"这次花了多少 token"恰恰是这一页最该让人看到的数字。
+  if (message !== undefined) setStatus(message);
 }
 
 function showNotice(text, kind) {
@@ -153,10 +158,12 @@ async function renderSwitcher() {
     const btn = el('button');
     btn.type = 'button';
     btn.textContent = s.label;
-    const n = counts[s.id];
+    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 那一处。
+    //   这里原本写的是 `counts[s.id]`，而接口**不返回** all 这一项
+    //   （它按库里实际存在的 source 逐条返回）——于是「全部」按钮上
+    //   一直不显示数字，另外两页却显示。同一件事两种表现。
+    const n = sourceCount(s.id, counts);
     if (n !== undefined) {
-      // "全部"的计数是接口单独给的，这里不自己相加——相加就多了一处
-      // 需要跟着后端改的地方（见 stats.py 里 sources 端点的注释）。
       btn.appendChild(el('span', 'count', n));
       if (n === 0) btn.classList.add('empty');
     }
@@ -282,7 +289,11 @@ function renderNoticeOnly(data) {
   reportEl.replaceChildren();
   emptyEl.classList.add('show');
   emptyEl.textContent = data.notice || '暂无报告。';
-  showNotice('', '');
+  // ★ 这里**不**清 page-notice（原本有一句 showNotice('', '')，是错的）。
+  //   空态文案属于报告区（就是上面那行），而 page-notice 装的是
+  //   "服务本身出了什么事"（比如没配 key）——两根不同的轴。
+  //   共用一个格子就会互相擦，而被擦掉的那条恰恰是解释
+  //   "按钮为什么是灰的"那条。见下面 init() 里的顺序。
   setStatus('');
 }
 
@@ -351,6 +362,11 @@ rerunBtn.addEventListener('click', () => generate(true));
 (async function init() {
   await renderSwitcher();
 
+  // ★ 顺序要紧：**先 loadLatest()，再健康检查。**
+  //   反过来的话，loadLatest 走到 renderNoticeOnly 时那句 setStatus('')
+  //   会把这里刚写下的 'LLM 未配置' 擦掉——顺序错了，功能就少一半。
+  await loadLatest();
+
   // 健康检查：没配 key 就**提前**说，而不是让用户点了按钮才看到报错。
   // ★ 只禁用"生成/重算"两个按钮，不禁用整页——
   //   报告可能已经在缓存里了，那种情况下不需要 key 也能看
@@ -365,12 +381,20 @@ rerunBtn.addEventListener('click', () => generate(true));
         '.env（GLM_API_KEY=…）后重启服务。已有的报告仍然可以查看。'
       );
       setStatus('LLM 未配置');
+
+      // ★ 光把按钮变灰还不够。报告区的空态文案是**后端**给的
+      //   （"点「生成分析报告」即可调用 GLM 分析当前数据源。"），
+      //   而这句话此刻是一句**做不到的建议**——按钮正是灰的。
+      //   于是页面上出现"按这里"+"此处按不动"，各自单看都合理，合起来是矛盾的。
+      //   前端此刻掌握了更准的信息，就该覆盖它。
+      if (emptyEl.classList.contains('show')) {
+        emptyEl.textContent =
+          '未配置 GLM API Key，暂时无法生成报告。已有的报告仍然可以查看。';
+      }
     }
   } catch (err) {
     console.warn('健康检查失败', err);
   }
-
-  await loadLatest();
 })();
 </script>
 </body>

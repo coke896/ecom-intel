@@ -149,9 +149,10 @@ async function renderSwitcher() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.setAttribute('aria-pressed', String(s.id === active));
-    const n = s.id === 'all'
-      ? Object.values(counts).reduce((a, b) => a + b, 0)
-      : counts[s.id];
+    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 一处。
+    //   原本这里自己求和、另外两页写 counts['all']（恒 undefined），
+    //   于是「全部」按钮在不同页面上长得不一样。
+    const n = sourceCount(s.id, counts);
     btn.innerHTML = n === undefined
       ? s.label
       : `${s.label}<span class="count">${n === 0 ? '空' : n}</span>`;
@@ -201,35 +202,57 @@ function rowHtml(p) {
     </tr>`;
 }
 
-/* ★ 必须转义。
+/* ★ escapeHtml / escapeAttr 已经搬到 static/js/api.js 了。
  *
- *   标题来自外部数据源（采集来的），里面完全可能有 `<`、`&`、引号。
- *   直接用 innerHTML 拼就是 **DOM 型 XSS**：一条标题里带
- *   `<img src=x onerror=...>` 的爆料，就能在打开页面的人浏览器里执行脚本。
- *
- *   这个项目里最危险的地方恰恰是"演示给别人看"的时候——
- *   你会把浏览器打开给面试官看，而数据是真实站点抓来的。
- *
- *   用 textContent 赋值是最稳的转义方式（它不会解析标签），
- *   比手写 replace 链可靠——手写的那种总会漏掉某个字符。
+ *   搬家的理由不是"整理文件"，而是：**charts.js 也需要它，但拿不到。**
+ *   本页的表格可以用 textContent 逐个建节点，而 ECharts 的 tooltip
+ *   formatter 只能返回字符串、由 echarts 内部赋给 innerHTML——
+ *   那条路上页面的转义纪律覆盖不到，只能由喂进去的字符串自己负责。
+ *   放在 api.js（三个页面都引）才不会出现第二份拷贝。
  */
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s == null ? '' : String(s);
-  return d.innerHTML;
-}
-// 属性值里的引号要单独处理（textContent 不转义引号）
-function escapeAttr(s) {
-  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+
+/* ★ 请求序号：只认**最后发出**的那一次的结果。
+ *
+ *   这一页有四个地方会调 load()（翻页、排序、每页条数、搜索），
+ *   而它们全是异步的。连点两下「下一页」会发出两个请求，
+ *   **哪个先回来是不确定的**——先发的完全可能后到。
+ *
+ *   没有这个序号时的表现：表格里是第 2 页的数据，
+ *   而 `state.page` 已经是 3、「第 N / M 页」那行也写着 3。
+ *   下一步再点「下一页」就跳过了第 3 页——**静默丢页**，
+ *   而且因为页码看起来是连着的，根本不会想到是竞态。
+ *
+ *   后端的排序是确定的（见 app/api/stats.py 顶部第 2 条），
+ *   所以这里只要把"该听谁的"定下来就够了。
+ */
+let _loadSeq = 0;
 
 async function load() {
   const tbody = document.getElementById('rows');
+  const seq = ++_loadSeq;
   try {
     const data = await apiGet('/api/products', {
       page: state.page, size: state.size, sort: state.sort, order: state.order, q: state.q,
     });
+
+    // 已经有更新的请求发出去了 → 这份结果过期，整个丢掉。
+    // ★ 必须连错误分支一起挡：否则一个失败的老请求会把
+    //   新请求刚画好的表格替换成一行报错。
+    if (seq !== _loadSeq) return;
+
+    // ★ 页码翻过头了就拉回来。
+    //   「下一页」按钮要等响应回来才会被禁用，而在等待的这段时间里
+    //   每一次点击都已经把 state.page 加过一了——连点几下就会跑到
+    //   数据的页数之外。后端**不夹页码**（见 app/api/products.py：
+    //   直接 offset((page-1)*size)，page 原样回显），于是返回 items: []，
+    //   界面显示"该数据源暂无商品"——可库里明明有 1100 条。
+    //   真实原因是"你翻过头了"，和"没有数据"是完全不同的两件事。
+    if (data.page > data.pages) {
+      state.page = data.pages;
+      // 这一次的结果由下面那个新请求接管（它的序号更新，会更靠后生效）
+      load();
+      return;
+    }
 
     tbody.innerHTML = data.items.length
       ? data.items.map(rowHtml).join('')
@@ -251,6 +274,9 @@ async function load() {
     showNotice('page-notice', data.total === 0 && !state.q
       ? '该数据源暂无商品。' : null);
   } catch (err) {
+    // ★ 过期请求的错误也要丢掉。不挡的话，一个失败的老请求
+    //   会把新请求刚画好的表格替换成一行报错——而且报的还是上一页的错。
+    if (seq !== _loadSeq) return;
     console.error(err);
     tbody.innerHTML = `<tr><td colspan="${COL_COUNT}" style="text-align:center;padding:40px">
         接口请求失败：${escapeHtml(err.message)}</td></tr>`;

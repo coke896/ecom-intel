@@ -82,6 +82,22 @@ from scraper.cleaner import parse_timestamp
 
 BASE = "https://www.smzdm.com/jingxuan/"
 
+# ★ 我方采集通道。这个值必须落在 db/models.py 声明的取值族里
+#   （mock / jingxuan / fenlei），因为 **price_history.recorded_at 的语义
+#   是跟着它走的**——'jingxuan' 意味着 recorded_at 是爆料的发布时间，
+#   而不是我们抓取的时间。前端坐标轴的标签也按它查表。
+#
+# ★ 这里**不能**填源站自己那个 `'channel':'youhui'` 标记。
+#   那是 SMZDM 对文章的**类型分类**，和我们这个字段只是名字撞了、
+#   指的完全是两回事。之前就是把它填进来的，后果：
+#     · 真实数据 100/100 落在声明取值族之外；
+#     · `_X_AXIS_LABELS` 查不到 → 坐标轴退化成兜底的"记录时间"，
+#       而它其实是爆料发布时间（信息量更少，但至少不算错）；
+#     · 详情弹窗里把内部标记当业务值显示成"youhui 通道"（这个就是错的了）。
+#   ★ 一个没写清语义的字段，迟早会被填进一个语义不同的值——
+#     RawDeal.channel 当时就是这样（base.py 里它一行注释都没有）。
+CHANNEL = "jingxuan"
+
 # ★ 请求间隔（秒）。真实浏览器访问时也会停顿，这个节奏不算异常。
 #   取随机而不是固定 2.5 秒：固定间隔本身就是脚本特征。
 DELAY_RANGE = (2.0, 3.0)
@@ -178,7 +194,11 @@ RE_IMG = re.compile(r'src="(https://y\.zdmimg\.com/[^"]+)"')
 RE_BRAND = re.compile(r"'brand':'(.*?)'")
 RE_MALL = re.compile(r"'mall_name':'(.*?)'")
 RE_CATE = re.compile(r"'cate_level1':'(.*?)'")
-RE_CHANNEL = re.compile(r"'channel':'(.*?)'")
+# ★ 这里**曾经**有一条 RE_CHANNEL（抓源站的 `'channel':'youhui'`），已删除。
+#   它抓到的值被写进了 Product.source_channel，而那是两个不同的字段
+#   （详见上面 CHANNEL 那段）。源站的文章类型我们并不使用，
+#   留着只会给下一个人一个"顺手填进去"的机会。
+#   需要的话在 git 历史里能找到。
 
 RE_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 RE_WS = re.compile(r"\s+")
@@ -247,7 +267,8 @@ def parse_feed(html: str) -> list[RawDeal]:
                 brand=_text(RE_BRAND.search(body).group(1)) if RE_BRAND.search(body) else None,
                 platform=_text(RE_MALL.search(body).group(1)) if RE_MALL.search(body) else None,
                 category=_text(RE_CATE.search(body).group(1)) if RE_CATE.search(body) else None,
-                channel=_text(RE_CHANNEL.search(body).group(1)) if RE_CHANNEL.search(body) else None,
+                # ★ 填的是**我方通道**，不是源站的 channel 标记，理由见上面 CHANNEL 那段。
+                channel=CHANNEL,
             )
         )
 

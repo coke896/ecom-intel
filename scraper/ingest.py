@@ -72,6 +72,16 @@ dedup.decide() 那边也加了一道 source_id 自比对防护（纵深防御）
     里，**第一条是它最新的价格**，后面那些是更早的。
     如果无条件用后到的覆盖先到的，最终存下来的会是**最旧**的那个价格。
 
+    ★ 而且"见过的最新时间"必须是**跨批次**的，否则这条规则只在一批之内成立。
+      worker 每 20 条调一次 ingest_deals（PROGRESS_EVERY），而当初
+      newest_seen 这个字典是**每次调用新建**的——第 2 批看不到第 1 批记下的
+      时间，于是一条更旧的爆料照样能把价格改旧。
+      实测复现过：同一个商品，500 元的爆料在第 1 批、100 元的排在第 26 位，
+      按 20 条一批跑完，product.price = 100，
+      而 price_history 里最新的一点是 500——列表页和趋势图自相矛盾。
+      所以基准要取「内存里的」和「库里已有的」两者中更新的那个，
+      见 _newest_known_recorded_at。
+
 【三】没有价格 / 没有时间戳的爆料，不能产生价格点
     price_history 的 price 和 recorded_at 都是 NOT NULL。
     实测 100 条真实爆料里有 **2 条没有价格**（卡片上确实没写），
@@ -87,7 +97,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.db.base import utcnow
@@ -335,10 +345,26 @@ def ingest_deals(
             continue
 
         # ---- 第三步：新建（MARK 或 NEW）----
+        # ★ 通道必须由数据源自己声明（见 base.py 里 RawDeal.channel 的注释）。
+        #   这里**不再兜底**。原先写的是 `deal.channel or "jingxuan"`——那等于
+        #   把 SMZDM 的通道名写进了公共管道：任何源忘了声明，都会被标成一个
+        #   它根本不是的通道，而 recorded_at 的语义正是跟着这个字段走的
+        #   （models.py 第 208-212 行）。NULL 会让语义「未知」，标错却会让
+        #   语义「错误」——后者更糟，因为它看起来一切正常。
+        #   宁可让它响：忘了声明是编程错误，不是运行时状况。
+        channel = (deal.channel or "").strip()
+        if not channel:
+            raise ValueError(
+                f"数据源 {src!r} 没有声明 channel（RawDeal.channel）。"
+                "这个字段决定 price_history.recorded_at 的语义，"
+                "不能由公共管道猜——smzdm 源曾经就是被这里兜底成了 "
+                "'jingxuan'，而它填的是源站的 'youhui' 标记。"
+            )
+
         row = ProductRow(
             source=src,
             source_id=deal.source_id,
-            source_channel=(deal.channel or "jingxuan")[:16],
+            source_channel=channel[:16],
             title=cleaned.title,
             title_norm=cleaned.title_norm,
             brand=cleaned.brand,
@@ -488,6 +514,40 @@ def _queue_price_point(
     )
 
 
+def _newest_known_recorded_at(
+    db: Session, target_id: int, newest_seen: dict[int, datetime]
+) -> datetime | None:
+    """我们**已知**的这个商品最新的 price 事件时间。
+
+    ★ 为什么必须同时看内存和数据库——只看任何一边都有洞：
+
+      只看内存（原实现）：worker 每 20 条调一次 ingest_deals，
+      而 newest_seen 是每次调用新建的字典。第 2 批看不到第 1 批记下的
+      "最新时间"，于是一条更旧的爆料会把商品价格改旧（已实测复现）。
+
+      只看数据库：同一批里前面几条的价格点还躺在 pending 里没落库
+      （ingest_deals 末尾才 record_prices），查询根本看不到它们。
+
+      取两者的最大值，两个场景都覆盖。
+
+    ★ 这个查询走 ix_ph_product_recorded(product_id, recorded_at)：
+      product_id 是索引前导列，recorded_at 紧随其后，
+      所以 SQLite 能在索引里直接定位到 max，不是全表扫。
+    """
+    db_prev = db.execute(
+        select(func.max(PriceHistory.recorded_at)).where(
+            PriceHistory.product_id == target_id
+        )
+    ).scalar_one_or_none()
+
+    mem_prev = newest_seen.get(target_id)
+    if db_prev is None:
+        return mem_prev
+    if mem_prev is None or db_prev > mem_prev:
+        return db_prev
+    return mem_prev
+
+
 def _refresh_known(
     db: Session,
     target_id: int,
@@ -528,24 +588,39 @@ def _refresh_known(
         )
         return
 
-    prev = newest_seen.get(target_id)
-    if prev is not None and cleaned.recorded_at <= prev:
+    prev = _newest_known_recorded_at(db, target_id, newest_seen)
+    if prev is not None and cleaned.recorded_at < prev:
         # 我们见过更新的爆料了，这条是旧的：不覆盖价格，也不改 last_crawled_at
         #（last_crawled_at 表示"最近一次采集见到它的时间"，而这次采集
         #  在处理一条旧数据，不代表现在见到的是它）。
+        #
+        # ★ 判据是 `<` 而不是 `<=`。时间戳**相等**意味着这是同一个价格事件
+        #   （同一篇爆料被重放，第二次采集就是这种情况），价格本来就是同一个
+        #   值，放行没有风险；而放行是**必要的**——增量采集的"刷新 N 条"
+        #   就是要靠这一步把 last_crawled_at 推向前，
+        #   挡掉的话它永远停在第一次采集的那天，
+        #   统计页的"最近采集时间"会一直显示过期值。
         return
     newest_seen[target_id] = cleaned.recorded_at
 
-    db.execute(
-        update(Product)
-        .where(Product.id == target_id)
-        .values(
-            price=cleaned.price,
-            price_max=cleaned.price_max,
-            last_crawled_at=utcnow(),
-            # ★ url / image_url 也一起刷新：它们指向的是**这次爆料**的图片，
-            #   而列表页显示商品图时希望看到最新那条爆料的图。
-            url=cleaned.deal.url,
-            image_url=cleaned.deal.image_url,
-        )
-    )
+    values: dict[str, object] = {
+        "price": cleaned.price,
+        "price_max": cleaned.price_max,
+        "last_crawled_at": utcnow(),
+    }
+    # ★ url / image_url 也一起刷新：它们指向的是**这次爆料**的图片，
+    #   而列表页显示商品图时希望看到最新那条爆料的图。
+    #
+    #   ★ 但只在这条爆料**确实带了值**的时候才写。
+    #     判据和上面 sales / shop_id 不在更新列里是同一条：
+    #     **不能拿"不知道"去覆盖"已知"**。
+    #
+    #     实测 100 条真实爆料里有 3 条卡片上没有 <img>（image_url 为 None），
+    #     无条件写下去就会把商品已经有的缩略图抹掉——而且抹得没有痕迹，
+    #     表现只是"这个商品的图突然变成占位图了"，没人会联想到采集。
+    if cleaned.deal.url:
+        values["url"] = cleaned.deal.url
+    if cleaned.deal.image_url:
+        values["image_url"] = cleaned.deal.image_url
+
+    db.execute(update(Product).where(Product.id == target_id).values(**values))

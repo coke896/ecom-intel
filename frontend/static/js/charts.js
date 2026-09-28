@@ -193,14 +193,18 @@ function renderSalesTop(elId, emptyId, noticeId, data) {
       //   "商务款/送礼佳品"这类营销语）。所以"图例只负责放得下，
       //   全文交给 tooltip"是这个问题真正的修法。
       //   见 app/textutil.py 的模块注释。
+      // ★ 返回的字符串**会被 echarts 赋给 innerHTML**，所以要自己转义。
+      //   这几个字段全部来自采集数据（标题、品牌、店铺），
+      //   而"文本填进 DOM 用 textContent"这条纪律管不到这里——
+      //   详见 api.js 里 escapeHtml 上方那段注释。
       formatter: (p) => {
         const it = items[p.dataIndex];
         return [
-          `<div style="max-width:340px;white-space:normal;font-weight:600">${it.title}</div>`,
+          `<div style="max-width:340px;white-space:normal;font-weight:600">${escapeHtml(it.title)}</div>`,
           `销量：<b>${fmtInt(it.sales)}</b>`,
           `价格：${fmtPrice(it.price)}`,
-          it.brand ? `品牌：${it.brand}` : null,
-          it.shop ? `店铺：${it.shop}` : null,
+          it.brand ? `品牌：${escapeHtml(it.brand)}` : null,
+          it.shop ? `店铺：${escapeHtml(it.shop)}` : null,
         ].filter(Boolean).join('<br/>');
       },
     },
@@ -252,11 +256,12 @@ function renderShopShare(elId, emptyId, noticeId, data) {
   chart.setOption({
     tooltip: {
       trigger: 'item',
+      // ★ 同样是 innerHTML 出口，理由见上面销量排行那条注释。
       formatter: (p) => {
         const it = data.items[p.dataIndex];
         return [
-          `<b>${it.shop}</b>`,
-          it.platform ? `平台：${it.platform}` : null,
+          `<b>${escapeHtml(it.shop)}</b>`,
+          it.platform ? `平台：${escapeHtml(it.platform)}` : null,
           `商品数：<b>${it.product_count}</b>（${fmtPct(it.share)}）`,
           it.avg_price !== null ? `均价：${fmtPrice(it.avg_price)}` : null,
         ].filter(Boolean).join('<br/>');
@@ -306,7 +311,9 @@ function renderKeywords(elId, emptyId, noticeId, data) {
   if (!chart) return;
 
   const option = {
-    tooltip: { formatter: (p) => `${p.name}：出现 <b>${p.value}</b> 次` },
+    // ★ 词云的 name 是 jieba 从商品标题里切出来的，仍然属于外部数据，
+    //   一样要转义（理由同销量排行的 tooltip）。
+    tooltip: { formatter: (p) => `${escapeHtml(p.name)}：出现 <b>${p.value}</b> 次` },
     series: [
       {
         type: 'wordCloud',
@@ -363,7 +370,24 @@ function renderKeywords(elId, emptyId, noticeId, data) {
 
 function renderPriceHistory(elId, data) {
   const chart = _getChart(elId);
-  if (!chart || !data.points.length) return;
+  if (!chart) return;
+
+  // ★ 没有价格点时**必须显式清空**，不能直接 return。
+  //
+  //   _getChart 是按容器 id 缓存实例的，而详情弹窗只换内容、不换容器——
+  //   所以关掉弹窗再打开另一件商品时，画布不会自己重置。
+  //   直接 return 的话，上一件商品的曲线会**原样留在新商品的标题下面**，
+  //   看起来就是"这件商品的价格历史"，而它是假的。
+  //
+  //   真实数据里马上能撞到：id=1023、id=1098 这两条 smzdm 商品的价格点数为 0，
+  //   而其余 98 条都 ≥1 点。先开有点的、再开这两条，就会看到残留。
+  //
+  //   "为什么没有价格点"由详情接口的 notice 负责解释（弹窗里 m-notice 那块），
+  //   这里只负责一件事：**别把上一条曲线留着冒充这一条的。**
+  if (!data.points.length) {
+    chart.clear();
+    return;
+  }
 
   const prices = data.points.map((p) => p.price);
   const times = data.points.map((p) => p.recorded_at.slice(5, 16));
@@ -381,7 +405,7 @@ function renderPriceHistory(elId, data) {
           // ★ 把 source_ref 显示出来，是为了让"事件归并"这件事可见：
           //   每个价格点对应一篇爆料文章，同一个商品被反复爆料，
           //   这里就会长出多个点。这是 mock 数据给不了的证据。
-          pt.source_ref ? `来源爆料：${pt.source_ref}` : null,
+          pt.source_ref ? `来源爆料：${escapeHtml(pt.source_ref)}` : null,
         ].filter(Boolean).join('<br/>');
       },
     },

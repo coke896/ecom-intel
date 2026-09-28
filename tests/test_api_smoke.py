@@ -870,6 +870,61 @@ def test_single_point_price_history_explains_itself(client, db) -> None:
     assert "趋势" in body["notice"]
 
 
+def test_price_history_truncation_keeps_the_newest_and_stays_consistent(client, db) -> None:
+    """★ limit 截断时：取**最新**的点，且 total / 极值走全量口径，并且要说出来。
+
+    这条守的是一个"同一个弹窗里两个接口自相矛盾"的缺陷。
+    前端 openDetail 用 Promise.all 同时取 `/api/products/{id}` 和
+    `/api/products/{id}/price-history`，渲染在**同一屏**上：
+
+      · 前者（price_point_count / historical_min / historical_max）
+        走的是 SQL 聚合，**全量**，不受 limit 影响；
+      · 后者如果算在截断后的列表上，两个接口就会给出不同答案——
+        KPI 卡写"价格点数 600 / 历史最高 699"，
+        折线图的"最高"标记却停在 499。各自都没写错，并排才矛盾。
+
+    原来还有两个错：排序写的是 asc 配 limit（于是取到的是**最旧**的 400 个，
+    把最新的点全丢了），以及截断时 `notice` 为 None（静默）。
+
+    600 个点这个规模是刻意的：默认 limit 是 400，必须真的超过它才算测到。
+    """
+    product = _add(db, sid="many", title="价格点很多", price=699.0, points=600)
+    db.commit()
+
+    detail = _get(client, f"/api/products/{product.id}")
+    body = _get(client, f"/api/products/{product.id}/price-history")
+
+    # ---- 全量口径：两个接口必须一致 ----
+    assert body["total"] == detail["price_point_count"] == 600
+    assert body["max_price"] == detail["historical_max"] == 699.0
+    assert body["min_price"] == detail["historical_min"] == 100.0
+    assert body["last_recorded_at"] == detail["last_recorded_at"]
+
+    # ---- 窗口：默认返回 400 个，而且是**最新**的那批 ----
+    assert len(body["points"]) == 400
+    assert body["points"][-1]["recorded_at"] == detail["last_recorded_at"], \
+        "最新的那个价格点被截掉了——趋势图丢掉近期数据等于没有用"
+
+    # ---- 截断了就必须说 ----
+    assert body["notice"], "截断是静默的：图上少一截，而没人知道"
+    assert "600" in body["notice"]
+
+
+def test_price_history_does_not_warn_when_nothing_was_truncated(client, db) -> None:
+    """★ 上一条的对照面：没截断就不能提"截断"。
+
+    只写上一半的话，把 notice 写成常量也能通过——那种"永远为真"的断言
+    在缺陷反向变形时不会变红（这类假 GREEN 本项目栽过）。
+    """
+    product = _add(db, sid="few", title="价格点不多", price=100.0, points=5)
+    db.commit()
+
+    body = _get(client, f"/api/products/{product.id}/price-history")
+    assert body["total"] == 5
+    assert len(body["points"]) == 5
+    assert body["notice"] is None
+
+
 def test_price_history_returns_404_for_a_missing_product(client) -> None:
     assert client.get("/api/products/99999/price-history").status_code == 404
 

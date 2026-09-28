@@ -82,7 +82,7 @@ import numpy as np
 import pytest
 from sqlalchemy import func, select
 
-from app.db.models import PriceHistory, Product, Shop
+from app.db.models import Alert, AlertRule, PriceHistory, Product, Shop
 from scraper import seed as seed_mod
 from scraper.dedup import normalize_title
 from scraper.seed import (
@@ -801,6 +801,58 @@ def test_reset_removes_only_mock_products(db) -> None:
     assert removed["products"] == 10
     assert removed["price_history"] == 50
     assert db.execute(select(func.count()).select_from(Product)).scalar_one() == 0
+
+
+def test_reset_deletes_alerts_before_their_rules(db) -> None:
+    """★ 有触发记录的规则，必须先删 alerts 再删 alert_rules。
+
+    `alerts.rule_id` 指向 `alert_rules.id`，而 PRAGMA foreign_keys=ON 是开着的
+    （见 app/db/base.py），所以顺序反了会被外键挡住、抛 IntegrityError。
+
+    ★ 这条**很容易踩到**：给任意一个 mock 商品建一条规则，等它触发一次
+      （worker 每 5 分钟扫一遍），此后任何一次 `python -m scraper.seed`
+      都会死在 reset_mock_data 的第一步上——整个 seed 直接不可用。
+      而"给 mock 商品建条告警规则试试"恰恰是最自然的演示动作。
+
+    ★ 项目里同一个顺序在 app/api/alerts.py 的 DELETE /rules/{id} 里是对的
+      （先删 Alert 再删规则），seed 这边漏了——所以要有测试钉住，
+      而不是靠"记得两处都改"。
+
+    ★ 顺带守住隔离：真实数据（source='smzdm'）的规则和触发记录
+      不能被这次清理碰到。
+    """
+    seed_mod.seed(db, count=2, days=1)
+    mock_product = db.execute(select(Product).order_by(Product.id)).scalars().first()
+
+    # 真实采集的商品 + 它的规则和触发记录（这两个必须活下来）
+    real = Product(source="smzdm", source_id="real-1", title="真实采集商品", price=50.0)
+    db.add(real)
+    db.commit()
+
+    mock_rule = AlertRule(
+        product_id=mock_product.id, rule_type="price_below", threshold=200.0, enabled=True
+    )
+    real_rule = AlertRule(
+        product_id=real.id, rule_type="price_below", threshold=60.0, enabled=True
+    )
+    db.add_all([mock_rule, real_rule])
+    db.commit()
+    db.add_all([
+        Alert(rule_id=mock_rule.id, price_at_trigger=150.0, notified=False),
+        Alert(rule_id=real_rule.id, price_at_trigger=55.0, notified=False),
+    ])
+    db.commit()
+
+    removed = seed_mod.reset_mock_data(db)  # ★ 修复前这里抛 IntegrityError
+
+    assert removed["alerts"] == 1, "mock 规则下的触发记录没被删（或删多了）"
+    assert removed["alert_rules"] == 1
+
+    # 隔离：真实数据的规则和记录都还在
+    remaining_rules = db.execute(select(AlertRule)).scalars().all()
+    assert [r.id for r in remaining_rules] == [real_rule.id], "真实数据的规则被删了"
+    remaining_alerts = db.execute(select(Alert)).scalars().all()
+    assert [a.rule_id for a in remaining_alerts] == [real_rule.id], "真实数据的触发记录被删了"
 
 
 def test_seed_cleans_up_orphan_shops(db) -> None:

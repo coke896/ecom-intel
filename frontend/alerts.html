@@ -284,7 +284,9 @@ async function renderSwitcher() {
     const btn = el('button');
     btn.type = 'button';
     btn.textContent = s.label;
-    const n = counts[s.id];
+    // ★ 规则在 api.js 的 sourceCount 一处（原先是 counts[s.id]，
+    //   而接口不返回 all 项，「全部」按钮上因此一直没有数字）。
+    const n = sourceCount(s.id, counts);
     if (n !== undefined) {
       btn.appendChild(el('span', 'count', n));
       if (n === 0) btn.classList.add('empty');
