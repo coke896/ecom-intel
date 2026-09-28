@@ -68,8 +68,11 @@ SYSTEM_PROMPT = """你是一名电商竞品分析顾问，为一家做数码配�
 
 你会收到一份 JSON 数据，包含：
   · summary           —— **全部商品**的统计量（商品数、价格的 min/p25/中位数/p75/max/均值、
-                          品牌分布、销量汇总）。这是唯一能代表整体的数据。
-  · price_buckets     —— **全部商品**的价格直方图
+                          品牌分布、销量汇总，以及各字段缺失的商品数
+                          price_missing_count / brand_missing_count）。
+                          这是唯一能代表整体的数据。
+  · price_buckets     —— 价格的直方图。它覆盖的是**有价格**的那些商品：
+                          没有价格的商品进不了任何区间，数量见 price_missing_count
   · shops             —— 店铺维度的商品数与均价
   · keywords          —— 商品标题的高频词及其出现次数
   · sample + top_products —— **一部分**商品（样本），以及它是怎么被选出来的
@@ -104,6 +107,8 @@ SYSTEM_PROMPT = """你是一名电商竞品分析顾问，为一家做数码配�
      · 不要写任何关于销量、爆款、畅销程度的判断
      · 在 data_limits 里明确写出"数据缺少销量，无法判断畅销程度"
    同理，brand_missing_count 高时不要谈品牌格局。
+   price_missing_count 是**因为没有价格、所以不在 price_buckets 里**的商品数——
+   凡是拿 price_buckets 算占比，分母用"有价格的商品数"，不要用 product_count。
 
 4. **宁可说"看不出来"，也不要凑一段。** 一个诚实的
    "这批数据不足以判断 X"比一段编出来的分析有价值得多。

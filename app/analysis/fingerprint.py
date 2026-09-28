@@ -67,7 +67,15 @@ from typing import Any
 #
 #   版本号约定：v1 / v2 / v3… 每次实质性改动 +1。
 #   （不要用日期：v20260928 看不出改了几次，也没法比较先后。）
-PROMPT_VERSION = "v1"
+#
+#   v2（2026-09-28）：说清 price_buckets 的覆盖范围。
+#     原文写的是"**全部商品**的价格直方图"，而直方图只装得下**有价格**的商品
+#     （payload.py 里 prices 明确过滤了 None）。数据里一直有
+#     price_missing_count 这个数，但 prompt 从没提过它——
+#     却专门为 brand_missing_count 写了一条规则。
+#     后果是模型可能拿 bucket 的计数去除以 product_count，
+#     算出一个偏大的占比（实测真实采集源 2% 的商品没有价格）。
+PROMPT_VERSION = "v2"
 
 # 指纹进入数据库的 analysis_reports.fingerprint 列（String(64)）。
 # sha256 十六进制正好 64 个字符——长度对得上不是巧合，是建表时就按它定的。

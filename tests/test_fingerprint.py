@@ -304,7 +304,12 @@ def test_prompt_version_change_invalidates_everything(monkeypatch) -> None:
       这条会立刻红。
     """
     before = _fp(_payload())
-    monkeypatch.setattr(fp, "PROMPT_VERSION", "v2")
+    # ★ 变异值必须**从当前值推导**，不能写死成 "v2"。
+    #   写死的话，哪天真的把 PROMPT_VERSION 升到 v2，这行 monkeypatch
+    #   就成了空操作，于是 `!= before` 断言失败——测试变红，而代码没错。
+    #   这类"升级时才暴露"的假红最费时间：它出现在你最不该分心的时候
+    #   （正在改 prompt、正要确认缓存该失效）。
+    monkeypatch.setattr(fp, "PROMPT_VERSION", fp.PROMPT_VERSION + "-mutated")
     assert _fp(_payload()) != before
 
 
