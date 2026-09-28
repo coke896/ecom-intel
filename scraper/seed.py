@@ -76,6 +76,7 @@ from __future__ import annotations
 import argparse
 import math
 import re
+import sys
 from datetime import timedelta
 
 import numpy as np
@@ -841,13 +842,62 @@ def seed(
     """生成并写入 Mock 数据。可重复调用（幂等）。
 
     返回本次写入的行数统计。
+
+    ============================================================================
+    ★★ 两个不变量，都是实测撞出来的
+    ============================================================================
+
+    【一】参数校验必须在**任何破坏性动作之前**
+
+      `--days 0` / `--days -1` / `--count 0` 都会让生成阶段抛异常，
+      而这个过程是**先删后建**的——删在 `reset_mock_data()` 里已经
+      `commit()` 了，于是异常发生时数据已经没了。实测（真库副本）：
+
+          --days 0    退出码=1  mock 商品 1000 → 0   全部价格点消失
+          --days -1   退出码=1  mock 商品 1000 → 0
+          --count 0   退出码=1  mock 商品 1000 → 0
+
+      ★ 最刺眼的地方不是"数据没了"，而是**它看起来像什么都没发生**：
+        程序抛异常退出，而人的直觉是"崩了 = 事务回滚了 = 没事"。
+        实际上下次打开页面只会看到空图表，而报错信息（IndexError）
+        完全指向别处——它说的是"列表下标越界"，没有一个字提到数据被删了。
+
+    【二】顺序是刻意的：**先算出全部数据，再删库**
+
+      `build_products()` 是纯函数（只用 rng，不碰 db），所以可以安全地
+      提到 `reset_mock_data()` 前面。这样"生成阶段可能失败"和
+      "破坏性动作已提交"这两件事就**不可能同时发生**了。
+
+      ★ 连带保证：rng 的消耗顺序没变（`reset_mock_data` / `ensure_shops`
+        都不碰 rng），所以生成的商品、价格序列、销量**逐字节不变**。
+        这一点很重要——变了的话 docs/charts/ 的自检图和 test_seed.py
+        的分布断言就都要重做。
+
+      ★ 残留的边界（没修，记录在此）：插入阶段本身仍分两次 commit
+        （products 一次、price_history 一次）。崩在两者之间会留下
+        "有商品、没价格历史"的半截状态。要彻底消除得把整段包成一个
+        事务，但那会改变写入的锁粒度，而当前这两次 commit 让
+        9 万行的写入不会长时间占着写锁（见 app/db/base.py 的 busy_timeout）。
+        这个取舍留着，但至少现在**它只可能发生在写入阶段**，
+        而不是"生成阶段随便一个低级错误就毁数据"。
     """
+    if count < 1:
+        raise ValueError(f"count 必须 ≥ 1，收到 {count}（0 个商品没有意义）")
+    if days < 1:
+        raise ValueError(
+            f"days 必须 ≥ 1，收到 {days}。"
+            "每个商品至少要有一个价格点——"
+            "商品的当前价（price / price_max）就是从价格序列的最后一天取的，"
+            "序列为空就没有当前价可写。"
+        )
+
     rng = np.random.default_rng(seed_value)
+
+    # ★ 先算——见 docstring【二】。任何生成阶段的失败都发生在删库之前。
+    products = build_products(rng, count, days)
 
     removed = reset_mock_data(db)
     shops = ensure_shops(db)
-
-    products = build_products(rng, count, days)
 
     # ---- 批量插入 products ----
     # ★ 先构造好全部 dict 再一次性 insert，而不是循环 db.add()。
@@ -943,6 +993,26 @@ def main() -> None:
         help=f"随机种子，固定值保证结果可复现（默认 {DEFAULT_SEED}）",
     )
     args = parser.parse_args()
+
+    # ★ 参数错误在**打开数据库之前**就报掉，而且报成人话。
+    #
+    #   两个理由：
+    #   1. 抛 ValueError 的默认形态是一串 traceback，末尾才是"days 必须 ≥ 1"。
+    #      人看到 traceback 的第一反应是"程序坏了"，而不是"我参数写错了"。
+    #   2. 崩在 `with SessionLocal()` 里面的话，即便将来 seed() 的校验被
+    #      挪走，也已经建立了数据库连接。（现在校验在 seed() 里，
+    #      是这一层的第二道；两处都留着，因为 seed() 也会被别的代码调用。）
+    if args.count < 1 or args.days < 1:
+        # ★ 退出码 2 而不是 1：Windows 的习惯是"用法错误 = 2"，
+        #   而 1 通常表示"跑起来之后失败了"。脚本里据此区分两种情况。
+        print(
+            f"参数不对：count={args.count}，days={args.days}。"
+            "两者都必须 ≥ 1。\n"
+            "（★ 这里必须在动数据库之前拦住：seed 是【先删后建】的，"
+            " 生成阶段失败会留下一个已经被清空、但什么都没生成的库。）",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     with SessionLocal() as db:
         print(f"生成 {args.count} 个商品 × {args.days} 天价格历史 ……")

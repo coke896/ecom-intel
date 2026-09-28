@@ -78,6 +78,8 @@ seed.py 的模块注释里已经记了一次：价格累乘漂移那个 bug，�
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 from sqlalchemy import func, select
@@ -913,3 +915,129 @@ def test_default_params_are_the_calibrated_ones() -> None:
     assert SALES_ALPHA == pytest.approx(0.85)
     assert PROMO_PROB == pytest.approx(0.05)
     assert BIG_PROMO_DAYS == (30, 75)
+
+
+# ===========================================================================
+# 八、参数校验：非法输入必须在**删库之前**被拦住
+#
+# seed 是本项目唯一会【先删后建】的入口，所以它的坏法在这一层被放大：
+# 别的地方参数写错只是"没生成"，这里参数写错是"把已有的删了，然后没生成"。
+# 实测（真库副本）：--days 0 / --days -1 / --count 0 都是
+# mock 商品 1000 → 0、9 万个价格点一起消失，而退出码只是个 1。
+#
+# ★ 最刺眼的地方是它**看起来像什么都没发生**：
+#   程序抛异常退出，而人的直觉是"崩了 = 事务回滚了 = 没事"。
+#   实际是 reset_mock_data() 里已经 commit 过了，异常 ≠ 回滚。
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("count", "days"),
+    [
+        (0, T_DAYS),      # 没有商品
+        (T_COUNT, 0),     # 没有价格点 → price / price_max 没有来源
+        (T_COUNT, -1),    # 负天数
+        (0, 0),           # 两个都错
+        (-3, T_DAYS),
+    ],
+)
+def test_invalid_arguments_are_refused_without_deleting_anything(db, count, days) -> None:
+    """★ 非法参数必须抛 ValueError，**而且已有数据一个字节都不少**。
+
+    ★ 断言分两半，缺一不可：
+      · 只断言"抛了异常" → 修复前的实现**也**抛（抛的是 IndexError），
+        看不出任何区别；
+      · 只断言"数据还在"   → 一个直接 return 的空实现也能过。
+      两半合起来才是这条修复真正要买的东西：**拒绝，且不动数据**。
+
+    ★ 这里断言 ValueError 而不是"任意异常"：IndexError 是**下游症状**
+      （生成到一半发现价格序列是空的），ValueError 是**上游判断**
+      （这个参数组合本身就没有意义）。断言前者等于把"崩在哪儿"
+      钉死，改实现就红——而实现怎么摆是自由的，参数没意义这件事不是。
+    """
+    seed_mod.seed(db, count=T_COUNT, days=T_DAYS)
+
+    with pytest.raises(ValueError, match="必须 ≥ 1"):
+        seed_mod.seed(db, count=count, days=days)
+
+    # ★ expire_all()：会话是 expire_on_commit=False 的，commit 之后再读
+    #   同一个对象会直接命中身份映射里的内存副本。要证明的是
+    #   "数据库里还在"，那就必须先把内存副本丢掉。
+    db.expire_all()
+    assert db.execute(select(func.count()).select_from(Product)).scalar_one() == T_COUNT
+    assert (
+        db.execute(select(func.count()).select_from(PriceHistory)).scalar_one()
+        == T_COUNT * T_DAYS
+    )
+
+
+def test_a_failure_while_generating_cannot_destroy_existing_data(db, monkeypatch) -> None:
+    """★ 顺序不变量：生成阶段的任何失败，都不该让已有数据消失。
+
+    ★ 这条**不是**"某个参数会崩"的用例（那是上面那条的活），
+      而是那条不变量本身：`build_products()` 是纯函数（只用 rng、不碰 db），
+      所以它能被提到 `reset_mock_data()` **前面**，于是
+      "生成可能失败"和"破坏性动作已提交"就不可能同时发生。
+
+    ★ 所以这里刻意 monkeypatch 出一个**不存在于现实中的**异常，
+      而不是去复现某个具体的崩。理由：参数校验是**枚举**（漏掉一个输入
+      就漏掉一种毁库方式），而这条断言的是**顺序**——
+      将来 `build_products()` 里多出任何新的失败方式，它都自动挡得住。
+      从上游推导，而不是维护一张"已知会崩的输入"清单。
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("模拟生成阶段的失败")
+
+    seed_mod.seed(db, count=T_COUNT, days=T_DAYS)
+    monkeypatch.setattr(seed_mod, "build_products", _boom)
+
+    # ★ 用 pytest.raises 明确断言"异常真的传出来了"。
+    #   如果哪天有人给生成阶段套个 try/except 把异常吞掉，
+    #   下面两行数据断言会**照样通过**（数据确实还在），
+    #   于是这条用例会在实现已经变得很可疑时仍然全绿。
+    with pytest.raises(RuntimeError, match="模拟生成阶段的失败"):
+        seed_mod.seed(db, count=T_COUNT, days=T_DAYS)
+
+    db.expire_all()
+    assert db.execute(select(func.count()).select_from(Product)).scalar_one() == T_COUNT
+    assert (
+        db.execute(select(func.count()).select_from(PriceHistory)).scalar_one()
+        == T_COUNT * T_DAYS
+    )
+
+
+@pytest.mark.parametrize("bad_args", [["--count", "0"], ["--days", "0"], ["--days", "-1"]])
+def test_cli_refuses_bad_arguments_before_opening_the_database(
+    monkeypatch, capsys, bad_args
+) -> None:
+    """★ 命令行这一层：退出码、提示语，以及"根本没走到需要数据库的地方"。
+
+    ★ 用**炸弹**而不是"断言数据还在"来证明没有打开数据库：
+      后者要准备一个真实库，而这条要证明的恰恰是
+      "这一层根本不该走到需要库的地方"。
+      炸弹在这里比数据断言更严格——只要有人把校验挪到
+      `with SessionLocal()` 后面，它立刻响，且不需要任何数据准备。
+
+    ★ 退出码断言成 2 而不是 1：1 通常表示"跑起来之后失败了"，
+      2 是"你参数写错了"。脚本据此区分两种情况——而这里正是要
+      让"参数错"和"跑挂了"彻底分开，不再共用一个含混的失败。
+    """
+
+    def _bomb():
+        raise AssertionError("参数校验没拦住：main() 已经把数据库打开了")
+
+    monkeypatch.setattr(seed_mod, "SessionLocal", _bomb)
+    monkeypatch.setattr(sys, "argv", ["seed", *bad_args])
+
+    with pytest.raises(SystemExit) as excinfo:
+        seed_mod.main()
+
+    assert excinfo.value.code == 2
+
+    # ★ 提示语必须说清"为什么拦"，而不只是"参数不对"。
+    #   不说理由的话，下次有人会觉得这个校验碍事、删掉它——
+    #   而他删掉的是一道防数据丢失的闸。理由写在这里，就是给那一刻看的。
+    stderr = capsys.readouterr().err
+    assert "参数不对" in stderr
+    assert "先删后建" in stderr
