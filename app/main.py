@@ -41,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.analysis.glm_client import key_configured
-from app.api import alerts, analysis, products, stats, tasks
+from app.api import alerts, analysis, images, products, stats, tasks
 from app.config import settings
 from app.db.base import init_database
 
@@ -144,6 +144,10 @@ app.include_router(tasks.router)
 #   由采集 worker 每 5 分钟叫一次。接口里那个 POST /api/alerts/check
 #   只是**手动**叫一次同一个函数，不是第二份实现。
 app.include_router(alerts.router)
+# ★ 图片代理是本项目唯一一个"不接受 ?source="的接口——
+#   取图的是浏览器的 <img> 加载器，不是我们的 JS，而且它是一次取字节的动作
+#   而不是一次数据查询。理由写在 app/api/images.py 顶部。
+app.include_router(images.router)
 
 
 # ★ 这里**曾经**有一份 `_llm_key_configured()` 的实现，和

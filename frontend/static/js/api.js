@@ -119,6 +119,56 @@ function apiDelete(path) {
   return apiRequest('DELETE', path);
 }
 
+/** 图片地址 → 走后端代理的地址。
+ *
+ *  ★ 这是**唯一**一个不走 apiRequest 的后端接口，两个理由：
+ *
+ *  ① 取图的是**浏览器的 <img> 加载器**，不是我们的 JS。
+ *     什么 fetch / 什么 XHR 都插不进去——所以它走不了 apiRequest，
+ *     而不是"我们决定让它特殊"。
+ *  ② 它也因此**拿不到 `?source=`**。这不是遗漏：
+ *     取字节的动作和"这个平台的商品是什么样"无关，
+ *     同一个商品在 all / mock / smzdm 三个视图下的缩略图是同一张。
+ *     （后端那边也是同一个说法，见 app/api/images.py 顶部。）
+ *
+ *  ★ 用 encodeURIComponent 而不是拼字符串：图片地址里带 `&`（图床的
+ *    URL 经常有 query），不编码的话第一个 `&` 之后的内容会被当成
+ *    `/api/proxy-image` 自己的参数——表现是"某些图能显示、某些不能"，
+ *    而它们的区别只是 URL 里有没有 `&`，很容易往图床那边想。
+ *
+ *  顺带一提，编码之后返回值里只剩 URL 安全字符，
+ *  所以它可以被直接插进 HTML 属性，不需要再转义一次。
+ */
+function proxyImageUrl(url) {
+  if (!url) return '';
+  return '/api/proxy-image?url=' + encodeURIComponent(url);
+}
+
+/** 图片加载失败时的兜底。
+ *
+ *  ★ 用 `function` 声明而不是 `const imgFallback = ...`：
+ *    这个函数是给 `onerror="imgFallback(this)"` 这个**内联属性**调的，
+ *    而内联属性里的名字是从 window 上找的。
+ *    顶层 `function` 声明会挂到 window 上，顶层 `const` **不会**
+ *    （它在脚本的词法作用域里）——写成 const 的话，
+ *    图片一加载失败就是一个 ReferenceError，
+ *    而表现的只是"占位符没出来"，看不到报错来源。
+ *
+ *  ★ 为什么必须有它：代理失败是会发生的（断网、图床挂了、超过大小上限），
+ *    而 <img> 失败时浏览器画的是那个**破图图标**——
+ *    它看起来像"这个网站坏了"，而不是"这张图没取到"。
+ *    换成一块空白占位要好得多，因为"没有图"本来就是这一屏的常态
+ *    （Mock 数据一条图都没有）。
+ */
+function imgFallback(img) {
+  const box = document.createElement('span');
+  box.className = 'thumb thumb-empty';
+  // ★ 兜底时不能再触发兜底。replaceWith 之后原来的 <img> 已经不在文档里，
+  //   不会再触发 onerror；但这一点值得写下来，
+  //   因为"错误处理自己报错"是这类代码最常见的死循环。
+  img.replaceWith(box);
+}
+
 /* ---------------------------------------------------------------------------
  * 数字格式化
  * ------------------------------------------------------------------------ */

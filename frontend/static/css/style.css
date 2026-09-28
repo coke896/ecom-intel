@@ -227,6 +227,41 @@ td.title-cell {
 .num { font-variant-numeric: tabular-nums; text-align: right; }
 .muted { color: var(--text-faint); }
 
+/* --------------------------------------------------------------------------
+ * 缩略图
+ *
+ * ★ 尺寸写在 CSS 上而不是 <img> 的 width/height 属性上，是为了
+ *   **图片还没加载出来时列宽就已经定住**。否则图一个个加载完成，
+ *   整张表会一格一格地往右挪——列表在眼前"跳"一下，很难看。
+ *
+ * ★ 有图和没图用的是同一个 40×40 的框：这样同一列里所有行的
+ *   文字起始位置是对齐的，而"没有图"读起来是"这里空着"，
+ *   不是"这一行缺了点什么"。
+ * ------------------------------------------------------------------------ */
+.thumb {
+  display: block;
+  width: 40px;
+  height: 40px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+img.thumb { object-fit: cover; }
+/* 没有图 / 取不到图：虚线框，比实线更明确地表示"这里是空的" */
+.thumb-empty { border-style: dashed; }
+
+/* 详情主图。★ 上限给得比缩略图宽松得多——这一屏就是专门看它的。
+   不设 max-width: 100% 的话，一张大图会把弹窗撑破（900px 宽），
+   而 .modal 上没有 overflow: hidden，撑破了就是整页横向滚动。 */
+#m-figure img {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin: 4px 0 2px;
+}
+
 .tag {
   display: inline-block;
   padding: 1px 7px;

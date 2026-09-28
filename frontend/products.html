@@ -35,6 +35,8 @@
       点任意一行查看详情和价格历史。
       「价格点」这一列是双数据源的直观对比：Mock 商品有 90 个点，
       真实采集的商品可能只有 1 个（只被爆料过一次）。
+      缩略图只有真实采集的数据才有（Mock 没有配图），
+      而且要经后端代理才能取回——理由见 <code>app/api/images.py</code>。
     </div>
 
     <div class="notice" id="page-notice"></div>
@@ -58,6 +60,10 @@
       <table class="data">
         <thead>
           <tr>
+            <!-- 缩略图列。★ 表头留空：这一列的内容（一张图或一块灰）
+                 不需要标题，写个"图"只是噪声。宽度靠 th 上的 style 定，
+                 不靠图片自己撑——图还没加载出来时列宽不能跳。 -->
+            <th style="width:52px"></th>
             <th style="width:56px">ID</th>
             <th>标题</th>
             <th style="width:78px">来源</th>
@@ -92,6 +98,9 @@
     </div>
 
     <div class="notice" id="m-notice"></div>
+    <!-- 详情主图。★ 没有图时这里是空的、不占位置（不是一块灰），
+         因为弹窗是"看这一个商品"的地方，一块灰在这里只是噪声。 -->
+    <div id="m-figure"></div>
     <div class="kv" id="m-kv"></div>
     <div class="chart" id="m-chart" style="height:300px"></div>
 
@@ -114,6 +123,17 @@
 //   每次请求都要把「当前页 + 搜索词 + 排序」一起带上，
 //   散着放最容易出现"改了排序但翻页时用的还是旧排序"这类不同步的 bug。
 const state = { page: 1, size: 20, q: '', sort: 'last_crawled_at', order: 'desc' };
+
+/* 表格有几列，**从表头数出来**，不写死。
+ *
+ * ★ 空态和错误态那两行是 `colspan="N"`，N 写错的话：
+ *     写小了 → 内容不居中，看起来只是"有点歪"
+ *     写大了 → 多出来的格子把表撑宽，整页出现横向滚动条
+ *   两种都不报错。而"加一列"是这一页最容易发生、也最容易忘的改动
+ *   （加缩略图这一列时就刚刚发生过一次）。
+ *   数出来就没有这个类别的问题了。
+ */
+const COL_COUNT = document.querySelectorAll('thead th').length;
 
 async function renderSwitcher() {
   const box = document.getElementById('source-switcher');
@@ -159,8 +179,17 @@ function rowHtml(p) {
     ? '<span class="muted">—</span>'
     : fmtPrice(p.price) + (hasRange ? `<span class="muted"> ~${fmtPrice(p.price_max)}</span>` : '');
 
+  // ★ 没有图时给一块**空占位**，不给破图图标，也不给"暂无图片"四个字。
+  //   因为"没有图"在这个列表里是常态（Mock 一条图都没有），
+  //   而一个每行都出现的提示词，会盖过真正有图的那几行。
+  const thumb = p.image_url
+    ? `<img class="thumb" src="${proxyImageUrl(p.image_url)}" alt="" loading="lazy"
+            onerror="imgFallback(this)">`
+    : '<span class="thumb thumb-empty"></span>';
+
   return `
     <tr data-id="${p.id}">
+      <td>${thumb}</td>
       <td class="muted">${p.id}</td>
       <td class="title-cell" title="${escapeAttr(p.title)}">${escapeHtml(p.title)}</td>
       <td><span class="tag src-${p.source}">${p.source}</span></td>
@@ -204,7 +233,7 @@ async function load() {
 
     tbody.innerHTML = data.items.length
       ? data.items.map(rowHtml).join('')
-      : `<tr><td colspan="8" style="text-align:center;padding:40px" class="muted">
+      : `<tr><td colspan="${COL_COUNT}" style="text-align:center;padding:40px" class="muted">
            ${state.q ? '没有匹配的商品' : '该数据源暂无商品'}
          </td></tr>`;
 
@@ -223,7 +252,7 @@ async function load() {
       ? '该数据源暂无商品。' : null);
   } catch (err) {
     console.error(err);
-    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:40px">
+    tbody.innerHTML = `<tr><td colspan="${COL_COUNT}" style="text-align:center;padding:40px">
         接口请求失败：${escapeHtml(err.message)}</td></tr>`;
   }
 }
@@ -278,16 +307,54 @@ async function openDetail(id) {
 
     renderPriceHistory('m-chart', hist);
 
-    // 带着商品 id 跳到告警页。★ 用 URL 参数而不是 localStorage：
-    //   这是"我要给这一个商品配告警"的一次性上下文，
-    //   像数据源那样长期记住它反而会让下次进来时莫名其妙地预选一个商品。
+    /* 主图。
+     * ★ 走代理而不是直接 <img src="https://y.zdmimg.com/...">，理由见
+     *   app/api/images.py 顶部（防盗链 / 不把访客 IP 送给图床 / 一处收口）。
+     * ★ 用 createElement 而不是拼 innerHTML：这样能挂 onerror。
+     *   失败就**整个撤掉**，不留破图——详情弹窗里一个破图图标
+     *   比没有图难看得多，而失败是会发生的（断网、图床挂了、超过大小上限）。
+     */
+    const figure = document.getElementById('m-figure');
+    figure.innerHTML = '';
+    if (p.image_url) {
+      const img = document.createElement('img');
+      img.src = proxyImageUrl(p.image_url);
+      // ★ 详情页的主图是**内容**，不是装饰，所以 alt 必须写标题。
+      //   列表里的缩略图可以 alt=""（标题就在旁边），这里不行。
+      img.alt = p.title;
+      img.onerror = () => { figure.innerHTML = ''; };
+      figure.appendChild(img);
+    }
+
+    // 弹窗底部两个动作：去看原帖、给这个商品配告警。
     const actions = document.getElementById('m-actions');
     actions.innerHTML = '';
-    const link = document.createElement('a');
-    link.className = 'btn';
-    link.href = 'alerts.html?product_id=' + encodeURIComponent(id);
-    link.textContent = '为这个商品配价格告警 →';
-    actions.appendChild(link);
+
+    // 带商品 id 跳到告警页。★ 用 URL 参数而不是 localStorage：
+    //   这是"我要给这一个商品配告警"的一次性上下文，
+    //   像数据源那样长期记住它反而会让下次进来时莫名其妙地预选一个商品。
+    const alertLink = document.createElement('a');
+    alertLink.className = 'btn primary';
+    alertLink.href = 'alerts.html?product_id=' + encodeURIComponent(id);
+    alertLink.textContent = '为这个商品配价格告警 →';
+    actions.appendChild(alertLink);
+
+    // 回源站看原帖。
+    // ★ rel="noopener" 不能省：不带它的话，被打开的那个页面可以
+    //   通过 window.opener 把我们这一页导航走（反向 tabnabbing）——
+    //   而这里打开的恰好是一个**外部站点**。
+    //   noreferrer 是顺手：既然这个项目在意"不把访客信息送给第三方"，
+    //   那就别在这里漏一个 Referer 出去。
+    if (p.url) {
+      const srcLink = document.createElement('a');
+      srcLink.className = 'btn';
+      srcLink.href = p.url;
+      srcLink.target = '_blank';
+      srcLink.rel = 'noopener noreferrer';
+      srcLink.textContent = '查看原爆料 ↗';
+      srcLink.style.marginLeft = '8px';
+      actions.appendChild(srcLink);
+    }
   } catch (err) {
     console.error(err);
     document.getElementById('m-title').textContent = '加载失败';
