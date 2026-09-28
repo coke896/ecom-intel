@@ -1,0 +1,312 @@
+/* ============================================================================
+ * 全局样式
+ *
+ * 纯手写 CSS，没有 Tailwind / Bootstrap / 任何构建步骤。
+ * 理由和"前端用纯 HTML"是同一个：这是一个**作品集项目**，
+ * 面试官 clone 下来要能直接打开。多一个 npm install 就多一半的人不会打开。
+ *
+ * 用 CSS 变量而不是写死颜色，是为了让"图表配色"和"页面配色"能对上——
+ * ECharts 那边要读同一批色值（见 charts.js 里的 palette）。
+ * 两边写死两套色值，改主题时必然改漏一处，然后就出现"图上有个不认识的蓝色"。
+ * ========================================================================== */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #e4e7ec;
+  --text: #1f2937;
+  --text-soft: #6b7280;
+  --text-faint: #9ca3af;
+  --accent: #2563eb;
+  --accent-soft: #eff4ff;
+  --warn-bg: #fffbeb;
+  --warn-border: #fcd34d;
+  --warn-text: #92400e;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 1px 3px rgba(16, 24, 40, .06);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  /* 中文字体栈：把系统中文字体排在前面。
+     顺序很讲究——macOS 上如果先写 Arial，中文会走 Arial 的
+     回退字体，字重和行高都不对。 */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+               "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* --------------------------------------------------------------------------
+ * 顶栏
+ * ------------------------------------------------------------------------ */
+header.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+}
+
+.topbar-inner {
+  max-width: 1440px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-height: 58px;
+  flex-wrap: wrap;
+}
+
+.brand { font-size: 16px; font-weight: 650; letter-spacing: .2px; }
+.brand span { color: var(--text-faint); font-weight: 400; font-size: 13px; margin-left: 8px; }
+
+nav.pages { display: flex; gap: 4px; margin-left: auto; }
+nav.pages a {
+  color: var(--text-soft);
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-weight: 500;
+}
+nav.pages a:hover { background: var(--bg); color: var(--text); }
+nav.pages a.active { background: var(--accent-soft); color: var(--accent); }
+
+/* --------------------------------------------------------------------------
+ * 数据源切换（分段控件）
+ *
+ * ★ 这一个控件是整个项目的门面：它让"双数据源隔离"这件事
+ *   在界面上**可见**，而不是只能写在 README 里。
+ * ------------------------------------------------------------------------ */
+.switcher {
+  display: flex;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+.switcher button {
+  border: 0;
+  background: transparent;
+  color: var(--text-soft);
+  font: inherit;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.switcher button:hover { color: var(--text); }
+.switcher button[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--accent);
+  box-shadow: var(--shadow);
+}
+/* 没有数据的源：淡一点，但仍然可点——
+   点进去看到空态提示，本身就是演示的一部分。 */
+.switcher button.empty { color: var(--text-faint); }
+.switcher button .count { color: var(--text-faint); font-weight: 400; margin-left: 4px; font-size: 12px; }
+.switcher button[aria-pressed="true"] .count { color: var(--accent); opacity: .7; }
+
+/* --------------------------------------------------------------------------
+ * 布局
+ * ------------------------------------------------------------------------ */
+main { max-width: 1440px; margin: 0 auto; padding: 20px; }
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.card .label { color: var(--text-soft); font-size: 12px; margin-bottom: 2px; }
+.card .value { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.card .sub { color: var(--text-faint); font-size: 12px; margin-top: 2px; }
+
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(520px, 1fr)); gap: 16px; }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  min-width: 0;              /* ★ 没有这行，grid 子项里的长表格会把布局撑破 */
+}
+.panel h2 {
+  margin: 0 0 2px;
+  font-size: 15px;
+  font-weight: 620;
+}
+.panel .hint { color: var(--text-faint); font-size: 12px; margin-bottom: 10px; }
+
+/* ECharts 容器必须有显式高度，否则 canvas 高度为 0，图完全不显示
+   ——而控制台一个错都没有，这是最容易卡住新手的一步。 */
+.chart { width: 100%; height: 340px; }
+.chart.tall { height: 520px; }
+
+/* --------------------------------------------------------------------------
+ * 空态 / 提示
+ *
+ * ★ 这个块是本项目"诚实呈现"的落点。真实电商的销量不在网页端公开，
+ *   所以 ?source=smzdm 下销量图必然是空的。
+ *   空白的图看起来像系统坏了；一句解释才是诚实的。
+ * ------------------------------------------------------------------------ */
+.notice {
+  display: none;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.notice.show { display: block; }
+.notice.info { background: var(--accent-soft); border-color: #c7d7fe; color: #1e40af; }
+
+.empty-state {
+  display: none;
+  height: 340px;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-faint);
+  padding: 0 30px;
+}
+.empty-state.show { display: flex; }
+
+/* --------------------------------------------------------------------------
+ * 表格
+ * ------------------------------------------------------------------------ */
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th, table.data td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+table.data th {
+  color: var(--text-soft);
+  font-weight: 550;
+  font-size: 12px;
+  background: #fbfbfc;
+  position: sticky;
+  top: 58px;
+  white-space: nowrap;
+}
+table.data th.sortable { cursor: pointer; user-select: none; }
+table.data th.sortable:hover { color: var(--accent); }
+table.data tbody tr { cursor: pointer; }
+table.data tbody tr:hover { background: #fafbfc; }
+
+/* ★ 标题列用 CSS 截断而不是后端截断。
+   后端那个 title_short 是给图表图例用的（那边没有 CSS）；
+   表格这边 hover 能看到完整标题，用 CSS 更自然，
+   而且不会因为窗口宽度变化而露出一个固定的省略号。 */
+td.title-cell {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+.muted { color: var(--text-faint); }
+
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+}
+.tag.src-mock { background: #f0f9ff; border-color: #bae6fd; color: #0369a1; }
+.tag.src-smzdm { background: #f0fdf4; border-color: #bbf7d0; color: #15803d; }
+
+/* --------------------------------------------------------------------------
+ * 分页与工具条
+ * ------------------------------------------------------------------------ */
+.toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.toolbar input[type="search"], .toolbar select {
+  font: inherit;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+}
+.toolbar input[type="search"] { width: 240px; }
+
+.pager { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.pager button {
+  font: inherit;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--text);
+}
+.pager button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pager button:disabled { opacity: .45; cursor: default; }
+
+/* --------------------------------------------------------------------------
+ * 详情弹窗
+ * ------------------------------------------------------------------------ */
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, .45);
+  z-index: 50;
+  padding: 40px 20px;
+  overflow: auto;
+}
+.modal-backdrop.show { display: block; }
+.modal {
+  background: var(--surface);
+  border-radius: 12px;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+  box-shadow: 0 20px 40px rgba(16, 24, 40, .2);
+}
+.modal-head { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 12px; }
+.modal-head h3 { margin: 0 0 4px; font-size: 16px; font-weight: 620; }
+.modal-head .close {
+  margin-left: auto;
+  border: 0;
+  background: var(--bg);
+  width: 30px; height: 30px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 16px;
+  color: var(--text-soft);
+  flex: none;
+}
+.modal-head .close:hover { background: #fee2e2; color: #b91c1c; }
+
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 16px; margin: 12px 0; }
+.kv div { font-size: 13px; }
+.kv .k { color: var(--text-soft); font-size: 12px; }
+
+@media (max-width: 720px) {
+  .charts { grid-template-columns: 1fr; }
+  .toolbar input[type="search"] { width: 100%; }
+}

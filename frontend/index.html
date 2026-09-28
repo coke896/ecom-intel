@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电商竞品情报分析平台 · 总览</title>
+<link rel="stylesheet" href="static/css/style.css">
+
+<!-- ==========================================================================
+     ECharts 及其本地兜底
+
+     ★ 版本必须是 5.6.0，两个都不能动：
+       · 5.5.1 —— 是网上博客和 AI 生成代码里最常见的版本号，
+                  但实测在 bootcdn / staticfile 上都是 **404**
+       · 6.x   —— echarts-wordcloud 2.1.0 官方兼容声明是 `echarts ^5.0.1`，
+                  升到 6 之后的报错是 "series.wordCloud not exists"，
+                  这句话会把人引去查"是不是插件没引"，而不是"是不是版本不对"
+
+     ★ 兜底为什么用 document.write 而不是动态 appendChild：
+       动态插入的 <script> 默认是**异步**的，后面的脚本会先执行，
+       到那时 echarts 还没到——于是兜底看起来"没生效"。
+       document.write 是在解析期同步插入，能保证顺序。
+       （代价：它会阻塞解析。但这里换来的正是我们要的顺序保证。）
+     ======================================================================= -->
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.6.0/echarts.min.js"></script>
+<script>
+  window.echarts || document.write('<script src="vendor/echarts.min.js"><\/script>');
+</script>
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts-wordcloud/2.1.0/echarts-wordcloud.min.js"></script>
+<script>
+  // 插件的 UMD 包装会把自己挂在 `window['echarts-wordcloud']` 上，
+  // 所以用它判断加载是否成功（插件没有提供别的探测方式）。
+  window['echarts-wordcloud'] ||
+    document.write('<script src="vendor/echarts-wordcloud.min.js"><\/script>');
+</script>
+</head>
+
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">电商竞品情报分析<span>数据管道演示</span></div>
+    <!-- 数据源切换由 JS 填充：计数要从接口拿，不能写死在 HTML 里 -->
+    <div class="switcher" id="source-switcher" role="group" aria-label="数据源"></div>
+    <nav class="pages">
+      <a href="index.html" class="active">总览</a>
+      <a href="products.html">商品列表</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <!-- 总览卡片 -->
+  <section class="cards" id="cards"></section>
+
+  <!--
+    全局提示条。★ 它承载的是"这个数据源整体上缺了什么"，
+    而不是某一张图缺了什么——单张图的缺失由各自的图内提示负责。
+    两层提示分开，是因为它们回答的问题不同：
+      全局条："这个数据源是什么状态"
+      图内条："这张图为什么是空的"
+  -->
+  <div class="notice" id="global-notice"></div>
+
+  <section class="charts">
+
+    <div class="panel">
+      <h2>价格分布</h2>
+      <div class="hint">每个商品按其<b>当前价</b>计入一个价格区间（不是历史价，历史价要看详情页）</div>
+      <div class="notice" id="notice-price"></div>
+      <div class="chart" id="chart-price"></div>
+      <div class="empty-state" id="empty-price"></div>
+    </div>
+
+    <div class="panel">
+      <h2>店铺占比</h2>
+      <div class="hint">按商品数统计；未采集到店铺信息的商品归入「未知店铺」，不计入丢失</div>
+      <div class="notice" id="notice-shop"></div>
+      <div class="chart" id="chart-shop"></div>
+      <div class="empty-state" id="empty-shop"></div>
+    </div>
+
+    <div class="panel">
+      <h2>销量 Top 20</h2>
+      <div class="hint">柱状图标签经过截断，<b>鼠标悬停可看完整标题</b>（长标题尾部常是营销语，截断无法保证区分 SKU）</div>
+      <div class="notice" id="notice-sales"></div>
+      <div class="chart tall" id="chart-sales"></div>
+      <div class="empty-state" id="empty-sales"></div>
+    </div>
+
+    <div class="panel">
+      <h2>标题关键词</h2>
+      <div class="hint">jieba 分词 + 自定义词典 + 停用词过滤；ASCII 词保留长度 ≥3 的（USB / Type-C / iPhone 这类是数码品类信息量最高的词）</div>
+      <div class="notice" id="notice-words"></div>
+      <div class="chart tall" id="chart-words"></div>
+      <div class="empty-state" id="empty-words"></div>
+    </div>
+
+  </section>
+</main>
+
+<script src="static/js/api.js"></script>
+<script src="static/js/charts.js"></script>
+<script>
+/* ============================================================================
+ * 页面装配
+ *
+ * 整体是"先渲染骨架、再并发拉数据"：
+ * 五个接口之间没有依赖，串行等会让首屏慢 5 倍。
+ * ========================================================================== */
+
+/** 渲染数据源切换按钮。
+ *
+ *  ★ 计数来自 /api/stats/sources，所以"两个数据源各有多少条"
+ *    在界面上是**可见**的——这是"双数据源隔离"最直接的证据，
+ *    比在 README 里写一段话有力得多。
+ */
+async function renderSwitcher() {
+  const box = document.getElementById('source-switcher');
+  const active = currentSource();
+
+  let counts = {};
+  try {
+    const data = await apiGet('/api/stats/sources');
+    for (const s of data.sources) counts[s.source] = s.product_count;
+  } catch (err) {
+    // 拿不到计数不影响切换功能，按钮上不显示数字就行。
+    // ★ 不在这里弹错误：接口本身还能用，弹一个红框只会让人以为整个服务挂了。
+    console.warn('数据源清单加载失败，切换按钮将不显示计数', err);
+  }
+
+  box.innerHTML = '';
+  for (const s of SOURCES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('aria-pressed', String(s.id === active));
+    // all 的计数是各源之和，接口不单独返回，这里自己加
+    const n = s.id === 'all'
+      ? Object.values(counts).reduce((a, b) => a + b, 0)
+      : counts[s.id];
+    btn.innerHTML = n === undefined
+      ? s.label
+      : `${s.label}<span class="count">${n === 0 ? '空' : n}</span>`;
+    // 空数据源不置灰禁用——点进去看到空态提示，本身就是演示的一部分
+    if (n === 0) btn.classList.add('empty');
+
+    btn.onclick = () => {
+      if (s.id === currentSource()) return;
+      setSource(s.id);
+      location.reload();   // 简单直接：重新拉一遍所有数据
+    };
+    box.appendChild(btn);
+  }
+}
+
+function renderCards(ov) {
+  const box = document.getElementById('cards');
+  const price = ov.price;
+
+  const items = [
+    { label: '商品数', value: fmtInt(ov.product_count),
+      sub: ov.price_missing ? `${ov.price_missing} 个无价格` : '全部有价格' },
+    { label: '店铺数', value: fmtInt(ov.shop_count), sub: '按店铺字段去重' },
+    { label: '价格点', value: fmtInt(ov.price_point_count),
+      sub: ov.product_count
+        ? `均 ${(ov.price_point_count / ov.product_count).toFixed(1)} 点/商品` : '—' },
+    { label: '价格中位数', value: price ? fmtPrice(price.median) : '—',
+      sub: price ? `${fmtPrice(price.min)} ~ ${fmtPrice(price.max)}` : '无数据' },
+    // ★ 销量这一格是"数据源差异"最直观的体现：
+    //   Mock 有，真实采集没有。空着 + 一句说明，而不是显示 0——
+    //   显示 0 会被读成"一件都没卖出去"，那是完全不同的事实。
+    ov.has_sales
+      ? { label: '销量合计', value: fmtInt(ov.sales.total),
+          sub: `最高单品 ${fmtInt(ov.sales.max)}` }
+      : { label: '销量合计', value: '—', sub: '真实电商不公开销量' },
+  ];
+
+  box.innerHTML = items.map((it) => `
+    <div class="card">
+      <div class="label">${it.label}</div>
+      <div class="value">${it.value}</div>
+      <div class="sub">${it.sub}</div>
+    </div>`).join('');
+}
+
+/** 并发拉取 4 张图的数据。
+ *
+ *  ★ 用 Promise.all 而不是 await 四次：四个接口互不依赖，
+ *    串行的话首屏时间等于四者之和。
+ *  ★ 但**任何一个失败都不该让整页白屏**——所以不是 Promise.all 直接
+ *    抛错，而是每张图各自 catch 后把自己的空态显示出来。
+ *    第一版是裸的 Promise.all，结果 onerror 一挂整页什么都不显示，
+ *    而控制台只有一个错，很容易以为是接口全挂了。
+ */
+async function loadCharts() {
+  const jobs = [
+    ['/api/stats/price-distribution', renderPriceDistribution,
+     'chart-price', 'empty-price', 'notice-price'],
+    ['/api/stats/sales-top', renderSalesTop,
+     'chart-sales', 'empty-sales', 'notice-sales'],
+    ['/api/stats/shop-share', renderShopShare,
+     'chart-shop', 'empty-shop', 'notice-shop'],
+    ['/api/stats/keywords', renderKeywords,
+     'chart-words', 'empty-words', 'notice-words'],
+  ];
+
+  await Promise.all(jobs.map(async ([path, render, chartId, emptyId, noticeId]) => {
+    try {
+      const data = await apiGet(path);
+      render(chartId, emptyId, noticeId, data);
+    } catch (err) {
+      console.error(path, err);
+      toggleEmpty(chartId, emptyId, true, `接口请求失败：${err.message}`);
+    }
+  }));
+}
+
+(async function main() {
+  // 切换按钮先画出来，它不依赖统计接口
+  renderSwitcher();
+
+  try {
+    const ov = await apiGet('/api/stats/overview');
+    renderCards(ov);
+    showNotice('global-notice', ov.notice);
+  } catch (err) {
+    document.getElementById('cards').innerHTML =
+      `<div class="card"><div class="label">加载失败</div>
+       <div class="value">—</div><div class="sub">${err.message}</div></div>`;
+  }
+
+  await loadCharts();
+})();
+</script>
+</body>
+</html>

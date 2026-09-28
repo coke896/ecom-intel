@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电商竞品情报分析平台 · 商品列表</title>
+<link rel="stylesheet" href="static/css/style.css">
+
+<!-- 和 index.html 同一套 ECharts + 本地兜底，理由见那边的注释 -->
+<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.6.0/echarts.min.js"></script>
+<script>
+  window.echarts || document.write('<script src="vendor/echarts.min.js"><\/script>');
+</script>
+</head>
+
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">电商竞品情报分析<span>数据管道演示</span></div>
+    <div class="switcher" id="source-switcher" role="group" aria-label="数据源"></div>
+    <nav class="pages">
+      <a href="index.html">总览</a>
+      <a href="products.html" class="active">商品列表</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>商品列表</h2>
+    <div class="hint">
+      点任意一行查看详情和价格历史。
+      「价格点」这一列是双数据源的直观对比：Mock 商品有 90 个点，
+      真实采集的商品可能只有 1 个（只被爆料过一次）。
+    </div>
+
+    <div class="notice" id="page-notice"></div>
+
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="搜索标题（支持中文）" autocomplete="off">
+      <select id="sort">
+        <option value="last_crawled_at">按采集时间</option>
+        <option value="price">按价格</option>
+        <option value="sales">按销量</option>
+        <option value="id">按 ID</option>
+      </select>
+      <select id="order">
+        <option value="desc">从高到低</option>
+        <option value="asc">从低到高</option>
+      </select>
+      <span class="muted" id="total-hint"></span>
+    </div>
+
+    <div style="overflow-x:auto">
+      <table class="data">
+        <thead>
+          <tr>
+            <th style="width:56px">ID</th>
+            <th>标题</th>
+            <th style="width:78px">来源</th>
+            <th style="width:150px">品牌</th>
+            <th style="width:92px" class="num">价格</th>
+            <th style="width:92px" class="num">销量</th>
+            <th style="width:150px">店铺</th>
+            <th style="width:72px" class="num">价格点</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+
+    <div class="pager">
+      <button id="prev">← 上一页</button>
+      <span class="muted" id="page-info"></span>
+      <button id="next">下一页 →</button>
+    </div>
+  </div>
+</main>
+
+<!-- 详情弹窗 -->
+<div class="modal-backdrop" id="modal">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h3 id="m-title">—</h3>
+        <div class="muted" id="m-sub"></div>
+      </div>
+      <button class="close" id="m-close" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="notice" id="m-notice"></div>
+    <div class="kv" id="m-kv"></div>
+    <div class="chart" id="m-chart" style="height:300px"></div>
+  </div>
+</div>
+
+<script src="static/js/api.js"></script>
+<script src="static/js/charts.js"></script>
+<script>
+/* ============================================================================
+ * 商品列表页
+ * ========================================================================== */
+
+// 页面状态。★ 集中放一个对象里，而不是散在几个全局变量：
+//   每次请求都要把「当前页 + 搜索词 + 排序」一起带上，
+//   散着放最容易出现"改了排序但翻页时用的还是旧排序"这类不同步的 bug。
+const state = { page: 1, size: 20, q: '', sort: 'last_crawled_at', order: 'desc' };
+
+async function renderSwitcher() {
+  const box = document.getElementById('source-switcher');
+  const active = currentSource();
+  let counts = {};
+  try {
+    const data = await apiGet('/api/stats/sources');
+    for (const s of data.sources) counts[s.source] = s.product_count;
+  } catch (err) { console.warn('数据源清单加载失败', err); }
+
+  box.innerHTML = '';
+  for (const s of SOURCES) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('aria-pressed', String(s.id === active));
+    const n = s.id === 'all'
+      ? Object.values(counts).reduce((a, b) => a + b, 0)
+      : counts[s.id];
+    btn.innerHTML = n === undefined
+      ? s.label
+      : `${s.label}<span class="count">${n === 0 ? '空' : n}</span>`;
+    if (n === 0) btn.classList.add('empty');
+    btn.onclick = () => {
+      if (s.id === currentSource()) return;
+      setSource(s.id);
+      state.page = 1;
+      load();
+    };
+    box.appendChild(btn);
+  }
+}
+
+function rowHtml(p) {
+  // ★ 销量为空时显示"—"而不是 0。
+  //   0 是"一件没卖出去"，"—"是"不知道"——两件完全不同的事，
+  //   而真实采集的数据永远是后者。
+  const sales = p.sales === null ? '<span class="muted">—</span>' : fmtInt(p.sales);
+
+  // ★ 价格区间（券后 199-299 这种）在列表里也要能看出来。
+  //   只在真的存在区间时才显示第二个数字，单值时保持表格干净。
+  const hasRange = p.price_max !== null && p.price_max !== p.price;
+  const price = p.price === null
+    ? '<span class="muted">—</span>'
+    : fmtPrice(p.price) + (hasRange ? `<span class="muted"> ~${fmtPrice(p.price_max)}</span>` : '');
+
+  return `
+    <tr data-id="${p.id}">
+      <td class="muted">${p.id}</td>
+      <td class="title-cell" title="${escapeAttr(p.title)}">${escapeHtml(p.title)}</td>
+      <td><span class="tag src-${p.source}">${p.source}</span></td>
+      <td>${p.brand ? escapeHtml(p.brand) : '<span class="muted">—</span>'}</td>
+      <td class="num">${price}</td>
+      <td class="num">${sales}</td>
+      <td>${p.shop ? escapeHtml(p.shop) : '<span class="muted">未采集</span>'}</td>
+      <td class="num">${p.price_point_count}</td>
+    </tr>`;
+}
+
+/* ★ 必须转义。
+ *
+ *   标题来自外部数据源（采集来的），里面完全可能有 `<`、`&`、引号。
+ *   直接用 innerHTML 拼就是 **DOM 型 XSS**：一条标题里带
+ *   `<img src=x onerror=...>` 的爆料，就能在打开页面的人浏览器里执行脚本。
+ *
+ *   这个项目里最危险的地方恰恰是"演示给别人看"的时候——
+ *   你会把浏览器打开给面试官看，而数据是真实站点抓来的。
+ *
+ *   用 textContent 赋值是最稳的转义方式（它不会解析标签），
+ *   比手写 replace 链可靠——手写的那种总会漏掉某个字符。
+ */
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+// 属性值里的引号要单独处理（textContent 不转义引号）
+function escapeAttr(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function load() {
+  const tbody = document.getElementById('rows');
+  try {
+    const data = await apiGet('/api/products', {
+      page: state.page, size: state.size, sort: state.sort, order: state.order, q: state.q,
+    });
+
+    tbody.innerHTML = data.items.length
+      ? data.items.map(rowHtml).join('')
+      : `<tr><td colspan="8" style="text-align:center;padding:40px" class="muted">
+           ${state.q ? '没有匹配的商品' : '该数据源暂无商品'}
+         </td></tr>`;
+
+    // 行点击 → 打开详情
+    for (const tr of tbody.querySelectorAll('tr[data-id]')) {
+      tr.onclick = () => openDetail(tr.dataset.id);
+    }
+
+    document.getElementById('total-hint').textContent = `共 ${fmtInt(data.total)} 条`;
+    document.getElementById('page-info').textContent = `第 ${data.page} / ${data.pages} 页`;
+    document.getElementById('prev').disabled = data.page <= 1;
+    document.getElementById('next').disabled = data.page >= data.pages;
+
+    // 空数据源的整体提示（和后端 NO_DATA_NOTICE 一致）
+    showNotice('page-notice', data.total === 0 && !state.q
+      ? '该数据源暂无商品。' : null);
+  } catch (err) {
+    console.error(err);
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:40px">
+        接口请求失败：${escapeHtml(err.message)}</td></tr>`;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 详情弹窗
+ * ------------------------------------------------------------------------ */
+
+async function openDetail(id) {
+  const modal = document.getElementById('modal');
+  // ★ 先显示弹窗再画图。反过来的话 ECharts 会在一个 display:none
+  //   的容器上初始化，量到的宽高是 0，图画不出来——而且不报错，
+  //   表现为"点开是一块空白"，非常难查。
+  modal.classList.add('show');
+
+  const chartEl = document.getElementById('m-chart');
+  const existing = echarts.getInstanceByDom(chartEl);
+  if (existing) existing.resize();
+
+  try {
+    const [p, hist] = await Promise.all([
+      apiGet(`/api/products/${id}`),
+      apiGet(`/api/products/${id}/price-history`),
+    ]);
+
+    document.getElementById('m-title').textContent = p.title;
+    document.getElementById('m-sub').innerHTML =
+      `<span class="tag src-${p.source}">${p.source}</span>
+       <span class="muted"> · ${escapeHtml(p.source_channel)} 通道 · 源站 ID ${escapeHtml(p.source_id)}</span>`;
+
+    const kv = [
+      ['当前价', p.price === null ? '—' : fmtPrice(p.price)],
+      ['价格区间上限', p.price_max === null ? '—' : fmtPrice(p.price_max)],
+      // ★ 历史极值来自 price_history 现算，不是 products.price_max。
+      //   两者含义不同：price_max 是"这一次成交的区间上限"。
+      ['历史最低 / 最高',
+        p.historical_min === null ? '—' : `${fmtPrice(p.historical_min)} / ${fmtPrice(p.historical_max)}`],
+      ['品牌 / 分类', `${p.brand || '—'} / ${p.category || '—'}`],
+      ['店铺', p.shop || '未采集'],
+      ['销量', p.sales === null ? '— （该数据源不提供）' : fmtInt(p.sales)],
+      ['价格点数', String(p.price_point_count)],
+      ['最近采集', fmtTime(p.last_crawled_at)],
+      ['疑似重复指向', p.suspected_duplicate_of === null ? '无' : `#${p.suspected_duplicate_of}`],
+      ['归一化标题', p.title_norm],
+    ];
+    document.getElementById('m-kv').innerHTML = kv.map(([k, v]) => `
+      <div><div class="k">${k}</div><div>${escapeHtml(v)}</div></div>`).join('');
+
+    // ★ 详情接口返回的 notice 直接显示——它解释的是"为什么只有一个点"，
+    //   那正是"事件归并"这条叙事的关键一环，不能让它看起来像 bug。
+    showNotice('m-notice', hist.notice, hist.notice ? 'info' : 'warn');
+
+    renderPriceHistory('m-chart', hist);
+  } catch (err) {
+    console.error(err);
+    document.getElementById('m-title').textContent = '加载失败';
+    showNotice('m-notice', err.message);
+  }
+}
+
+function closeDetail() {
+  document.getElementById('modal').classList.remove('show');
+}
+
+/* ---------------------------------------------------------------------------
+ * 事件绑定
+ * ------------------------------------------------------------------------ */
+
+document.getElementById('m-close').onclick = closeDetail;
+// 点背景关闭。★ 必须判断 e.target 就是背景本身，
+//   否则点弹窗内部任何地方都会把弹窗关掉。
+document.getElementById('modal').onclick = (e) => {
+  if (e.target.id === 'modal') closeDetail();
+};
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeDetail();
+});
+
+document.getElementById('prev').onclick = () => { state.page -= 1; load(); };
+document.getElementById('next').onclick = () => { state.page += 1; load(); };
+document.getElementById('sort').onchange = (e) => {
+  state.sort = e.target.value; state.page = 1; load();
+};
+document.getElementById('order').onchange = (e) => {
+  state.order = e.target.value; state.page = 1; load();
+};
+
+/* 搜索防抖。
+ *
+ * ★ 不防抖的话，输入"充电宝"三个字会发三次请求，
+ *   而且三次的响应**可能乱序返回**——最后显示的是哪一次的结果
+ *   取决于网络快慢，于是搜索结果看起来是随机的。
+ *   300ms 是打字停顿的常见经验值：比它短会在连续输入时误触发，
+ *   比它长会有明显的卡顿感。
+ */
+let searchTimer = null;
+document.getElementById('q').oninput = (e) => {
+  clearTimeout(searchTimer);
+  const value = e.target.value.trim();
+  searchTimer = setTimeout(() => {
+    state.q = value;
+    state.page = 1;
+    load();
+  }, 300);
+};
+
+(async function main() {
+  renderSwitcher();
+  await load();
+})();
+</script>
+</body>
+</html>
