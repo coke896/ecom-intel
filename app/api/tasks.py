@@ -55,7 +55,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import insert, literal, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import DbDep, SourceDep, SourceFilter
@@ -186,22 +186,83 @@ def enqueue_crawl(db: DbDep, source: SourceDep) -> TaskOut:
             ),
         )
 
-    existing = _active_task(db, source.value)
-    if existing is not None:
-        out = _to_out(existing)
-        out.message = (
-            f"{source.value} 已有一个采集任务（#{existing.id}，"
-            f"{existing.status}）在队列里，本次不再重复入队。"
-            f"★ 重复入队不会更快，只会把 SMZDM 的请求额度更快用光。"
+    # ★ 一条 SQL 完成"检查 + 插入"，**不能写成先查后插**。
+    #
+    #   先查后插是最自然的写法（`existing = _active_task(...)`，
+    #   是 None 就 `db.add(...)`），读起来完全正确，但在并发下不成立：
+    #   两个请求各自查到自己想看的"没有待办任务"，然后各自插入。
+    #
+    #   实测（真实文件库，4 个并发 POST ?source=smzdm，
+    #   把"查完、还没写"的那条缝隙从微秒级撑到 50ms 以便稳定复现）：
+    #
+    #       响应：(200, id=1) (200, id=2) (200, id=3) (200, id=4)
+    #       库里：4 行 pending
+    #
+    #   ★ 四个请求**没有一个**认为自己被挡下了——全都返回 200 + 新 id。
+    #     而这正是本文件顶部那段承诺要防的事：worker 会把 4 个任务依次跑一遍，
+    #     也就是 4 倍的请求量，对 SMZDM 的额度是 4 倍的消耗。
+    #     更要命的是它看起来完全正常：界面上只是"任务多跑了几轮"。
+    #
+    #   把判断塞进 INSERT 的 WHERE 里就成立了：SQLite 的写是串行的，
+    #   两条语句必然一前一后执行，后到的那条会看到前一条刚提交的行。
+    #   ★ 形状和 worker.py 的 claim_next_task 一模一样
+    #     （那边是"一条 SQL 完成选中 + 占住"，注释在它上面）——
+    #     同一个问题的同一个解法，只是这边守的是"入队"、那边守的是"认领"。
+    now = utcnow()
+    already_queued = (
+        select(literal(1))
+        .where(CrawlTask.source == source.value, CrawlTask.status.in_(_ACTIVE_STATUSES))
+        .exists()
+    )
+    new_id = db.execute(
+        insert(CrawlTask)
+        .from_select(
+            # ★ 列要写全（`total` 除外，它本来就该是 NULL）。
+            #   不写的话，这些 NOT NULL 列不会被填上模型里的 default——
+            #   `default=utcnow` 是 SQLAlchemy 在**参数集**上做的客户端默认值，
+            #   而 INSERT ... SELECT 走的是另一条路，不经过它。
+            ["source", "status", "progress", "message", "created_at", "updated_at"],
+            select(
+                literal(source.value),
+                literal("pending"),
+                literal(0),
+                literal(f"已入队。等待 worker 认领——启动方式：{_WORKER_HINT}"),
+                literal(now),
+                literal(now),
+            ).where(~already_queued),
         )
-        return out
-
-    task = CrawlTask(source=source.value, status="pending", progress=0)
-    task.message = f"已入队。等待 worker 认领——启动方式：{_WORKER_HINT}"
-    db.add(task)
+        .returning(CrawlTask.id)
+    ).scalar_one_or_none()
     db.commit()
 
-    return _to_out(task)
+    if new_id is not None:
+        # 这里不需要 expire：上面是 Core 插入，会话里没有对应的 ORM 对象，
+        # 所以这次 get 必然真的去查库。（批量 UPDATE 那条路就必须 expire，
+        # 理由见 worker.py 的 recover_stale_tasks——这里不是那种情况。）
+        return _to_out(db.get(CrawlTask, new_id))
+
+    # 没插进去 = 有别人先提交了一个待办任务。这不是错误，把那个任务返回回去。
+    existing = _active_task(db, source.value)
+    if existing is None:
+        # ★ 理论上到不了：EXISTS 为真就说明查得到那一行。
+        #   但如果真发生了，**绝不能返回 200**——那等于告诉调用方
+        #   "任务已经在队列里了"，而实际上一个都没有，于是前端会一直
+        #   等一个不存在的任务。宁可报出来。
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "入队被并发操作挡住了，但没查到是哪一个任务。"
+                "这不该发生——请刷新后在任务列表里确认一下，再重试。"
+            ),
+        )
+
+    out = _to_out(existing)
+    out.message = (
+        f"{source.value} 已有一个采集任务（#{existing.id}，"
+        f"{existing.status}）在队列里，本次不再重复入队。"
+        f"★ 重复入队不会更快，只会把 SMZDM 的请求额度更快用光。"
+    )
+    return out
 
 
 @router.get("", response_model=TaskListOut)

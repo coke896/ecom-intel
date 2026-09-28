@@ -33,13 +33,34 @@
     分叉的代价（新类型永远建不出来）比文档少个下拉框大得多。
 
 【2】同一个商品 + 同一种规则 + 同一个阈值 → 拒绝，不建第二条
-    ★ 这条检查**建成和改成都走同一个函数**（`_assert_not_duplicate`）：
+    ★ 这条判据**建成和改成都取自同一处**（`_duplicate_conditions`）：
       只挡"建成"的话，改一个阈值就能绕过去，防线的形状是漏的。
 
     和 tasks.py 里"同一个源不重复入队"是同一条理由：**两条一模一样的规则
     会对同一个价格事件各写一条 alerts、各推一次通知**。
     状态机只能防住"一条规则重复触发"，防不住"两条规则同时触发"。
     挡在后端而不是前端，也是同一条理由（前端的防抖挡不住 curl 和第二个标签页）。
+
+    ★★ "挡在后端"这句话本身不够——**后端怎么写才算挡住了**，是这一轮 review
+       才补上的一课。原来的写法是"先查一遍，没有重复再插入"，读起来完全正确，
+       但并发下不成立：两个请求各自查到"没有重复"，然后各自插入。
+       实测（真实文件库，4 个并发 POST，把查完到写之前那条缝隙撑到 50ms）：
+
+           响应：(200, id=1) (200, id=2) (200, id=3) (200, id=4)
+           库里：4 条一模一样的规则
+
+       "连点两次提交"就够了——不需要恶意，也不需要并发压测工具，
+       前端按钮点两下、或者两个标签页各点一下。
+
+       改法：把判断塞进 INSERT / UPDATE 语句**自己的 WHERE** 里。
+       SQLite 的写是串行的，两条语句必然一前一后执行，后到的那条
+       会看到前一条刚提交的行。同一个形状在 tasks.py（入队）和
+       worker.py（认领任务）各有一处，三处是一课。
+
+       `_assert_not_duplicate` 这个函数因此**换了职责**：它不再判定，
+       只在写语句没写进去之后复算原因、提供报错文案。
+       这件事在它的 docstring 里单独记了一笔——"守门的"变成
+       "解释门为什么没开"，是重构里最容易骗过 review 的动作。
 
 【3】改规则 = 重新武装（`state` 回到 `armed`）
 
@@ -72,10 +93,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Path, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, insert, literal, select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import DbDep, SourceDep, apply_source
+from app.db.base import utcnow
 from app.db.models import Alert, AlertRule, PriceHistory, Product
 from scraper.check_alerts import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
 
@@ -355,6 +377,72 @@ def _get_rule(db: Session, rule_id: int) -> AlertRule:
     return rule
 
 
+def _duplicate_conditions(
+    *,
+    product_id: int,
+    rule_type: str,
+    threshold: float,
+    exclude_id: int | None = None,
+) -> list[object]:
+    """一对"完全相同的规则"要满足的条件。
+
+    ★ **这是这条规则的唯一定义处**——建、改、以及报错时复算，三处都从这里取。
+      各写一遍的后果本文件反复记过：不是"两处实现不一致"，
+      而是**一处有、一处没有**，而防线的形状是漏的。
+
+    ★ 比较是**精确的浮点相等**，不是"差不多"。
+      引入容差就要回答"多接近算一样"，那是个需要解释的魔法数字；
+      而两条阈值相近的规则本来就是用户自己配的，不算错误——
+      真正要防的是"连点两次提交建出两条一模一样的"。
+    """
+    conditions: list[object] = [
+        AlertRule.product_id == product_id,
+        AlertRule.rule_type == rule_type,
+        AlertRule.threshold == threshold,
+    ]
+    if exclude_id is not None:
+        # 改规则时要把自己排除掉，否则"把阈值改成它现在这个值"会被判成和自己重复。
+        conditions.append(AlertRule.id != exclude_id)
+    return conditions
+
+
+def _duplicate_exists(
+    *,
+    product_id: int,
+    rule_type: str,
+    threshold: float,
+    exclude_id: int | None = None,
+):
+    """把上面那组条件变成一个能塞进**写语句的 WHERE** 里的 EXISTS。
+
+    ★ 为什么要塞进写语句里，而不是写在写之前：
+      先查后写（`_assert_not_duplicate(...)` → 没抛异常 → `db.add(...)`）
+      是并发下不成立的——两个请求各自查到"没有重复"，然后各自插入。
+
+      实测（真实文件库，4 个并发 POST /api/alerts/rules，
+      把"查完、还没写"的那条缝隙从微秒级撑到 50ms 以便稳定复现）：
+
+          响应：(200, id=1) (200, id=2) (200, id=3) (200, id=4)
+          库里：4 条一模一样的规则
+
+      ★ 而这是本文件顶部【2】那段承诺想要防的事：两条相同规则会对同一个
+        价格事件各写一条 alerts、各推一次通知——"连点两次提交"就够了，
+        不需要恶意。文件里写着"挡在后端而不是前端"，但先查后写的后端
+        在并发下并不比前端防抖更可靠。
+
+      SQLite 的写是串行的，所以判断一旦落在写语句自己的 WHERE 里，
+      两条语句必然一前一后执行，后到的那条会看到前一条刚提交的行。
+    """
+    return (
+        select(literal(1)).where(*_duplicate_conditions(
+            product_id=product_id,
+            rule_type=rule_type,
+            threshold=threshold,
+            exclude_id=exclude_id,
+        )).exists()
+    )
+
+
 def _assert_not_duplicate(
     db: Session,
     *,
@@ -365,27 +453,36 @@ def _assert_not_duplicate(
 ) -> None:
     """有完全相同的规则就 409。
 
-    ★ 建成和改成都必须走这里。
+    ★ 这个函数的**职责在本轮 review 里变了，必须说清楚**，否则读代码的人
+      会以为防线还是它：它现在**不做判定**，只在写语句没写进去之后
+      **复算一遍原因**（好把"是哪一条重复了"写进报错里）。
+
+      判定已经由 `_duplicate_exists` 塞进写语句的 WHERE 里做完了——
+      真正的防线在数据库那条语句上，这里只是**报错文案的提供者**。
+
+      ★ 这件事值得单独记一笔：一个"检查函数"从"守门的"变成"解释为什么
+        门没开"，是重构里最容易骗过 review 的动作——
+        名字还叫 `_assert_not_duplicate`，调用点也还在，但它的失败
+        不再意味着"挡下来了"，而是"已经挡下来了，现在只是告诉你原因"。
+        所以写语句那边**必须**同时带上 `~_duplicate_exists(...)`，
+        少了它，这里就从"报错"悄悄退化成"唯一的防线"——
+        而那正是这个文件最开始的样子。
+
+    ★ 建成和改成都必须走到同一条判据（`_duplicate_conditions`）。
       只挡"建成"的话，防线可以被绕过：
         规则 A（商品 5，低于 100）、规则 B（商品 5，低于 150）
-        → 把 A 的阈值改成 150 → **两条一一样的规则**，谁也没挡住。
-      这正是"同一条规则写两遍就会分叉"的另一个面相——
-      不是两处实现不一致，而是**一处有、一处没有**。
-
-    ★ 比较是**精确的浮点相等**，不是"差不多"。
-      引入容差就要回答"多接近算一样"，那是个需要解释的魔法数字；
-      而两条阈值相近的规则本来就是用户自己配的，不算错误——
-      真正要防的是"连点两次提交建出两条一模一样的"。
+        → 把 A 的阈值改成 150 → **两条一模一样的规则**，谁也没挡住。
     """
-    query = select(AlertRule).where(
-        AlertRule.product_id == product_id,
-        AlertRule.rule_type == rule_type,
-        AlertRule.threshold == threshold,
-    )
-    if exclude_id is not None:
-        query = query.where(AlertRule.id != exclude_id)
-
-    duplicate = db.execute(query).scalar_one_or_none()
+    duplicate = db.execute(
+        select(AlertRule).where(
+            *_duplicate_conditions(
+                product_id=product_id,
+                rule_type=rule_type,
+                threshold=threshold,
+                exclude_id=exclude_id,
+            )
+        )
+    ).scalar_one_or_none()
     if duplicate is not None:
         raise HTTPException(
             status_code=409,
@@ -396,6 +493,37 @@ def _assert_not_duplicate(
                 "状态机只能防住一条规则重复触发，防不住两条规则同时触发。"
             ),
         )
+
+
+def _assert_under_rule_cap(db: Session) -> None:
+    """规则总数到上限就 422。
+
+    ★ 和上面那个一样，这个函数现在是**报错文案的提供者**：
+      上限的判定已经塞进 create_rule 的写语句 WHERE 里了
+      （见 `_rule_count_below_cap`）。分开的理由是它原来就在重复检查之前，
+      报错的优先级要保持不变（既超上限又重复时报 422，不是 409）。
+    """
+    total = db.scalar(select(func.count()).select_from(AlertRule)) or 0
+    if total >= MAX_RULES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"告警规则已达上限 {MAX_RULES} 条。"
+                "★ 检查是每 5 分钟一轮的全量扫描，规则数直接决定那个动作的代价——"
+                "请先删掉一些不需要的，而不是把上限调高。"
+            ),
+        )
+
+
+def _rule_count_below_cap():
+    """规则数还没到上限——一个能塞进写语句 WHERE 里的条件。
+
+    ★ 上限也要进写语句，理由是同一个：先数一遍再插入，在并发下
+      可以一起越过上限（虽然要凑够 100 个并发请求才明显，但形状是一样的）。
+      `MAX_RULES` 在这里**每次调用时**读取，不写成默认参数——
+      测试用 monkeypatch 把它改小来验上限，读成默认参数会让那个测试失效。
+    """
+    return select(func.count()).select_from(AlertRule).scalar_subquery() < MAX_RULES
 
 
 # ===========================================================================
@@ -420,36 +548,64 @@ def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
             status_code=404, detail=f"没有 id={payload.product_id} 的商品"
         )
 
-    # ★ 规则总数上限。见 MAX_RULES 的说明。
-    total = db.scalar(select(func.count()).select_from(AlertRule)) or 0
-    if total >= MAX_RULES:
+    # ★ 一条 SQL 完成"两道检查 + 插入"，不能写成先查后插。
+    #   两道检查是：① 规则数没到上限（MAX_RULES）② 没有一模一样的规则。
+    #   理由（含实测数据）写在 `_duplicate_exists` 的 docstring 里——
+    #   这里是同一个问题的第二处。
+    new_id = db.execute(
+        insert(AlertRule)
+        .from_select(
+            # ★ 列写全：`default=` 是 SQLAlchemy 在参数集上做的客户端默认值，
+            #   而 INSERT ... SELECT 不经过它，漏写的 NOT NULL 列会直接插入失败。
+            ["product_id", "rule_type", "threshold", "enabled", "state", "created_at"],
+            select(
+                literal(payload.product_id),
+                literal(payload.rule_type),
+                literal(payload.threshold),
+                literal(True),
+                # ★ 新规则一律从 armed 开始，理由见端点 docstring。
+                literal("armed"),
+                literal(utcnow()),
+            ).where(
+                _rule_count_below_cap(),
+                ~_duplicate_exists(
+                    product_id=payload.product_id,
+                    rule_type=payload.rule_type,
+                    threshold=payload.threshold,
+                ),
+            ),
+        )
+        .returning(AlertRule.id)
+    ).scalar_one_or_none()
+    db.commit()
+
+    if new_id is None:
+        # 没插进去 → 复算一遍是哪一个条件不成立，好给出准确的报错。
+        # ★ 顺序和改动前一致（先上限后重复）：两个条件都不成立时报 422。
+        _assert_under_rule_cap(db)
+        _assert_not_duplicate(
+            db,
+            product_id=payload.product_id,
+            rule_type=payload.rule_type,
+            threshold=payload.threshold,
+        )
+        # 两个条件现在都成立，但刚刚那条语句没插进去——
+        # 只可能是有人在这一瞬间并发删了规则（把上限腾出来了 /
+        # 把那条重复的删了）。**不能返回 200**：那等于告诉调用方
+        # "规则建好了"，而实际上库里没有这一行。
         raise HTTPException(
-            status_code=422,
+            status_code=503,
             detail=(
-                f"告警规则已达上限 {MAX_RULES} 条。"
-                "★ 检查是每 5 分钟一轮的全量扫描，规则数直接决定那个动作的代价——"
-                "请先删掉一些不需要的，而不是把上限调高。"
+                "这条规则在保存的一瞬间和别的操作撞上了（另一个请求刚删过规则），"
+                "本次没有建成。请刷新规则列表确认后重试。"
             ),
         )
 
-    # ★ 完全相同的规则不重复建。理由见文件顶部【2】。
-    _assert_not_duplicate(
-        db,
-        product_id=payload.product_id,
-        rule_type=payload.rule_type,
-        threshold=payload.threshold,
-    )
-
-    rule = AlertRule(
-        product_id=payload.product_id,
-        rule_type=payload.rule_type,
-        threshold=payload.threshold,
-        enabled=True,
-        state="armed",
-    )
-    db.add(rule)
-    db.commit()
-
+    # 这里不需要 expire：上面是 Core 插入，会话里没有对应的 ORM 对象，
+    # 所以这次 get 必然真的去查库。（批量 UPDATE 那条路就必须 expire，
+    # 理由见 worker.py 的 recover_stale_tasks——PATCH 那边是那种情况。）
+    rule = db.get(AlertRule, new_id)
+    assert rule is not None  # 刚插进去的行，除非并发删了
     return _rule_out(
         rule,
         product,
@@ -504,36 +660,70 @@ def update_rule(
     )
     _validate_threshold(new_type, new_threshold)
 
-    # ★ 改完不能和别的规则撞成一对。
-    #   在**赋值之前**检查：此刻会话里还没有未提交的改动，
-    #   查询看到的就一定是库里的真实状态（不依赖 autoflush 的设置）。
-    if new_type != rule.rule_type or new_threshold != rule.threshold:
-        _assert_not_duplicate(
-            db,
-            product_id=rule.product_id,
-            rule_type=new_type,
-            threshold=new_threshold,
-            exclude_id=rule.id,
-        )
-
-    changed = False
-    if payload.rule_type is not None and payload.rule_type != rule.rule_type:
-        rule.rule_type = payload.rule_type
-        changed = True
-    if payload.threshold is not None and payload.threshold != rule.threshold:
-        rule.threshold = payload.threshold
-        changed = True
-    if payload.enabled is not None and payload.enabled != rule.enabled:
-        rule.enabled = payload.enabled
-        changed = True
+    changed = (
+        new_type != rule.rule_type
+        or new_threshold != rule.threshold
+        or (payload.enabled is not None and payload.enabled != rule.enabled)
+    )
 
     # ★ 重置状态放在"有改动"的分支里，而不是无条件执行：
     #   一个空 PATCH（或者传了和当前值相同的值）不该改变状态机的状态。
     #   "保存了一下但什么都没改，于是重新武装了"是个很难查的怪事。
     if changed:
-        rule.state = "armed"
+        values: dict[str, object] = {"state": "armed"}
+        if new_type != rule.rule_type:
+            values["rule_type"] = new_type
+        if new_threshold != rule.threshold:
+            values["threshold"] = new_threshold
+        if payload.enabled is not None and payload.enabled != rule.enabled:
+            values["enabled"] = payload.enabled
 
-    db.commit()
+        # ★ "改完不能和别的规则撞成一对"这条判断，塞在 UPDATE 自己的 WHERE 里，
+        #   而不是写在它前面。写成先查后改的话，两个并发 PATCH 会各自
+        #   查到"没撞"，然后各自改——于是又出现两条一模一样的规则。
+        #   形状和 create_rule 那一处完全相同，理由和实测数据见
+        #   `_duplicate_exists` 的 docstring。
+        result = db.execute(
+            update(AlertRule)
+            .where(
+                AlertRule.id == rule.id,
+                ~_duplicate_exists(
+                    product_id=rule.product_id,
+                    rule_type=new_type,
+                    threshold=new_threshold,
+                    exclude_id=rule.id,
+                ),
+            )
+            .values(**values)
+        )
+        db.commit()
+
+        if not result.rowcount:
+            # 没改到 → 复算原因：要么撞上了别的规则（409），
+            # 要么这一行在保存过程中被并发删掉了。
+            _assert_not_duplicate(
+                db,
+                product_id=rule.product_id,
+                rule_type=new_type,
+                threshold=new_threshold,
+                exclude_id=rule.id,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"规则 #{rule.id} 在保存过程中被删掉了，本次改动没有生效。"
+                    "请刷新规则列表。"
+                ),
+            )
+
+        # ★ 这一行不能省，理由和 worker.py 的 recover_stale_tasks 里那段一样：
+        #   批量 UPDATE **不会**把新值同步到会话里已有的对象上。
+        #   不 expire 的话，下面读到的 rule 还带着改动前的字段——
+        #   响应里会显示旧阈值，而库里已经是新值（"库改对了，读的人看到旧值"）。
+        db.expire_all()
+        rule = db.get(AlertRule, rule.id)
+        assert rule is not None  # 上面刚确认过它还在
+
     product = db.get(Product, rule.product_id)
     assert product is not None  # 外键保证；真丢了说明数据被手工改坏了
     return _rule_out(
