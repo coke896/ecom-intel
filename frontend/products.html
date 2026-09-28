@@ -23,6 +23,7 @@
       <a href="index.html">总览</a>
       <a href="products.html" class="active">商品列表</a>
       <a href="analysis.html">AI 分析</a>
+      <a href="alerts.html">价格告警</a>
     </nav>
   </div>
 </header>
@@ -93,6 +94,12 @@
     <div class="notice" id="m-notice"></div>
     <div class="kv" id="m-kv"></div>
     <div class="chart" id="m-chart" style="height:300px"></div>
+
+    <!-- 「为这个商品配告警」的入口。
+         ★ 放这里而不是放列表行里：行本身就是"点开详情"的按钮，
+           在里面再塞一个按钮要处理冒泡，而且 20 行各一个按钮也很吵。
+           而"我正在看这个商品的详情"恰好是想给它配告警的那一刻。 -->
+    <div class="modal-actions" id="m-actions"></div>
   </div>
 </div>
 
@@ -270,6 +277,17 @@ async function openDetail(id) {
     showNotice('m-notice', hist.notice, hist.notice ? 'info' : 'warn');
 
     renderPriceHistory('m-chart', hist);
+
+    // 带着商品 id 跳到告警页。★ 用 URL 参数而不是 localStorage：
+    //   这是"我要给这一个商品配告警"的一次性上下文，
+    //   像数据源那样长期记住它反而会让下次进来时莫名其妙地预选一个商品。
+    const actions = document.getElementById('m-actions');
+    actions.innerHTML = '';
+    const link = document.createElement('a');
+    link.className = 'btn';
+    link.href = 'alerts.html?product_id=' + encodeURIComponent(id);
+    link.textContent = '为这个商品配价格告警 →';
+    actions.appendChild(link);
   } catch (err) {
     console.error(err);
     document.getElementById('m-title').textContent = '加载失败';

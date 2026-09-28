@@ -395,6 +395,47 @@ td.title-cell {
 .kv div { font-size: 13px; }
 .kv .k { color: var(--text-soft); font-size: 12px; }
 
+/* --------------------------------------------------------------------------
+ * 告警页
+ * ------------------------------------------------------------------------ */
+
+/* 规则状态徽章（看守中 / 已触发）。
+   ★ 文字本身就把两种状态分开了，颜色只是加强。
+     只靠颜色的话，色盲、截图、黑白打印都会丢掉这个信息——
+     而"这条规则会不会再响"恰恰是这一页最需要被看懂的东西。 */
+.state-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.state-armed { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
+.state-fired { background: #fff7ed; border-color: #fed7aa; color: #c2410c; }
+
+/* 告警页的表格行没有"点开详情"的行为（其它页面有），
+   所以光标不能是说谎的手型。 */
+#rules-body tr, #alerts-body tr { cursor: default; }
+
+/* 检查报告。★ 它的存在感要比一般提示强一点：
+   "判不了"那种情况在别处完全看不见（没写记录、没报错），
+   这里是它唯一的出口。 */
+.check-report {
+  margin-top: 4px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.check-reasons { margin: 8px 0 0; padding-left: 18px; color: var(--warn-text); }
+
+.modal-actions { margin-top: 14px; }
+/* 让 <a> 用 .btn 的样式时不会带上链接的下划线和主题色。 */
+a.btn { display: inline-block; text-decoration: none; }
+
 @media (max-width: 720px) {
   .charts { grid-template-columns: 1fr; }
   .toolbar input[type="search"] { width: 100%; }

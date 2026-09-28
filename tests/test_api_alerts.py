@@ -624,6 +624,53 @@ def test_list_rules_respects_limit(client, db, make):
     assert client.get("/api/alerts/rules?limit=2").json()["total"] == 2
 
 
+def test_list_rules_filters_by_source(client, db, make):
+    """★ `?source=` 在告警页同样可用（它就是 apply_source 的第二种合法形状）。
+
+    ★ 这条同时验证了 deps.py 里写的那个约定：**主表不是 Product 也能用**，
+      前提是每条结果恰好对应一个商品。断言两侧都要有——
+      只断言"过滤后剩 1 条"的话，一个把全部数据都过滤掉的实现也能过。
+    """
+    product, _ = make  # 默认 source="mock"
+    real = product_factory(db)(sid="s-1", title="真实商品", source="smzdm", channel="jingxin")
+    create_rule(client, product.id, threshold=100.0)
+    create_rule(client, real.id, threshold=100.0)
+
+    assert client.get("/api/alerts/rules?source=smzdm").json()["total"] == 1
+    assert client.get("/api/alerts/rules?source=mock").json()["total"] == 1
+    assert client.get("/api/alerts/rules?source=all").json()["total"] == 2
+    assert client.get("/api/alerts/rules").json()["total"] == 2  # 默认 all
+
+
+def test_list_alerts_filters_by_source(client, db, make):
+    product, _ = make
+    real = product_factory(db)(sid="s-1", title="真实商品", source="smzdm", channel="jingxin")
+    mock_rule = create_rule(client, product.id, threshold=100.0)["id"]
+    real_rule = create_rule(client, real.id, threshold=100.0)["id"]
+    add_alert(db, mock_rule)
+    add_alert(db, real_rule)
+
+    assert client.get("/api/alerts?source=smzdm").json()["total"] == 1
+    assert client.get("/api/alerts?source=mock").json()["total"] == 1
+    assert client.get("/api/alerts").json()["total"] == 2
+
+
+def test_check_is_not_filtered_by_source(client, db, make):
+    """★ 手动查一轮是**动作**，不是查询——它永远检查全部规则。
+
+    ★ 跟着界面上的数据源开关走的话，会出现"我在 mock 视图下点了检查，
+      结果我那条真实商品的规则没被查到"，而且没有任何提示。
+    """
+    product, _ = make
+    real = product_factory(db)(sid="s-1", title="真实商品", source="smzdm", channel="jingxin")
+    create_rule(client, product.id, threshold=999.0)   # mock，条件成立
+    create_rule(client, real.id, threshold=999.0)      # 真实，条件成立
+
+    body = client.post("/api/alerts/check?source=mock").json()
+    assert body["rules_checked"] == 2
+    assert body["fired"] == 2
+
+
 # ===========================================================================
 # 四、删规则
 # ===========================================================================

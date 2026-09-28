@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电商竞品情报分析平台 · 价格告警</title>
+<link rel="stylesheet" href="static/css/style.css">
+
+<!-- 这一页不引 ECharts：一张图都没有。
+     （对比 index.html / products.html：那两页引了 ECharts + 本地兜底。） -->
+</head>
+
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">电商竞品情报分析<span>数据管道演示</span></div>
+    <div class="switcher" id="source-switcher" role="group" aria-label="数据源"></div>
+    <nav class="pages">
+      <a href="index.html">总览</a>
+      <a href="products.html">商品列表</a>
+      <a href="analysis.html">AI 分析</a>
+      <a href="alerts.html" class="active">价格告警</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ======================================================================
+       页头 + 手动检查
+       ====================================================================== -->
+  <div class="panel">
+    <h2>价格告警</h2>
+    <div class="hint">
+      规则由采集进程每 5 分钟检查一次。判定成立时会写一条触发记录，
+      并把规则标成「已触发」——<b>同一个事件只记录一次</b>，
+      价格涨回阈值上方之后规则才会重新武装。
+      <br>
+      界面上的「立即检查」是手动叫一次同一个检查器，不用等那 5 分钟。
+    </div>
+
+    <div class="notice" id="page-notice"></div>
+
+    <div class="toolbar">
+      <button class="btn primary" id="check">立即检查一次</button>
+      <span class="muted">检查的是<b>全部</b>规则，不跟着上面的数据源开关走</span>
+      <span class="muted" id="status"></span>
+    </div>
+
+    <!-- 检查报告挂载点。★ 它必须显示"判不了"那一项，理由见 JS 里的注释。 -->
+    <div id="check-report"></div>
+  </div>
+
+  <!-- ======================================================================
+       新建规则
+       ====================================================================== -->
+  <div class="panel">
+    <h2>新建规则</h2>
+    <div class="hint">
+      两种规则：<b>低于某个价</b>（绝对价格）、<b>相对历史最高价跌了多少</b>（百分比）。
+      后者需要一个历史最高价，而它<b>从价格历史里现算</b>——
+      真实采集的商品常常只有 1 个价格点，这种情况下界面会给出提醒。
+    </div>
+
+    <div class="toolbar">
+      <input type="search" id="product-q" placeholder="搜商品标题" autocomplete="off">
+      <select id="product" style="max-width:420px"></select>
+      <select id="rule-type">
+        <option value="price_below">价格低于</option>
+        <option value="price_drop_pct">相对历史最高价跌</option>
+      </select>
+      <input type="number" id="threshold" min="0.01" step="0.01" value="100" style="width:110px">
+      <span class="muted" id="threshold-unit">元</span>
+      <button class="btn primary" id="create">建立规则</button>
+    </div>
+
+    <div class="notice" id="create-notice"></div>
+    <div class="muted" id="picked"></div>
+  </div>
+
+  <!-- ======================================================================
+       规则列表
+       ====================================================================== -->
+  <div class="panel">
+    <h2>规则</h2>
+    <div class="hint">
+      <b>状态</b>这一列是这个页面最该看的地方：
+      「看守中」= 还没通知过，条件成立就会通知；
+      「已触发」= 已经通知过了，正在等价格涨回阈值上方——
+      <b>这时它不会再响，是设计如此，不是坏了</b>。
+    </div>
+
+    <div style="overflow-x:auto">
+      <table class="data">
+        <thead>
+          <tr>
+            <th style="width:56px">ID</th>
+            <th>商品</th>
+            <th style="width:100px">数据源</th>
+            <th>规则</th>
+            <th style="width:100px">状态</th>
+            <th style="width:90px">触发次数</th>
+            <th style="width:150px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="rules-body"></tbody>
+      </table>
+    </div>
+    <div class="empty-state" id="rules-empty"></div>
+  </div>
+
+  <!-- ======================================================================
+       触发记录
+       ====================================================================== -->
+  <div class="panel">
+    <h2>触发记录</h2>
+    <div class="hint">
+      「触发时价格」是当时那一刻的价格，冗余存下来的——
+      事后想去价格历史里还原"当时为什么响"，既要反查时间点，又可能查不到。
+      <br>
+      <b>没有推送渠道</b>：本项目不发邮件、不发 webhook，这一页和日志都是要你主动来看的。
+      所以「已通知」永远是「否」——不是推送失败，是根本没有东西可失败。
+    </div>
+
+    <div style="overflow-x:auto">
+      <table class="data">
+        <thead>
+          <tr>
+            <th style="width:170px">触发时间</th>
+            <th>商品</th>
+            <th>规则</th>
+            <th style="width:120px">触发时价格</th>
+            <th style="width:100px">已通知</th>
+          </tr>
+        </thead>
+        <tbody id="alerts-body"></tbody>
+      </table>
+    </div>
+    <div class="empty-state" id="alerts-empty"></div>
+  </div>
+
+</main>
+
+<script src="static/js/api.js"></script>
+<script>
+/* ============================================================================
+ * 价格告警页
+ *
+ * ---------------------------------------------------------------------------
+ * ★ 全文件一条规则：所有来自后端的数据都用 textContent / DOM 节点渲染，
+ *   **绝不拼 innerHTML**。
+ *
+ *   原因同 analysis.html：这一页显示的商品标题是**采集来的**，不由我们控制。
+ *   一条标题里带 `<img src=x onerror=...>` 的爆料，如果用 innerHTML 拼，
+ *   就会在打开这一页的人浏览器里执行脚本——而这个页面恰恰是要
+ *   演示给别人看的。
+ *
+ *   products.html 用的是另一条路（innerHTML + escapeHtml），那也正确，
+ *   但要多一层"记得转义"的纪律；这里是"根本没有解析 HTML 的入口"。
+ *
+ * ---------------------------------------------------------------------------
+ * 这一页要回答的问题，按重要性排序：
+ *
+ *   1. 「我的规则为什么没响？」
+ *      → 状态列 + 检查报告里的"判不了" + 建规则时的提醒，三处一起回答。
+ *        这三个地方缺任何一个，答案就会变成"不知道"。
+ *   2. 「响了没有？」
+ *      → 触发记录表。
+ *   3. 「怎么加一条？」
+ *      → 中间那个面板。
+ * ========================================================================== */
+
+const state = {
+  // 正在检查中。★ 一次检查要写库、改状态，连点没有意义，
+  //   而且会让报告闪烁。按钮禁用比"随它去"更省事。
+  checking: false,
+  // 当前选中的商品 id（下拉框的值）。用数字而不是对象，
+  // 因为它要跨"重新加载列表"存活。
+  pickedProductId: null,
+};
+
+const statusEl = document.getElementById('status');
+const noticeEl = document.getElementById('page-notice');
+const createNoticeEl = document.getElementById('create-notice');
+const productSel = document.getElementById('product');
+const productQ = document.getElementById('product-q');
+const ruleTypeSel = document.getElementById('rule-type');
+const thresholdInput = document.getElementById('threshold');
+const unitEl = document.getElementById('threshold-unit');
+const pickedEl = document.getElementById('picked');
+const rulesBody = document.getElementById('rules-body');
+const alertsBody = document.getElementById('alerts-body');
+const rulesEmpty = document.getElementById('rules-empty');
+const alertsEmpty = document.getElementById('alerts-empty');
+const checkReport = document.getElementById('check-report');
+
+/* ---------------------------------------------------------------------------
+ * 小工具（和 analysis.html 同一套写法）
+ * ------------------------------------------------------------------------ */
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+/** 数据源徽章。
+ *
+ *  ★ 必须在**每一行**上显示，而不是只在页头显示一个当前的开关：
+ *    这一页的列表是"用户配过的东西"，里面可能同时有 Mock 商品的规则
+ *    和真实商品的规则。不标出来的话，用户会对着一条监控演示数据的规则
+ *    等一个永远不会来的通知。
+ */
+function sourceTag(source) {
+  // ★ 类名只从已知取值里挑，不直接拼后端给的字符串。
+  //   class 属性本身不执行脚本，但"把后端字符串拼进 HTML 属性"
+  //   是个不该开的头——开了之后迟早有人把它挪到别的地方用。
+  const known = ['mock', 'smzdm'];
+  const cls = known.includes(source) ? 'tag src-' + source : 'tag';
+  return el('span', cls, source);
+}
+
+/** 规则的人话描述："价格低于 ¥100.00" / "相对历史最高价跌 20%"。
+ *
+ *  ★ 阈值在表格里必须带单位。只显示 "100" 和 "20" 的话，
+ *    两种规则的数字看起来是一回事，而它们一个是一百块、一个是两成。
+ */
+function ruleText(ruleType, threshold) {
+  if (ruleType === 'price_below') return '价格低于 ' + fmtPrice(threshold);
+  if (ruleType === 'price_drop_pct') return '相对历史最高价跌 ' + threshold + '%';
+  // 认不出来的类型照样显示出来。★ 不要显示成"—"：
+  // 库里真有可能出现一条谁也不认识的规则（比如新版本加的、旧前端不认识），
+  // 显示成"—"会让人以为"这条规则没问题"，而它其实永远不会被判定。
+  return ruleType + ' ' + threshold;
+}
+
+/** 状态徽章。
+ *
+ *  ★ 这两个词的差别是这一页最需要被理解的事，所以：
+ *    · 不用颜色区分就够——还要有**文字**（色盲、截图、打印）
+ *    · 不认识的取值原样显示，不猜
+ */
+function stateBadge(s) {
+  const box = el('span', 'state-badge state-' + (s === 'fired' ? 'fired' : 'armed'));
+  if (s === 'armed') box.textContent = '看守中';
+  else if (s === 'fired') box.textContent = '已触发';
+  else box.textContent = s;
+  return box;
+}
+
+function setStatus(t) { statusEl.textContent = t || ''; }
+
+function showNotice(text, kind) {
+  if (!text) { noticeEl.classList.remove('show'); noticeEl.textContent = ''; return; }
+  noticeEl.textContent = text;
+  noticeEl.classList.toggle('info', kind === 'info');
+  noticeEl.classList.add('show');
+}
+
+function showCreateNotice(text, kind) {
+  if (!text) { createNoticeEl.classList.remove('show'); createNoticeEl.textContent = ''; return; }
+  createNoticeEl.textContent = text;
+  createNoticeEl.classList.toggle('info', kind === 'info');
+  createNoticeEl.classList.add('show');
+}
+
+/* ---------------------------------------------------------------------------
+ * 数据源切换器
+ * ------------------------------------------------------------------------ */
+
+async function renderSwitcher() {
+  const box = document.getElementById('source-switcher');
+  const active = currentSource();
+  let counts = {};
+  try {
+    const data = await apiGet('/api/stats/sources');
+    for (const s of data.sources) counts[s.source] = s.product_count;
+  } catch (err) { console.warn('数据源清单加载失败', err); }
+
+  box.replaceChildren();
+  for (const s of SOURCES) {
+    const btn = el('button');
+    btn.type = 'button';
+    btn.textContent = s.label;
+    const n = counts[s.id];
+    if (n !== undefined) {
+      btn.appendChild(el('span', 'count', n));
+      if (n === 0) btn.classList.add('empty');
+    }
+    btn.setAttribute('aria-pressed', String(s.id === active));
+    btn.addEventListener('click', async () => {
+      setSource(s.id);
+      // ★ 这一页切换数据源要**重新拉取**（不像分析页只是判断"报告还对不对"）：
+      //   因为规则和记录都带数据源，列表内容本身就该变。
+      await renderSwitcher();
+      await Promise.all([loadProducts(), loadRules(), loadAlerts()]);
+    });
+    box.appendChild(btn);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 商品下拉
+ * ------------------------------------------------------------------------ */
+
+async function loadProducts() {
+  const params = { size: 50, sort: 'last_crawled_at' };
+  const q = productQ.value.trim();
+  if (q) params.q = q;
+
+  let items = [];
+  try {
+    const data = await apiGet('/api/products', params);
+    items = data.items || [];
+  } catch (err) {
+    showNotice('商品列表加载失败：' + err.message);
+    return;
+  }
+
+  productSel.replaceChildren();
+  if (!items.length) {
+    productSel.appendChild(el('option', null, q ? '没有匹配的商品' : '这个数据源下没有商品'));
+    productSel.disabled = true;
+    pickedEl.textContent = '';
+    return;
+  }
+  productSel.disabled = false;
+  for (const p of items) {
+    const opt = el('option', null, '#' + p.id + ' ' + p.title.slice(0, 34) + '（' + fmtPrice(p.price) + '）');
+    opt.value = String(p.id);
+    productSel.appendChild(opt);
+  }
+
+  // ★ 优先用 URL 上的 ?product_id=（从商品列表页跳过来的），其次沿用上次的选择。
+  //   两者都没有才用第一条。这一段是"从别的页面带着上下文进来"的入口，
+  //   少了它，演示时就得在几百个商品里手动找一个。
+  const fromUrl = Number(new URLSearchParams(location.search).get('product_id'));
+  const want = fromUrl || state.pickedProductId;
+  if (want && items.some((p) => p.id === want)) productSel.value = String(want);
+
+  state.pickedProductId = Number(productSel.value);
+  updatePicked();
+}
+
+/** 显示选中的商品信息。★ 把当前价显示出来，用户才知道自己配的阈值意味着什么。 */
+function updatePicked() {
+  const opt = productSel.selectedOptions[0];
+  if (!opt) { pickedEl.textContent = ''; return; }
+  const p = { id: Number(productSel.value), text: opt.textContent };
+  state.pickedProductId = p.id;
+  pickedEl.textContent = '将对：' + p.text + ' 建立规则';
+}
+
+/* ---------------------------------------------------------------------------
+ * 规则列表
+ * ------------------------------------------------------------------------ */
+
+async function loadRules() {
+  let data;
+  try {
+    data = await apiGet('/api/alerts/rules');
+  } catch (err) {
+    showNotice('规则列表加载失败：' + err.message);
+    return;
+  }
+
+  rulesBody.replaceChildren();
+  if (!data.items.length) {
+    rulesEmpty.textContent = '这个数据源下还没有规则。用上面的「新建规则」加一条。';
+    rulesEmpty.classList.add('show');
+    return;
+  }
+  rulesEmpty.classList.remove('show');
+
+  for (const r of data.items) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'muted', r.id));
+
+    const titleCell = el('td', 'title-cell');
+    titleCell.title = r.product_title;
+    titleCell.textContent = r.product_title;
+    tr.appendChild(titleCell);
+
+    const srcCell = el('td');
+    srcCell.appendChild(sourceTag(r.product_source));
+    tr.appendChild(srcCell);
+
+    tr.appendChild(el('td', null, ruleText(r.rule_type, r.threshold)));
+
+    const stateCell = el('td');
+    stateCell.appendChild(stateBadge(r.state));
+    tr.appendChild(stateCell);
+
+    // ★ 触发次数为 0 时显示 0，不显示"—"。
+    //   "0 次"是"这条规则还没响过"，是个事实；
+    //   "—"会被读成"不知道"，而这里我们**知道**。
+    tr.appendChild(el('td', 'num', r.fired_count));
+
+    // ---- 操作 ----
+    const actions = el('td');
+    const toggle = el('button', 'btn', r.enabled ? '停用' : '启用');
+    toggle.addEventListener('click', () => toggleRule(r));
+    actions.appendChild(toggle);
+
+    const del = el('button', 'btn', '删除');
+    del.style.marginLeft = '6px';
+    del.addEventListener('click', () => removeRule(r));
+    actions.appendChild(del);
+
+    if (!r.enabled) {
+      // ★ 停用的规则要一眼看出来，否则"我明明关掉了怎么还在这"。
+      tr.style.opacity = '.55';
+    }
+    tr.appendChild(actions);
+    rulesBody.appendChild(tr);
+  }
+}
+
+async function toggleRule(rule) {
+  try {
+    const updated = await apiPatch('/api/alerts/rules/' + rule.id, { enabled: !rule.enabled });
+    // ★ 重新武装是后端的决定（改规则 = 重新武装），这里**不解释**它，
+    //   只把后端返回的 state 显示出来——前端不该自己推断状态会变成什么。
+    setStatus(`规则 #${rule.id} 已${updated.enabled ? '启用' : '停用'}`);
+    await loadRules();
+  } catch (err) {
+    showNotice('操作失败：' + err.message);
+  }
+}
+
+async function removeRule(rule) {
+  // ★ 必须确认，因为**不可逆**：删规则会连同它的触发记录一起删掉。
+  //   （后端在响应里也提醒了：要保留历史就停用，别删。）
+  if (!confirm(
+    `删除规则 #${rule.id}（${ruleText(rule.rule_type, rule.threshold)}）？\n\n` +
+    `它的 ${rule.fired_count} 条触发记录会一起删掉，且不可恢复。\n` +
+    `只想让它停下来、但要保留记录的话，用「停用」。`
+  )) return;
+
+  try {
+    const res = await apiDelete('/api/alerts/rules/' + rule.id);
+    setStatus(`已删除规则 #${rule.id}，连同 ${res.deleted_alerts} 条触发记录`);
+    await Promise.all([loadRules(), loadAlerts()]);
+  } catch (err) {
+    showNotice('删除失败：' + err.message);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 触发记录
+ * ------------------------------------------------------------------------ */
+
+async function loadAlerts() {
+  let data;
+  try {
+    data = await apiGet('/api/alerts', { limit: 100 });
+  } catch (err) {
+    showNotice('触发记录加载失败：' + err.message);
+    return;
+  }
+
+  alertsBody.replaceChildren();
+  if (!data.items.length) {
+    // ★ 空态要说清"是没规则还是没响过"——这两件事用户该做的事完全不同。
+    alertsEmpty.textContent = '还没有触发记录。'
+      + '（如果上面一条规则都没有，先去建一条；如果有规则，那就是价格还没到。）';
+    alertsEmpty.classList.add('show');
+    return;
+  }
+  alertsEmpty.classList.remove('show');
+
+  for (const a of data.items) {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'muted', fmtTime(a.triggered_at)));
+
+    const titleCell = el('td', 'title-cell');
+    titleCell.title = a.product_title;
+    titleCell.textContent = a.product_title;
+    tr.appendChild(titleCell);
+
+    tr.appendChild(el('td', null, ruleText(a.rule_type, a.threshold)));
+    tr.appendChild(el('td', 'num', fmtPrice(a.price_at_trigger)));
+    // ★ 恒为「否」。见表格上方的说明——不要把这一列渲染成"推送失败"。
+    tr.appendChild(el('td', 'muted', a.notified ? '是' : '否（本项目没有推送渠道）'));
+    alertsBody.appendChild(tr);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 手动检查
+ * ------------------------------------------------------------------------ */
+
+async function runCheck() {
+  if (state.checking) return;  // 双保险：按钮已禁用，回车/双击仍可能绕过去
+  state.checking = true;
+  const btn = document.getElementById('check');
+  btn.disabled = true;
+  setStatus('正在检查…');
+  showNotice('');
+
+  try {
+    const r = await apiPost('/api/alerts/check');
+    renderCheckReport(r);
+    setStatus(r.message);
+    // 检查会改状态、写记录，所以两个列表都要重拉。
+    await Promise.all([loadRules(), loadAlerts()]);
+  } catch (err) {
+    showNotice('检查失败：' + err.message);
+    setStatus('');
+  } finally {
+    state.checking = false;
+    btn.disabled = false;
+  }
+}
+
+function renderCheckReport(r) {
+  checkReport.replaceChildren();
+
+  const box = el('div', 'check-report');
+  box.appendChild(el('div', null, r.message));
+
+  // ★ 「判不了」必须单独显示，而且必须是显眼的。
+  //   它在界面上和"没触发"长得一样（都没写记录），但含义完全相反：
+  //     没触发 → 规则在正常工作，价格还没到
+  //     判不了 → 规则**根本没工作**（没有价格 / 没有基准价 / 类型不认识）
+  //   合成一个的话，"我的告警怎么一直没响"会被答成"价格还没到"。
+  if (r.undecidable) {
+    const list = el('ul', 'check-reasons');
+    for (const reason of r.reasons) list.appendChild(el('li', null, reason));
+    box.appendChild(list);
+  }
+  checkReport.appendChild(box);
+}
+
+/* ---------------------------------------------------------------------------
+ * 建规则
+ * ------------------------------------------------------------------------ */
+
+async function createRule() {
+  const productId = Number(productSel.value);
+  if (!productId) { showCreateNotice('先选一个商品。'); return; }
+
+  const threshold = Number(thresholdInput.value);
+  if (!(threshold > 0)) {
+    // ★ 后端也会挡（422），但前端先说一句更省一次往返——
+    //   而且这句话能说清"为什么 0 不行"：阈值 0 意味着"价格跌破 0 元"。
+    showCreateNotice('阈值必须大于 0。阈值 0 是"价格跌破 0 元"，永远不会成立。');
+    return;
+  }
+
+  showCreateNotice('正在建立…', 'info');
+  try {
+    const rule = await apiPost('/api/alerts/rules', {}, {
+      product_id: productId,
+      rule_type: ruleTypeSel.value,
+      // ★ 跌幅阈值不能超过 100（价格最多跌到 0），后端会挡。
+      //   这里不预先拦，是为了让后端的报错信息原样传到界面上——
+      //   那句话说清了"如果你要的是别的意思，请改规则类型"。
+      threshold: threshold,
+    });
+
+    // ★ 后端给的提醒要**原样显示**，不能吞掉。
+    //   实测：库里 100 个真实商品有 98 个只有 1 个价格点，
+    //   给它们配跌幅规则会得到一个永远不响、而且不报错的规则。
+    //   这句话是用户唯一能提前知道这件事的地方。
+    if (rule.warning) {
+      showCreateNotice('规则 #' + rule.id + ' 已建立。提醒：' + rule.warning);
+    } else {
+      showCreateNotice('规则 #' + rule.id + ' 已建立（看守中）。', 'info');
+    }
+    setStatus('');
+    await loadRules();
+  } catch (err) {
+    // 409（重复规则）和 422（参数不合法）的 detail 都是写给人看的一句话。
+    showCreateNotice(err.message);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 启动
+ * ------------------------------------------------------------------------ */
+
+ruleTypeSel.addEventListener('change', () => {
+  // 两种规则的单位不同。★ 不跟着变的话，用户会以为还在填"元"，
+  // 于是给"跌 100%"填了个 299。
+  const isPct = ruleTypeSel.value === 'price_drop_pct';
+  unitEl.textContent = isPct ? '%（相对历史最高价）' : '元';
+  thresholdInput.value = isPct ? 20 : 100;
+  thresholdInput.max = isPct ? 100 : '';
+});
+
+// ★ 搜索用 input 防抖，不是 keydown —— keydown 会把输入法组字过程也算进去，
+//   中文输入时每敲一个字母就发一次请求。
+let qTimer = null;
+productQ.addEventListener('input', () => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(loadProducts, 250);
+});
+productSel.addEventListener('change', updatePicked);
+document.getElementById('create').addEventListener('click', createRule);
+document.getElementById('check').addEventListener('click', runCheck);
+
+(async function init() {
+  await renderSwitcher();
+  await loadProducts();
+  await Promise.all([loadRules(), loadAlerts()]);
+})();
+</script>
+</body>
+</html>

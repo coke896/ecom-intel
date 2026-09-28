@@ -75,7 +75,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import DbDep
+from app.api.deps import DbDep, SourceDep, apply_source
 from app.db.models import Alert, AlertRule, PriceHistory, Product
 from scraper.check_alerts import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
 
@@ -443,22 +443,24 @@ def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
 @router.get("/rules", response_model=RuleListOut)
 def list_rules(
     db: DbDep,
+    source: SourceDep,
     limit: int = Query(200, ge=1, le=500, description="最多返回几条"),
 ) -> RuleListOut:
     """规则列表，最新的在前。
 
     ★ 一次 join 出商品标题，不做懒加载（N+1）。
-    ★ 不做 `?source=` 过滤：那需要给一个以 alert_rules 为主表的 join 查询
-      套 `apply_source`，而它在 deps.py 里写明的契约是"调用方必须以
-      Product 为主表"。与其放宽那个契约，不如不给这个接口加这个参数——
-      每条规则都带 `product_source` 字段，前端要分组自己分。
+    ★ 支持 `?source=`：这条查询的主表是 alert_rules，但它**join 了 Product
+      且一条规则恰好对应一个商品**，所以过滤 `Product.source` 正好是
+      "只看这个数据源的规则"。这是 apply_source 的第二种合法形状，
+      写在 deps.py 的约定里（那里也写了它不适用的形状）。
     """
-    rows = db.execute(
+    stmt = (
         select(AlertRule, Product)
         .join(Product, Product.id == AlertRule.product_id)
         .order_by(AlertRule.id.desc())
         .limit(limit)
-    ).all()
+    )
+    rows = db.execute(apply_source(stmt, source)).all()
     counts = _fired_counts(db)
 
     return RuleListOut(
@@ -561,16 +563,18 @@ def delete_rule(db: DbDep, rule_id: int = Path(description="规则 id")) -> dict
 @router.get("", response_model=AlertListOut)
 def list_alerts(
     db: DbDep,
+    source: SourceDep,
     limit: int = Query(50, ge=1, le=500, description="最多返回几条"),
 ) -> AlertListOut:
-    """触发记录，最新的在前。"""
-    rows = db.execute(
+    """触发记录，最新的在前。★ 同样支持 `?source=`（理由见 list_rules）。"""
+    stmt = (
         select(Alert, AlertRule, Product)
         .join(AlertRule, AlertRule.id == Alert.rule_id)
         .join(Product, Product.id == AlertRule.product_id)
         .order_by(Alert.triggered_at.desc(), Alert.id.desc())
         .limit(limit)
-    ).all()
+    )
+    rows = db.execute(apply_source(stmt, source)).all()
 
     return AlertListOut(
         items=[
@@ -612,6 +616,12 @@ def run_check(db: DbDep) -> CheckResultOut:
       （`WHERE state='armed'`），谁先到谁赢，后到的拿到 0 行、安静退出。
       正因为如此，手动触发一次是安全的——这恰好也是那条原子性设计
       给出来的一个额外好处。
+
+    ★ **不接受 `?source=`**，和上面两个列表端点不一样，这是有意的：
+      它是一次**动作**，不是一次查询。让它跟着界面上的数据源开关走，
+      就会出现"我在 mock 视图下点了检查，结果我那条真实商品的规则
+      没被查到"——而且不会有任何提示。检查永远是全量的，
+      返回的报告也是全量的；要看某个数据源的情况，去看列表。
     """
     report = check_alerts(db)
     return CheckResultOut(

@@ -91,10 +91,23 @@ def apply_source(stmt: Select[_SelectT], source: SourceFilter) -> Select[_Select
       数据库里根本没有 source='all' 的行，写反了会返回空结果。
       空结果比报错更难查：图表一片空白，看起来像前端坏了。
 
-    ★ 调用方必须是"以 Product 为主表"的语句。如果语句里 join 了
-      products 但主表是别的，`Product.source` 这个条件依然会被加进去，
-      语义上可能不是你想要的——所以本项目的约定是：
-      **stats 层的每一条语句都从 Product 出发**。
+    ★ 本函数的约定是：**查询里必须有 products 表**，且 `Product.source`
+      这个条件在语义上就是调用方想要的那个过滤。目前有两种合法形状：
+
+        ① 以 Product 为主表（stats 层的每一条语句都是这样）
+        ② 主表是别的表，但 join 了 Product，且**每条结果恰好对应一个商品**
+           ——比如告警规则列表（`AlertRule ⋈ Product`，一条规则一个商品）
+
+      ★ 为什么 ② 也成立、而且不会多出或少掉行：
+        加的是 WHERE（不是 JOIN 条件），所以它只**过滤**不**连接**；
+        而一条规则只挂在唯一一个商品上，过滤掉不等价的商品
+        就等于过滤掉那一条规则——不会因为 join 而把一行拆成多行。
+        `tests/test_api_alerts.py` 里两条按数据源过滤的用例守着它。
+
+      ★ 不成立的形状要说清楚：如果 join 的是"一对多"（比如从 Product
+        去 join 它的所有价格点），那么过滤 `Product.source` 并不会
+        把不想看的价格点去掉，只是把它们所属的商品整批留下或去掉。
+        那种查询要过滤的是**商品**，不是价格点——条件该写在别处。
     """
     if source is SourceFilter.all:
         return stmt

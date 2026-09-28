@@ -54,14 +54,24 @@ function setSource(id) {
  *    就必须记得改两处——而漏改的那一处不会报错，
  *    只会让某一类请求的错误提示和别人不一样。
  */
-async function apiRequest(method, path, params = {}) {
+async function apiRequest(method, path, params = {}, body = undefined) {
   const url = new URL(path, location.origin);
   url.searchParams.set('source', currentSource());
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
   }
 
-  const resp = await fetch(url, { method });
+  const init = { method };
+  if (body !== undefined) {
+    // ★ body 必须是显式传的，不能"有 params 就顺手当 body 发"。
+    //   这两种东西语义完全不同：params 是过滤条件（GET 也能有），
+    //   body 是要写入的数据。混在一起的话，某个只想加个过滤参数的调用
+    //   会变成"把过滤条件当数据写进库"——而它看起来完全正常。
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(body);
+  }
+
+  const resp = await fetch(url, init);
   if (!resp.ok) {
     // 把后端的 detail 带出来。FastAPI 的 422 是结构化数组，
     // 直接 alert 一个 [object Object] 对排查毫无帮助。
@@ -79,15 +89,34 @@ function apiGet(path, params = {}) {
   return apiRequest('GET', path, params);
 }
 
-/** POST。目前只有「生成分析报告」用它。
+/** POST。
  *
  *  ★ 生成报告必须用 POST，这不是风格问题：
  *    它会写一行报告、消耗 token。用 GET 的话，浏览器预取、代理缓存、
  *    爬虫都可能触发一次**付费调用**——而且在用户没点任何按钮的时候。
  *    HTTP 语义在这里是有实际后果的：GET 约定"安全、可重复"，而它两条都不满足。
+ *
+ *  ★ 第三个参数 body 是给"要写数据"的接口用的（建告警规则）。
+ *    和前两个参数分开，理由见 apiRequest 里那段注释。
  */
-function apiPost(path, params = {}) {
-  return apiRequest('POST', path, params);
+function apiPost(path, params = {}, body = undefined) {
+  return apiRequest('POST', path, params, body);
+}
+
+/** PATCH：改一条已存在的记录（告警规则的启停和阈值）。
+ *
+ *  ★ 为什么不复用 POST：后端用 PATCH 表达"只改传进来的字段"——
+ *    空 PATCH 和不改任何东西的 PATCH 都不会重置规则的状态机状态。
+ *    前端用 POST 去调同一个路径会拿到 405，那个报错信息不会告诉你
+ *    "语义不匹配"，只会说方法不允许。
+ */
+function apiPatch(path, body) {
+  return apiRequest('PATCH', path, {}, body);
+}
+
+/** DELETE：删一条记录。★ 后端会回一个 JSON（删掉了什么、附带一句提醒）。 */
+function apiDelete(path) {
+  return apiRequest('DELETE', path);
 }
 
 /* ---------------------------------------------------------------------------
