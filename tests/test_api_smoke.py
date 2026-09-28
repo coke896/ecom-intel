@@ -751,6 +751,69 @@ def test_shop_share_total_and_price_distribution_total_reconcile(client, db) -> 
 
 
 # ===========================================================================
+# 九、接口契约：/docs 顶部那句关于 ?source= 的承诺，从接口定义里核对
+# ===========================================================================
+
+
+def test_the_docs_claim_about_source_filter_matches_the_actual_endpoints() -> None:
+    """★ `/docs` 顶部的说明是一句**对外承诺**，它必须和接口定义一致。
+
+    ★ 这条守的是一个已经发生过的形态：那句话原本写的是
+      "**所有**统计接口都支持 `?source=`"，而 `/api/stats/sources`
+      并不接受这个参数——它返回的就是"有哪些 source"，再按 source
+      过滤它没有意义。于是 /docs 上的一句承诺，被它自己列出的端点否掉。
+
+    ★ 为什么这类错值得单写一条测试：
+      · 它是**纯文档**的错，没有任何运行时会报错；
+      · 读的人会相信"全部"这种强断言，不会再去数一遍；
+      · 而它恰好出现在面试时最可能被点开的那一页上。
+      这个项目已经反复记录过"文档/配置说的和实现做的不一样"
+      （docs 16.10），这是它的又一个落点。
+
+    ★ 断言方式刻意**从接口定义推导**，而不是维护一张手写清单：
+      手写清单会在下次加接口时忘记更新，而路由表不会。
+      具体做两件事：
+        1. 数出 `/api/stats/*` 里**不接受** `?source=` 的端点，
+           断言它恰好是 `/api/stats/sources` 一个；
+        2. 断言这个例外**被那句话点名写出来了**——
+           只做第 1 步的话，将来新增一个例外、描述却仍说"除 X 外全部支持"，
+           测试照样绿。
+
+    ★ 诚实说明这条测试**管不到**的地方：它检查"描述里有没有提到这个例外"，
+      不检查那句话的措辞是否精确。所以有人把描述改成
+      "全部支持"却仍然在别处提到 `/api/stats/sources` 时，它不会红。
+      要挡住那种情况只能去断言具体的措辞，而那会让改一句话就变红——
+      权衡之下选择现在这样：**钉住事实，不钉住文字**。
+    """
+    spec = app.openapi()
+
+    stats_paths = {p for p in spec["paths"] if p.startswith("/api/stats/")}
+    assert stats_paths, "一个 /api/stats/* 端点都没找到，这条用例没测到东西"
+
+    no_source = set()
+    for path in stats_paths:
+        for op in spec["paths"][path].values():
+            params = {
+                p["name"] for p in op.get("parameters", []) if p.get("in") == "query"
+            }
+            if "source" not in params:
+                no_source.add(path)
+
+    assert no_source == {"/api/stats/sources"}, (
+        f"`?source=` 的例外集合变了：{sorted(no_source)}。"
+        "新增/删除例外时，请同时改 /docs 顶部那段话——"
+        "它承诺的是『统计接口除 X 外都支持』。"
+    )
+
+    description = spec["info"]["description"]
+    for path in no_source:
+        assert path in description, (
+            f"{path} 不接受 ?source=，但 /docs 顶部的说明里没有点名它——"
+            "读者会以为这个接口也支持数据源过滤。"
+        )
+
+
+# ===========================================================================
 # 八、词云
 # ===========================================================================
 

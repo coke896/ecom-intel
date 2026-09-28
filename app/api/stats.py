@@ -1,13 +1,22 @@
 """统计聚合接口 —— 前端 4 张图表的数据来源。
 
-端点一览（**全部支持 `?source=all|mock|smzdm`**）：
+端点一览（除 `/sources` 外都支持 `?source=all|mock|smzdm`）：
 
     GET /api/stats/sources             数据源清单（前端据此渲染切换按钮）
+                                       ★ **不接受 ?source=** —— 它返回的
+                                       就是"有哪些 source"，再按 source
+                                       过滤它没有意义
     GET /api/stats/overview            总览卡片
     GET /api/stats/price-distribution  价格分布直方图
     GET /api/stats/sales-top           销量 Top20 条形图
     GET /api/stats/shop-share          店铺占比饼图
     GET /api/stats/keywords            词云
+
+★ 这里原来写的是"**全部**支持"。它不是"文档略微不准"：
+  这句话和它下面两行列出的端点直接矛盾，而读的人会相信上面那句
+  （"全部"是强断言，不需要他再数一遍）。
+  现在这个例外由 tests/test_api_smoke.py 从**路由表**核对，
+  不靠人记得改这里。
 
 ================================================================================
 三个贯穿本文件的决定

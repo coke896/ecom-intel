@@ -1,3 +1,4 @@
+
 """FastAPI 应用入口。
 
 启动：
@@ -97,9 +98,19 @@ app = FastAPI(
     title="电商竞品情报分析平台",
     description=(
         "采集 → 清洗 → 存储 → 可视化 → AI 分析 → 导出/告警。\n\n"
-        "所有统计接口都支持 `?source=all|mock|smzdm` 数据源过滤："
-        "`mock` 是生成的演示数据，`smzdm` 是真实采集数据，"
-        "两者在同一个库里但**永不混算**。"
+        # ★ 这段话是 /docs 页面顶部的说明，也就是**对外承诺**。
+        #   它一度写的是"所有统计接口都支持 ?source="，而
+        #   `/api/stats/sources` 并不接受这个参数——它是"数据源清单"，
+        #   本身就在回答"有哪些 source"，再按 source 过滤它没有意义。
+        #   于是 /docs 上的一条承诺，被自己列出的端点之一否掉。
+        #   现在改成把例外点名写出来，并且由
+        #   tests/test_api_smoke.py 从**路由表**核对这句话
+        #   （理由见那条测试：手写清单会漂移，路由表不会）。
+        "统计接口（`/api/stats/*`）除 `/api/stats/sources` 外都支持 "
+        "`?source=all|mock|smzdm` 数据源过滤：`mock` 是生成的演示数据，"
+        "`smzdm` 是真实采集数据，两者在同一个库里但**永不混算**。\n\n"
+        "（`/api/stats/sources` 是那个例外：它返回的就是数据源清单本身，"
+        "再按 source 过滤它没有意义。这句话由测试从接口定义里核对。）"
     ),
     version="0.2.0",
     lifespan=lifespan,
@@ -144,9 +155,17 @@ app.include_router(tasks.router)
 #   由采集 worker 每 5 分钟叫一次。接口里那个 POST /api/alerts/check
 #   只是**手动**叫一次同一个函数，不是第二份实现。
 app.include_router(alerts.router)
-# ★ 图片代理是本项目唯一一个"不接受 ?source="的接口——
+# ★ 图片代理**不接受 ?source=**——和 /api/stats/sources 一样是例外之一。
 #   取图的是浏览器的 <img> 加载器，不是我们的 JS，而且它是一次取字节的动作
 #   而不是一次数据查询。理由写在 app/api/images.py 顶部。
+#   ★ 这里原本写的是"本项目**唯一一个**不接受 ?source= 的接口"。
+#     核实后发现不成立：光是不接受这个参数的端点就有 11 个
+#     （单条资源、任务、健康检查、告警配置……它们都不按数据源过滤）。
+#     改动时我没有再手写一个"一共两个"——那只是把同一个错误改小一点。
+#     现在只陈述"本接口不接受"，需要完整清单的话由
+#     tests/test_api_smoke.py 从接口定义里数出来。
+#   ★ "唯一""全都""永不"这类词是最该被核对的词：它们读起来最强，
+#     也最容易被写下来之后没人再验一次。
 app.include_router(images.router)
 
 
