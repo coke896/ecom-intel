@@ -813,6 +813,54 @@ def test_the_docs_claim_about_source_filter_matches_the_actual_endpoints() -> No
         )
 
 
+def test_proxy_image_is_not_the_only_endpoint_without_source_filter() -> None:
+    """★ 守 `app/main.py` 里图片代理那段注释的**前提**。
+
+      那段注释原本写的是"本项目**唯一一个**不接受 `?source=` 的接口"。
+      核实后发现不成立：单条资源、任务、健康检查、告警配置……
+      它们都不按数据源过滤。于是那句话改成只陈述"本接口不接受"。
+
+      这条测试守的就是那个改动的成立条件：只要不接受这个参数的端点
+      **不止一个**，"唯一一个"这种说法就不能再写回去。
+      集合真的缩小到只剩它一个的那天，这条会红——那时要同步改注释。
+
+    ★ 为什么这条**不**去数一个具体个数：
+      写那段注释时数了一遍，是 **11**；写 docs 第十九节时又数了一遍，
+      是 **12**——**同一份代码**，差别只在我手工列举时看漏了一行。
+      数字会随端点增减而变，钉住它等于每加一个接口就要改一次测试，
+      而它并不表达任何设计意图。
+      所以和上面那条一样：**钉住事实，不钉住文字。**
+    """
+    spec = app.openapi()
+
+    no_source = set()
+    for path, item in spec["paths"].items():
+        # ★ 参数既可能写在单个操作上，也可能写在 path 级共享——
+        #   两个地方都要看，否则会漏掉把参数上提过的端点。
+        shared = {
+            p["name"] for p in item.get("parameters", []) if p.get("in") == "query"
+        }
+        for method, op in item.items():
+            if method == "parameters":
+                continue
+            params = shared | {
+                p["name"] for p in op.get("parameters", []) if p.get("in") == "query"
+            }
+            if "source" not in params:
+                no_source.add(path)
+
+    assert "/api/proxy-image" in no_source, (
+        "`/api/proxy-image` 现在接受 `?source=` 了？"
+        "那段注释和 app/api/images.py 顶部都是照『它不接受』写的，"
+        "接口定义变了就要一起改。"
+    )
+    assert len(no_source) > 1, (
+        "不接受 `?source=` 的端点只剩 "
+        f"{sorted(no_source)} 一个了——"
+        "app/main.py 里那段注释的前提（『不止一个』）不再成立，请同步改掉。"
+    )
+
+
 # ===========================================================================
 # 八、词云
 # ===========================================================================
