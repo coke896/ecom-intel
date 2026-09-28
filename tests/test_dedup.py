@@ -23,6 +23,7 @@ import pytest
 from scraper.dedup import (
     GREY_ZONE_THRESHOLD,
     MERGE_THRESHOLD,
+    MODEL_SUFFIX_WORDS,
     Candidate,
     Decision,
     ExistingProduct,
@@ -469,6 +470,90 @@ def test_dangerous_pairs_are_flagged_not_silently_dropped() -> None:
         )
         assert result.decision is Decision.MARK, f"{a} / {b} 应该被标记待核对"
         assert "硬门槛" in result.reason
+
+
+# ===========================================================================
+# ★ 已知的漏网之鱼：Pro+ 与 Pro 会被当成同一款
+# ===========================================================================
+
+
+def test_every_model_suffix_word_can_actually_be_matched() -> None:
+    """★ `MODEL_SUFFIX_WORDS` 里不许有**永远命中不了**的条目。
+
+    每条词都是在 `extract_model_tokens` 里用 `tok in MODEL_SUFFIX_WORDS`
+    比对的，而 `tok` 来自 `normalize_title(...).split()`。
+    所以一个词只有当"归一化之后还能原样作为 token 出现"时才有意义。
+
+    ★ 这条测的是一个**一般性质**，不是"pro+ 没了"这个具体事实。
+      写成 `assert "pro+" not in MODEL_SUFFIX_WORDS` 的话，
+      下一个人往表里加 "ultra+" 或 "max*" 照样能加进去——
+      而这条会连它们一起挡住。
+      （原来那条 "pro+" 就是这么进去的：写的时候看着很合理，
+        因为 `+` 在标题里确实存在，只是它在**归一化阶段**就被丢掉了，
+        根本走不到这个比对。）
+
+    ★ 判据是"从上游推导"，不是"照抄一份清单"：
+      不维护一份"哪些词合法"的名单，而是真的构造一个只含该词的输入、
+      跑一遍真实的归一化，看它能不能活到比对那一步。
+      这样归一化规则改了这个测试会自动跟上。
+    """
+    unreachable = sorted(
+        word
+        for word in MODEL_SUFFIX_WORDS
+        if word not in normalize_title(f"某商品 {word} 型号").split()
+    )
+    assert not unreachable, (
+        f"这些词永远命不中，应该删掉（它们只会让人以为处理过了）：{unreachable}"
+    )
+
+
+def test_pro_plus_collapses_into_pro() -> None:
+    """★ 这条测试记录的是一个**已知的、被接受的**漏网之鱼。
+
+    `Pro` 和 `Pro+` 是两个不同 SKU，但 `normalize_title()` 会把 `+`
+    当标点丢掉，于是两者归一化后**字符串完全相同**：
+
+        小米 15 Pro 手机  → '小米 15 pro 手机'
+        小米 15 Pro+ 手机 → '小米 15 pro 手机'
+
+    型号 token 集合因此相同 → 硬门槛放行 → 包含度 1.000 → 归并。
+
+    ★ 为什么不断言"它应该拦住"：现在拦不住，而且**不值得为它改归一化**。
+      实测真实数据（100 条 smzdm 标题）带 `+` 的只有 6 条，没有一条是这个
+      形态——全是分隔符（`12GB+256GB` / `12+512` / `1壶3杯+收纳包`），
+      而丢掉 `+` 对它们恰好是对的：`12GB+256GB` → {12, 256}、
+      `12GB+512GB` → {12, 512}，区分保住了。
+      要改就得动 `normalize_title`，那会让已入库的 1100 条 `title_norm`
+      和新算出来的用两套规则（models.py 存这一列就是为了避免这个），
+      需要一次数据回填。没有真实案例支撑这个代价。
+
+    ★ 所以这条测试的作用是**设一个路标**，不是描述期望：
+      哪天有人真的去改归一化、让 Pro+ 能区分开了，这条会红——
+      那一刻他会看到这里写着"改完要回填 title_norm"。
+      写在注释里的约定会烂掉，写成测试的不会。
+
+    ★ 断言的是包含度 1.000 这个**具体数字**，不只是 decision。
+      只断言 MERGE 的话，"包含度 0.79 勉强归并"和"完全同一字符串"
+      在测试里长得一样，而这两种情况的严重程度完全不同。
+    """
+    a = "小米 15 Pro 手机 12GB 256GB 白色"
+    b = "小米 15 Pro+ 手机 12GB 256GB 白色"
+
+    norm_a = normalize_title(a)
+    norm_b = normalize_title(b)
+    assert norm_a == norm_b, (
+        "归一化规则变了——现在 Pro+ 和 Pro 能区分开了。"
+        "那正是好事，但请一并处理 products.title_norm 的回填"
+        "（见 scraper/dedup.py 里 MODEL_SUFFIX_WORDS 上方那段说明），"
+        "然后回来把这条测试改成断言它们不被归并。"
+    )
+
+    result = decide(
+        Candidate(source="smzdm", source_id="new", title=b),
+        [existing_of(1, a)],
+    )
+    assert result.decision is Decision.MERGE
+    assert result.score == pytest.approx(1.0)
 
 
 # ===========================================================================
