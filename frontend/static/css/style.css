@@ -192,7 +192,36 @@ main { max-width: 1440px; margin: 0 auto; padding: 20px; }
 
 /* --------------------------------------------------------------------------
  * 表格
+ *
+ * ★ 表格的横向滚动容器（下面 th 的 sticky 依赖它，改之前先读这段）
+ *
+ * 为什么不能只写 <div style="overflow-x:auto">：
+ *   CSS 规范规定：overflow-x 和 overflow-y 里只要有一个不是 visible，
+ *   另一个就会被**计算成 auto**。所以这个 div 不管有没有东西可滚，
+ *   都是一个**双向的滚动容器**。
+ *   而 position: sticky 是相对**最近的滚动容器**定位的——不是相对视口。
+ *
+ *   于是 th 上原来那句 `top: 58px`（本意是"滚动时别被 58px 高的顶栏盖住"），
+ *   含义悄悄变成了"距这个 div 自己的顶边 58px"。
+ *   表头在正常流里的位置**就是**这个 div 的顶边（偏移 0），
+ *   小于 58px 这个下界 → 表头被**向下推开 58px**，正好压住头两行数据，
+ *   而它原来待的位置空了出来。看起来就是"表格顶部被啃掉一块"。
+ *
+ *   ★ 这个 bug 只在**人眼确认**那一轮才被发现：
+ *     它不报错、不影响任何一条测试，HTML 和 CSS 都完全合法。
+ *
+ * 修法不是把 sticky 删掉（那会留下一句不干活的 CSS），
+ * 而是让这个容器名副其实：给它一个上限高度，它才真的会滚，
+ * 表头也才真的粘得住（见下面 th 的 top: 0）。
+ *
+ * max-height 只封顶、不撑高：规则表只有一行时它就是个普通盒子，
+ * 不会凭空多出一块空白。
  * ------------------------------------------------------------------------ */
+.table-scroll {
+  overflow: auto;
+  max-height: min(70vh, 720px);
+}
+
 table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th, table.data td {
   text-align: left;
@@ -206,7 +235,12 @@ table.data th {
   font-size: 12px;
   background: #fbfbfc;
   position: sticky;
-  top: 58px;
+  /* ★ 必须是 0，不能写顶栏高度（比如 58px）。
+     表头粘的是**它所在的滚动容器**（.table-scroll），不是视口；
+     写非 0 的值会把表头往下推、压住数据行。
+     完整的来龙去脉见上面 .table-scroll 那段注释。 */
+  top: 0;
+  z-index: 1;                /* 粘住的表头要盖住从它下面滚过去的行 */
   white-space: nowrap;
 }
 table.data th.sortable { cursor: pointer; user-select: none; }

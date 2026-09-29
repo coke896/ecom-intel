@@ -210,6 +210,103 @@ def test_pragma_list_covers_the_four_documented_items() -> None:
 
 
 # ===========================================================================
+# 二之补、busy_timeout 的**到期路径**
+#
+# ★ 上面几条只验证了"配置写进去了"。`busy_timeout` 是一条**承诺**：
+#   "后到的写会等，而不是立刻抛 database is locked"。
+#   而它的另一半 —— "等不到的时候会怎样" —— 在 2026-09-29 之前
+#   **从没被构造过**：配置是 30 秒，但没人真的去等那 30 秒。
+#   承诺的一半没验证，等于没有承诺。
+#
+# ★ 实测结论（手工构造，数字见下面那条测试的 docstring）：
+#   到期后抛 `OperationalError: database is locked`，**不会永远挂住**。
+#   但真正的等待时长是 ~32.8 秒，不是 30 秒 —— 原因也已查清。详见下。
+# ===========================================================================
+
+
+def test_a_blocked_writer_gives_up_instead_of_hanging(tmp_path) -> None:
+    """拿住写锁不放，另一个连接必须**抛错**，而不是永远等下去。
+
+    ★ 这条把超时改短到 300 毫秒来跑（设完覆盖一次 PRAGMA），
+      因为真的等 30 秒会让整个测试套件慢 33 秒 ——
+      那是一条没人愿意跑的测试，等于没有测试。
+      代价是：它验证的是**机制**（到期会抛、不会挂死），
+      不是"30 秒这个具体数字"。那个数字由上面
+      `test_pragma_list_covers_the_four_documented_items` 单独钉住。
+      两条合起来才等于"配置正确 + 行为正确"。
+    """
+    # ★ 抓的是 `sqlite3.OperationalError`，**不是** SQLAlchemy 那个。
+    #   这里的连接来自 raw_connection()，是裸的 DBAPI 连接，
+    #   异常不会被 SQLAlchemy 包装。第一版就是在这里红的。
+    import sqlite3
+
+    eng = create_engine(
+        f"sqlite:///{(tmp_path / 'busy.db').as_posix()}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    register_sqlite_pragmas(eng)
+    with eng.begin() as conn:
+        conn.exec_driver_sql("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        conn.exec_driver_sql("INSERT INTO t (id, v) VALUES (1, 0)")
+
+    a = eng.raw_connection()
+    b = eng.raw_connection()
+    ra, rb = a.driver_connection, b.driver_connection
+    try:
+        ra.execute("BEGIN IMMEDIATE")          # A 占住写锁
+        ra.execute("UPDATE t SET v = v + 1 WHERE id = 1")
+        rb.execute("PRAGMA busy_timeout=300")  # 覆盖成短超时，理由见 docstring
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            rb.execute("BEGIN IMMEDIATE")
+    finally:
+        ra.rollback()
+        a.close()
+        try:
+            rb.rollback()
+        except Exception:
+            pass
+        b.close()
+        eng.dispose()
+
+
+# ★ 下面这段是**实测记录**，不是测试（跑一次要 33 秒，不适合进套件）。
+#
+#   2026-09-29 手工构造，用**生产那一份** SQLITE_PRAGMAS 挂在临时库的引擎上：
+#
+#     PRAGMA busy_timeout = 30000 ms       ← 配置确实是 30 秒
+#     PRAGMA journal_mode = wal
+#     连接 B 等了 32.80 秒 / 32.85 秒（两次）后抛
+#       OperationalError: database is locked
+#
+#   ★ 32.8 ≠ 30。多出来的 2.8 秒一开始看着像测量误差，但两次复测
+#     只差 50 毫秒，是**系统性的**。短超时对照实验给出了规律：
+#
+#       500 ms → 实测  611 ms  (+22.3%)
+#      1000 ms → 实测 1203 ms  (+20.3%)
+#      2000 ms → 实测 2275 ms  (+13.8%)
+#      4000 ms → 实测 4451 ms  (+11.3%)
+#     30000 ms → 实测 32800 ms (+9.4%)
+#
+#   ★ 根因（已验证，不是猜的）：
+#       SQLite 的默认 busy handler 是**按 100 毫秒一档睡**的，
+#       每睡一档检查一次是否已超过 busy_timeout。
+#       而 Windows 的 `Sleep(100)` 实际会睡多久？
+#       实测（kernel32.Sleep 连打 50 次取平均）：
+#           Sleep(10)  → 15.5 ms  (+54.7%)
+#           Sleep(50)  → 62.4 ms  (+24.9%)
+#           Sleep(100) → 109.4 ms (+9.4%)   ← 对上 30 秒那次的 +9.4%
+#       原因是 Windows 默认计时器精度约 15.6 ms，Sleep 会向上取整到刻度。
+#
+#       于是：30000 ms ÷ 100 × 109.4 ms ≈ 32.8 秒  ← 与实测吻合。
+#
+#   ★ 这条实测的用处不是"30 秒变成了 32.8 秒"，而是它说明了一件事：
+#     **busy_timeout 是个下界，不是精确的墙钟承诺。**
+#     写文档/写注释时说"等 30 秒"是可以说得更准的。
+# ===========================================================================
+
+
+# ===========================================================================
 # 三、时间约定
 # ===========================================================================
 

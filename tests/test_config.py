@@ -24,6 +24,19 @@
     ——全集表都在、商品 0 条、不报错。服务照常起来，界面上什么都没有，
     而人只会以为"还没采集"。
 
+【3】`.env.example` 把【1】放了回来（2026-09-29 实测）
+    模板里有一行**没注释掉**的 `DATABASE_URL=sqlite:///data/ecom.db`。
+    它盖住了由 `DATA_DIR` 派生的默认值，于是上面那条
+    `test_data_dir_env_moves_everything` 在 `cp .env.example .env` 之后立刻变红。
+
+    ★ 关键在于：**它在此之前一直是绿的**——绿的原因不是代码对，
+      是没人真的照 README 做过第一步。而 README 让你做的正是那一步。
+
+    ★ 也在于：模板里那个值**恰好等于默认值**，所以平时完全看不出差别，
+      只有 `DATA_DIR` 一动才暴露"库没跟着搬"。
+      这是【1】的同一个形状换了个门进来：代码修好了，模板又放回去。
+      所以补了一条直接测 `.env.example` 的用例 —— 它测的不是代码，是交付物。
+
 ================================================================================
 ★ 为什么这里有一条 subprocess 测试
 ================================================================================
@@ -132,6 +145,48 @@ def test_a_single_path_can_still_be_overridden_on_its_own(tmp_path: Path) -> Non
     )
     assert Path(out["images"]) == pics
     assert Path(out["data_dir"]) == PROJECT_ROOT / "data"
+
+
+# ===========================================================================
+# 二之补：.env.example 是"模板"，不许悄悄关掉上面那条链
+# ===========================================================================
+
+
+def test_env_example_does_not_pin_the_derived_paths() -> None:
+    """★ `.env.example` 里不许出现**没注释**的路径覆盖项。
+
+    这是 2026-09-29 实测逼出来的一条（【1】的第三次复现）：
+
+      照 README 执行 `cp .env.example .env` 之后，
+      上面那条 `test_data_dir_env_moves_everything` **立刻变红** ——
+      而在此之前它一直是绿的。绿的原因不是代码对，
+      是**没人真的照 README 做过那一步**。
+
+    模板里那行 `DATABASE_URL=sqlite:///data/ecom.db` 的值恰好等于默认值，
+    所以平时看不出任何差别；只有把 `DATA_DIR` 指到别处时才暴露：
+    图片、停用词表、自定义词典都搬走了，**只有库没搬**。
+    而它看起来像成功了——新目录确实建出来了，只是里面少一个库文件。
+
+    ★ 所以这条不是在测代码，是在测**交付物**：
+      "README 让你做的第一件事，不能把 README 承诺的另一件事弄坏。"
+
+    ★ 允许的写法是把它注释掉（可选项照旧保留在那儿），
+      不允许的写法是取消注释 —— 哪怕填的是"默认值"。
+    """
+    pins = ("DATABASE_URL", "IMAGES_DIR", "STOPWORDS_FILE", "USERDICT_FILE")
+    active: list[str] = []
+    for raw in (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = line.partition("=")[0].strip()
+        if name in pins:
+            active.append(line)
+    assert not active, (
+        ".env.example 里有没注释掉的路径覆盖项，"
+        "它们会盖掉由 DATA_DIR 派生的默认值：\n  " + "\n  ".join(active) +
+        "\n改成注释掉的示例（前面加 #），并说明它何时才该被启用。"
+    )
 
 
 # ===========================================================================
