@@ -48,9 +48,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Select, func, select
 
 from app.aggregate import bucket_prices, median, quantile
-from app.api.deps import DbDep, SourceDep, apply_source
+from app.api.deps import DbDep, SourceDep
 from app.db.models import PriceHistory, Product, Shop
 from app.keywords import rank_keywords
+from app.source_scope import apply_source
 from app.textutil import elide_middle
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
@@ -691,7 +692,30 @@ def shop_share(
         #   各扇区之和不足 100%，而看图上完全看不出来少了东西。
         #   （`func.coalesce(..., UNKNOWN_SHOP)` 就是为了给这些行一个名字。）
         .join(Shop, Product.shop_id == Shop.id, isouter=True)
-        .group_by(Product.shop_id)
+        # ★ 这里必须把 Shop.platform 也写进 GROUP BY，不能只按 Product.shop_id 分组
+        #   而把 Shop.platform 裸放在 SELECT 里。
+        #
+        #   SQLite 对裸列是宽容的：它**静默**从组里挑一个值给你。所以这条 SQL
+        #   在 SQLite 上跑得好好的，测试也全绿。而在 PostgreSQL 上它是**硬错误**：
+        #       column "s.platform" must appear in the GROUP BY clause
+        #       or be used in an aggregate function
+        #
+        #   ★ 那"挑一个值"在眼下会不会挑错？——**不会**，这一点我实测过：
+        #     在真实库快照上按 Product.shop_id 分成 18 组，逐组数
+        #     `COUNT(DISTINCT s.platform)`，**最大值为 1**。
+        #     原因是 join 条件 `Shop.id = Product.shop_id` 打在 shops 的**主键**上，
+        #     所以 platform 被 shop_id 函数决定，组内本来就只有唯一取值。
+        #
+        #   ★ 所以修它不是"修一个算错的数"，是修**可移植性**：
+        #     本项目在 README 里明确讨论过"什么时候该换 PostgreSQL"
+        #     （busy_timeout 那条边界）。换过去的那一天，这条 SQL 会当场报错，
+        #     而它是被别人改到的概率最低的那一类语句——所以现在就写对。
+        #
+        #   ★ 为什么不用 `group_by(shop_label, Shop.platform)`：
+        #     shop_label 是 `coalesce(name, '未知店铺')`，按它分组等于按**别名**分组，
+        #     会把两个 shop_id 不同的行（比如两个都叫 NULL 的）并成一组。
+        #     按 shop_id 分组才是"一家店一组"的正确语义。
+        .group_by(Product.shop_id, Shop.platform)
         .order_by(func.count(Product.id).desc(), shop_label)
     )
 

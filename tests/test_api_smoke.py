@@ -33,7 +33,7 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from app.db.base import get_db, utcnow
 from app.db.models import PriceHistory, Product, Shop
@@ -578,6 +578,103 @@ def test_shop_share_ratios_sum_to_one(client, db) -> None:
     assert top["shop"] == "安克官方旗舰店"
     assert top["product_count"] == 6
     assert abs(top["share"] - 0.6) < 1e-6
+
+
+def test_shop_share_sends_a_group_by_that_covers_platform(client, db, engine) -> None:
+    r"""★ 店铺占比**真正发给数据库的那条 SQL**，GROUP BY 里必须有 platform。
+
+    ==========================================================================
+    为什么这条测试只能查 SQL 形状，不能查行为
+    ==========================================================================
+    它守的是一个**在 SQLite 上完全观察不到**的问题。
+
+    原来那条语句是：
+
+        SELECT coalesce(shops.name, '未知店铺'), shops.platform, count(*), ...
+        ... GROUP BY products.shop_id        ← 只按 shop_id 分组
+
+    `shops.platform` 是个**裸列**（不在 GROUP BY 里、也没套聚合函数）。
+    SQLite 对此是宽容的：它从组里**静默**挑一个值给你。
+
+    ★ 挑错了吗？——**没有**。这一点我在真实库快照上实测过：
+      按 `products.shop_id` 分成 18 组，逐组数 `COUNT(DISTINCT shops.platform)`，
+      **最大值为 1**。因为 join 条件 `shops.id = products.shop_id` 打在
+      shops 的**主键**上，platform 被 shop_id 函数决定，组内只有唯一取值。
+
+    ★ 所以这个 bug **没有可观测的行为差异**——写一条行为测试去"验证修复"，
+      只能是自欺欺人：那条测试在修复前后都会是绿的。
+      修它修的是**可移植性**。PostgreSQL 对裸列是硬错误：
+          column "shops.platform" must appear in the GROUP BY clause
+          or be used in an aggregate function
+      （PG 的功能依赖识别只认"分组列里包含该表主键"；这里分组列是
+        products.shop_id，是指向 shops.id 的**外键**而不是那个主键，所以不认。
+        —— 这是 PG 的文档行为，本机没有 PG 实例，**我没有实测**，如实标注。）
+
+    ==========================================================================
+    ★★ 这条测试的第一版是【假的】，写在这里因为它是个必须记住的陷阱
+    ==========================================================================
+    第一版是这么写的：
+
+        stmt = (select(shop_label, Shop.platform, ...)
+                .join(Shop, ...)
+                .group_by(Product.shop_id, Shop.platform))   # ← 在测试里
+        grouped = {c for c in stmt._group_by_clauses}
+        assert any("platform" in g for g in grouped)
+
+    它**在变异测试下没有红**——把 `app/api/stats.py` 退回
+    `.group_by(Product.shop_id)`，这条断言照样通过。
+
+    原因很简单也很难看：**我在测试里把那条查询重新写了一遍**，
+    于是它验证的是**我抄的那份副本**，不是 `stats.py` 里真正跑的那条。
+    被测对象从头到尾没进过这条测试。
+
+    ★ 这与 `tests/test_config.py` 模块注释里警告的是同一件事：
+      "在进程内 monkeypatch 一个假的 settings 再断言，测的是**测试自己写的替身**，
+       不是真实行为——那种测试会在实现坏掉时照样变绿。"
+
+    → 现在的做法：**挂一个 SQL 监听器，抓真实发出去的那条语句。**
+      被测对象是"经由 endpoint 打到数据库的那行 SQL"，
+      不是任何我在测试里构造的东西。变异一下立刻红。
+    """
+    # 造点数据，保证这条查询真的会被执行（空库时它照样跑，但这里求稳）
+    for i in range(3):
+        _add(db, sid=f"g{i}", title=f"G{i}", price=100.0, shop="京东自营")
+    _add(db, sid="g9", title="G9", price=100.0, shop=None)
+    db.commit()
+
+    captured: list[str] = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        # 只捞店铺占比那条：它同时含 shops 和 GROUP BY
+        up = statement.upper()
+        if "GROUP BY" in up and "SHOPS" in up:
+            captured.append(statement)
+
+    try:
+        _get(client, "/api/stats/shop-share", source="mock")
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert captured, "没抓到店铺占比的 SQL——监听器挂错了，这条测试没测到东西"
+    sql = captured[0]
+    normalized = " ".join(sql.split())          # 折叠换行和多余空格，便于定位
+    # 取出 GROUP BY 那一段做断言，避免误判 SELECT 列表里的 platform
+    group_clause = normalized.upper().split("GROUP BY", 1)[1]
+
+    assert "PLATFORM" in group_clause, (
+        "店铺占比的 GROUP BY 里没有 shops.platform —— "
+        "SELECT 里有它，GROUP BY 里就必须有它。\n"
+        f"  实际 SQL：\n    {normalized}\n"
+        "SQLite 会静默挑一个值让你发现不了；换成 PostgreSQL 直接报错。"
+    )
+    # ★ 反向确认：分组列里也不能少掉 shop_id。
+    #   为什么不用 `group_by(shop_label)`（按 coalesce 出来的别名分组）：
+    #   那会把 shop_id 不同、但名字恰好都为 NULL 的两个真实店铺并成一组。
+    #   按 shop_id 分组才是"一家店一组"的正确语义。
+    assert "SHOP_ID" in group_clause, (
+        f"GROUP BY 里没有 products.shop_id。\n  实际 SQL：\n    {normalized}"
+    )
 
 
 def test_shop_share_keeps_products_without_a_shop(client, db) -> None:

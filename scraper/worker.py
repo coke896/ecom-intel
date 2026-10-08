@@ -81,10 +81,11 @@ from pathlib import Path
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.base import SessionLocal, init_database, utcnow
 from app.db.models import CrawlTask
 from scraper import ingest
-from scraper.check_alerts import check_alerts
+from app.alerts_engine import check_alerts
 from scraper.base import (
     CrawlReport,
     DataSource,
@@ -98,7 +99,20 @@ from scraper.seed import DEFAULT_PRODUCT_COUNT
 from scraper.sources.mock import PER_PAGE as MOCK_PER_PAGE
 from scraper.sources.smzdm import SmzdmSource, dedupe_deals
 
-logger = logging.getLogger("scraper.worker")
+# ★ 用 `__name__` 而不是手打 "scraper.worker"：名字跟着模块走。
+#
+#   这里手打暂时是对的，但**对得没有保障**——本项目的
+#   `app/alerts_engine.py` 就正是栽在同一行上（模块搬走了、名字留下了）。
+#   `__name__` 把"名字对不对"从"下次有人刚好看见"变成"不可能错"。
+#
+#   ★ 为什么这里 `__name__` 一定等于 "scraper.worker"：
+#     入口在文件末尾的 `if __name__ == "__main__"`，而**直跑
+#     `python scraper/worker.py` 是跑不起来的**（sys.path[0] 变成 scraper/，
+#     第 84 行的 `from app.config import settings` 当场 ModuleNotFoundError
+#     ——已实测）。所以唯一的启动方式是 `python -m scraper.worker`
+#     （README、启动服务.bat、私人笔记.md 里写的都是这一种），
+#     此时 `__name__` 必然是 "scraper.worker"。
+logger = logging.getLogger(__name__)
 
 # 每处理多少条爆料更新一次进度。
 # 取 20 是因为两个源的每页都是 20 条——所以这个数字实际的含义是"每页更新一次"。
@@ -109,7 +123,14 @@ PROGRESS_EVERY = 20
 # ★ 取值要明显大于"一个正常任务的最长耗时"：
 #   5 页 × (2~3 秒间隔 + 解析) ≈ 15~20 秒，加上写库不到 1 分钟。
 #   取 10 分钟，正常任务绝不会被误判成崩溃遗留。
-STALE_TASK_MINUTES = 10
+#
+# ★ 值本身定义在 app/config.py（settings.stale_task_minutes），这里只是取个别名。
+#   原来这里和 app/api/tasks.py 各写了一份 10，靠注释"保持一致"约束——
+#   而同一条规则写两遍就会分叉（本项目第七类形状）。
+#   接口那个值决定"界面上显示成可能已中断"的时机，这个值决定
+#   "worker 什么时候把任务打回重跑"。两者不一致时的现象是
+#   "界面说还在跑、其实已经被重跑了"，排查时没人会想到是两个常量不一样。
+STALE_TASK_MINUTES = settings.stale_task_minutes
 
 # 轮询间隔（秒）。表做队列没有"有新任务就通知我"的机制，只能轮询。
 # 1 秒足够让前端觉得"提交完马上就开始了"，又不至于空转烧 CPU。
@@ -612,7 +633,7 @@ def check_alerts_once(db: Session) -> None:
 
     ★ 只记日志，不做任何"推送"——本项目没有外部通知渠道。
       触发记录落在 alerts 表里，用户打开界面看得到（是【拉】，不是【推】）。
-      这件事在 app/db/models.py 和 scraper/check_alerts.py 里都写明了。
+      这件事在 app/db/models.py 和 app/alerts_engine.py 里都写明了。
 
     ★ 异常必须在这里被吞掉（只记日志），理由和 run_once 里那条一样：
       告警检查是循环里的**附带动作**，它出问题不该让整个 worker 停摆。

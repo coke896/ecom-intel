@@ -11,7 +11,7 @@
 ★ 这个文件里没有告警逻辑，一行都没有
 ================================================================================
 判断"价格够不够低"、推进 armed/fired 状态机、写 alerts 行的，全是
-`scraper/check_alerts.py`。这里只做三件事：把请求翻译成数据库操作、
+`app/alerts_engine.py`。这里只做三件事：把请求翻译成数据库操作、
 把结果翻译成响应模型、把非法输入挡在门外。
 
 理由和 `app/api/tasks.py` 一样：**同一套规则写两遍就会分叉**
@@ -23,7 +23,7 @@
 四个必须在接口层拍板的决定
 ================================================================================
 
-【1】`rule_type` 的合法值来自 `check_alerts.RULE_TYPES`，不在这里另写一份
+【1】`rule_type` 的合法值来自 `alerts_engine.RULE_TYPES`，不在这里另写一份
 
     代价是 OpenAPI 上它是一个自由文本框而不是下拉框（FastAPI 的参数校验
     需要 Enum 类型才能给出取值列表）。
@@ -96,10 +96,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, insert, literal, select, update
 from sqlalchemy.orm import Session
 
-from app.api.deps import DbDep, SourceDep, apply_source
+from app.api.deps import DbDep, SourceDep
 from app.db.base import utcnow
 from app.db.models import Alert, AlertRule, PriceHistory, Product
-from scraper.check_alerts import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
+from app.source_scope import apply_source
+from app.alerts_engine import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
+
+# ★ 单独把模块本身也 import 进来，只为了下面那句 OpenAPI 描述能自己写出
+#   真实模块名（`alerts_engine.__name__`），而不是手打一个字符串。
+#   手打的那个名字已经错过一次了：模块从 scraper/ 挪到 app/ 之后，
+#   描述里还写着 `check_alerts.RULE_TYPES`——而这段文字是**面向使用者**的
+#   （它出现在 /docs 的接口说明里），说错了没有任何东西会提醒你。
+from app import alerts_engine
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -124,7 +132,7 @@ class RuleCreate(BaseModel):
     product_id: int = Field(description="给哪个商品配告警")
     rule_type: str = Field(
         description=f"规则类型，合法取值：{'、'.join(RULE_TYPES)}"
-        "（★ 依赖 check_alerts.RULE_TYPES，接口不另存一份清单）"
+        f"（★ 依赖 {alerts_engine.__name__}.RULE_TYPES，接口不另存一份清单）"
     )
     threshold: float = Field(
         gt=0,
@@ -295,7 +303,7 @@ def _fired_counts(db: Session) -> dict[int, int]:
     """每条规则触发过几次。
 
     ★ 一次 group by 查完，不在循环里逐个 count：
-      逐个数是 N+1 查询的经典形态（同 scraper/check_alerts.py 里的理由）。
+      逐个数是 N+1 查询的经典形态（同 app/alerts_engine.py 里的理由）。
     """
     rows = db.execute(
         select(Alert.rule_id, func.count()).group_by(Alert.rule_id)

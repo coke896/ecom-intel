@@ -90,7 +90,7 @@ python -m scraper.worker                # 常驻：认领页面上的采集任�
 | **双数据源隔离** | `source` 字段把"数据血缘"和"销售平台"拆成两个维度，所有统计接口支持 `?source=mock\|smzdm\|all`。Mock 用于联调演示，真实数据用于验证管道 | [`app/aggregate.py`](app/aggregate.py) |
 | **任务队列而非 `BackgroundTasks`** | 任务状态在数据库里而不是进程内存里，所以刷新页面能恢复进度；同一个源已有待办任务时**不再入队第二个**（并发下也成立——判断写在 INSERT 的 `WHERE` 里，实测 4 并发 → 1 个任务） | [`app/api/tasks.py`](app/api/tasks.py) |
 | **AI 缓存按数据指纹** | 指纹含 prompt 版本 + 模型名 + 模型实际看到的每一个字段，**排除**自增 id 与采集时间戳；留了 `?force=1` 的 bypass 出口，避免演示时"我再生成一次"却秒回旧报告 | [`app/analysis/fingerprint.py`](app/analysis/fingerprint.py) |
-| **告警状态机** | `armed` / `fired` 两态避免"价格持续低于阈值期间一天写 288 条记录"；改规则 = 重新武装，但**不补发通知** | [`scraper/check_alerts.py`](scraper/check_alerts.py) |
+| **告警状态机** | `armed` / `fired` 两态避免"价格持续低于阈值期间一天写 288 条记录"；改规则 = 重新武装，但**不补发通知** | [`app/alerts_engine.py`](app/alerts_engine.py) |
 | **图片代理的 SSRF 防护** | 域名白名单 + 禁止 IP 直连（含十进制/八进制变体）+ 解析后再校验真实地址；顺带处理了同源 XSS（代理本身会把三方图变成同源内容） | [`app/api/images.py`](app/api/images.py)、[docs 第十八节](docs/可行性评估.md) |
 
 ## 真实数据与合规

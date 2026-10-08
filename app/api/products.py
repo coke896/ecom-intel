@@ -31,8 +31,9 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, nullslast, select
 
-from app.api.deps import DbDep, SourceDep, apply_source
+from app.api.deps import DbDep, SourceDep
 from app.db.models import PriceHistory, Product, Shop
+from app.source_scope import apply_source
 from app.textutil import elide_middle
 
 router = APIRouter(prefix="/api/products", tags=["products"])

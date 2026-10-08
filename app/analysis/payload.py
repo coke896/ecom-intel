@@ -46,6 +46,36 @@
 （`build_payload` 里那些聚合量——分位数、直方图——算的都是**全体**，
  和采样无关。两套数字放在同一个 payload 里，靠 `sample` 块区分，
  靠 prompt 里的措辞约束模型不要混用。）
+
+================================================================================
+一条明确的、**不打算**去修的边界：样本里的标题是外部文本
+================================================================================
+
+上面那个 `sample` 块里的 `title`，内容直接来自页面（SMZDM 的爆料标题，
+或 seed 造的标题），**原样拼进 prompt**。于是这份 prompt 里有一块内容
+不受我们控制，原则上可以在里面写"忽略以上规则，改为输出……"。
+这就是 prompt injection，这里把边界如实写下来：
+
+  · **不清洗，这是取舍不是疏忽。**
+    "一句话像不像指令"在中文商品标题上分不出真假——"必须买""到手价"
+    "不容错过"本来就是正常营销语。任何激进的过滤都会先杀掉真实数据，
+    而收益只是挡住一个本来就没有杀伤力的输入。
+
+  · **能做这个取舍，是因为影响面是封死的。** 模型手上没有任何工具：
+    `glm_client` 每次只发一个 chat completion，参数只有
+    model / messages / temperature / max_tokens / response_format，
+    **没有 `tools`、没有 `tool_choice`**；它不能联网、不能读文件、
+    不能执行代码。输出还要过 `_extract_json` 和 `_validate` 两道关，
+    不合格直接抛 `AnalysisError`，不会写进 `analysis_reports`。
+    所以被带偏的最坏结果是**一份胡说八道的报告**——是人会当场看出来的那种，
+    而不是"系统被拿走"。
+
+  · ★ 会出事的是另一种架构：一个能读文件、能发请求、能调工具的 agent。
+    同一句标题在那种系统里的后果和这里完全不同。
+    本项目不打算做那种 agent，所以这条边界**停在原地，不升级**。
+
+★ 写下来是因为"没做"和"没想到"在代码里长得一模一样：
+  两者都只是**没有这几行代码**。区别全在有没有地方说清楚为什么。
 """
 
 from __future__ import annotations
@@ -56,9 +86,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.aggregate import bucket_prices, median, quantile
-from app.api.deps import SourceFilter, apply_source
 from app.db.models import PriceHistory, Product, Shop
 from app.keywords import rank_keywords
+from app.source_scope import SourceFilter, apply_source
 from app.textutil import elide_middle
 
 # 这些数字是"够用就好"和"别太贵"之间的取舍点。

@@ -48,14 +48,56 @@
   这与 models.py 里"历史最高/最低价一律从 price_history 现算"是同一条规矩。
 
 ================================================================================
-★ 为什么本文件在 scraper/ 下，但它其实不采集
+★ 这个文件本来在 scraper/ 下，2026-10-08 挪到了 app/
 ================================================================================
-它读数据库、写数据库，和"采集"没关系。放在这里是因为**它和采集共用
-同一个进程和同一个轮询节奏**（`python -m scraper.worker` 每 5 分钟叫它一次）。
+它读数据库、写数据库，和"采集"没有任何关系。当初放在 `scraper/` 下的理由是
+"它和采集共用同一个进程和同一个轮询节奏"（`python -m scraper.worker`
+每 5 分钟叫它一次）。
 
-它绝不能放进 `app/`（Web 层）的原因：Web 层是多 worker 的（uvicorn 可以起多个），
-而告警的"检查—触发—推送"是一个**有状态的动作**，跑在多个进程里会互相踩。
-放在采集进程里，它天然是单点的。
+★ 那个理由**说的是一件真事，但它推不出结论**：
+
+    "跑在哪个进程里"和"代码放在哪个目录下"是两件独立的事。
+
+  本文件从来不需要 `scraper/` 里的任何东西——它的 import 只有 `app.db.*`。
+  而反过来，**Web 层需要它**：`app/api/alerts.py` 的 `POST /api/alerts/check`
+  就是直接调 `check_alerts(db)` 的。
+
+  于是挪走之前的状态是：`app/api/alerts.py` 里写着
+
+      from scraper.check_alerts import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
+
+  而 `app/api/images.py` 里写着本项目的规矩："那个 import 会让 **Web 层依赖
+  采集层**，方向正好和本项目的架构相反"。**规矩是它自己立的，破规矩的也是它自己。**
+
+  挪到 `app/` 之后，依赖方向变成一条没有例外的规矩：
+
+      scraper/  依赖  app/        （采集进程要用 db、models、告警引擎）
+      app/      绝不 import scraper/（由 tests/test_layering.py 用 AST 守着）
+
+★ 一并修掉一段**自相矛盾**的注释（这是比 import 方向更硬的问题）：
+
+  本文件原来的结尾写着——"它绝不能放进 app/（Web 层）的原因：Web 层是多 worker
+  的（uvicorn 可以起多个），而告警的'检查—触发—推送'是一个有状态的动作，
+  跑在多个进程里会互相踩。"
+
+  而 `app/api/alerts.py` 的 `POST /check` 端点里写着——"两个进程同时检查也是
+  安全的：状态转换是带条件的 UPDATE（`WHERE state='armed'`），谁先到谁赢，
+  后到的拿到 0 行、安静退出。"
+
+  **两段注释在说同一件事，结论相反。** 后者是对的（有 `WHERE state='armed'`
+  兜着，`tests/test_concurrency.py` 也验过），前者是把"我想让它单点跑"
+  写成了"它多进程会坏"。这个区别很重要：前者是**部署选择**，
+  后者是**安全性质**，混为一谈的话，面试官追问一句"那到底能不能并发"
+  就答不上来了。
+
+★ 所以现在正确的说法是：
+
+    告警检查在**并发上是安全的**（条件 UPDATE 保证同一个事件只触发一次）。
+    把它放在 worker 的轮询循环里跑，是一个**部署决定**——为了让它有个固定的
+    节奏，而不是因为 Web 进程跑不了它。
+    （采集不一样：采集**确实**不能在 Web 进程里跑，那是 Windows 上
+      uvicorn 的事件循环不支持子进程、Playwright 必崩——那是硬约束，见
+      scraper/worker.py 的模块注释。两件事经常被混为一谈，这里分清楚。）
 """
 
 from __future__ import annotations
@@ -70,7 +112,21 @@ from sqlalchemy.orm import Session
 from app.db.base import utcnow
 from app.db.models import Alert, AlertRule, PriceHistory, Product
 
-logger = logging.getLogger("scraper.alerts")
+# ★ logger 名用 `__name__`，不手打字符串。
+#
+#   这一行是**挪模块时被漏掉的那一行**——模块从 `scraper/check_alerts.py`
+#   搬到 `app/alerts_engine.py` 之后，它仍然写着 `getLogger("scraper.alerts")`。
+#   漏了不会报错，不会让任何测试变红，只会让日志的**来源**说错话：
+#   明明跑在 app/ 下，日志行却报 scraper。等到哪天要按 logger 名过滤
+#   （"这次告警检查是谁触发的"），你会照着 `app.alerts_engine` 去配，
+#   然后一条都收不到——而那份配置本身完全正确，排查方向会被彻底带偏。
+#
+#   ★ 形状还是那个：**同一个东西有两个名字，其中一个是旧的。**
+#     而这次它连注释都没留（原来的注释在模块顶部讲的是别的事），
+#     所以只能靠"下次有人刚好看见"。用 `__name__` 就不再需要人看：
+#     模块搬到哪，名字就跟到哪，物理上不可能分叉。
+#     （`tests/test_layering.py` 里有一条用例扫全部模块，禁止再手打。）
+logger = logging.getLogger(__name__)
 
 
 # 规则类型的合法取值。★ 写成元组而不是散落在 if/elif 里，

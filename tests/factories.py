@@ -302,13 +302,13 @@ def add_alert(
         rule_id=rule_obj.id,
         triggered_at=utcnow(),
         price_at_trigger=price,
-        # ★ 和 scraper/check_alerts.py 的触发路径写的是同一对值。
+        # ★ 和 app/alerts_engine.py 的触发路径写的是同一对值。
         #   两边必须一致，否则工厂造出来的"历史记录"和真实产生的
         #   记录形状不同，用工厂写的用例就测不到真实路径。
         rule_type_at_trigger=rule_obj.rule_type if snapshot else None,
         threshold_at_trigger=rule_obj.threshold if snapshot else None,
         # ★ 恒为 False：本项目没有外部推送渠道。见 models.py 与
-        #   scraper/check_alerts.py 里的说明。
+        #   app/alerts_engine.py 里的说明。
         notified=False,
     )
     db.add(alert)

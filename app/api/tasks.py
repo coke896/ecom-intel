@@ -58,9 +58,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import insert, literal, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import DbDep, SourceDep, SourceFilter
+from app.api.deps import DbDep, SourceDep
+from app.config import settings
 from app.db.base import utcnow
 from app.db.models import CrawlTask
+from app.source_scope import SourceFilter
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -73,11 +75,17 @@ _ACTIVE_STATUSES = ("pending", "running")
 _WORKER_HINT = "python -m scraper.worker"
 
 # ★ 认领超时：一个 running 任务超过这个时间没有进度更新，
-#   前端就把它显示成"可能已中断"。取值和 worker 的自愈阈值
-#   （scraper/worker.py 的 STALE_TASK_MINUTES）保持一致——
-#   两边不一致的话，会出现"界面说还活着、worker 已经打回重跑了"
-#   或者反过来"界面说中断了、其实还在正常跑"，两种都会让排查跑偏。
-_STALE_MINUTES = 10
+#   前端就把它显示成"可能已中断"。
+#
+#   ★ 这个值现在**只有一处定义**：`settings.stale_task_minutes`（app/config.py）。
+#     这里曾经写死过一份 `_STALE_MINUTES = 10`，和 worker 的
+#     `STALE_TASK_MINUTES = 10` 靠一句注释"两边保持一致"约束着——
+#     那正是本项目反复记录的那个形状：**同一条规则写两遍，迟早会分叉。**
+#
+#     当时那句注释还说不出口自己在被谁验证：tests/test_tasks.py 只读了
+#     worker 那一份，接口这份改成 15 的话，测试照样全绿。
+#     现在两份拷贝物理上不存在了，测试也改成断言两边读到的是同一个值。
+_STALE_MINUTES = settings.stale_task_minutes
 
 
 class TaskOut(BaseModel):

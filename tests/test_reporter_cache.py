@@ -44,7 +44,7 @@ from sqlalchemy import select
 
 from app.analysis import reporter
 from app.analysis.glm_client import AnalysisError, GlmClient, GlmResult
-from app.api.deps import SourceFilter
+from app.source_scope import SourceFilter
 from app.db.models import AnalysisReport
 
 # ---------------------------------------------------------------------------

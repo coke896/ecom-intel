@@ -59,9 +59,9 @@ from sqlalchemy.orm import Session
 from app.analysis.fingerprint import build_fingerprint
 from app.analysis.glm_client import AnalysisClient, GlmClient
 from app.analysis.payload import build_payload
-from app.api.deps import SourceFilter
 from app.db.base import utcnow
 from app.db.models import AnalysisReport
+from app.source_scope import SourceFilter
 
 logger = logging.getLogger(__name__)
 

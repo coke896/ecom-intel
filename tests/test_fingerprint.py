@@ -42,7 +42,7 @@ import pytest
 from app.analysis import fingerprint as fp
 from app.analysis.fingerprint import FingerprintError, build_fingerprint
 from app.analysis.payload import build_payload
-from app.api.deps import SourceFilter
+from app.source_scope import SourceFilter
 
 MODEL = "glm-4-flash"
 

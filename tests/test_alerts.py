@@ -1,4 +1,4 @@
-"""告警状态机（`scraper/check_alerts.py`）的测试。
+"""告警状态机（`app/alerts_engine.py`）的测试。
 
 ================================================================================
 这个文件里最要紧的是"没有发生的事"
@@ -37,7 +37,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models import Alert, AlertRule
-from scraper.check_alerts import (
+from app.alerts_engine import (
     RULE_PRICE_BELOW,
     RULE_PRICE_DROP_PCT,
     AlertReport,
