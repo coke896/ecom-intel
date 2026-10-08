@@ -3,6 +3,16 @@
 配合 calibrate_dice.py 使用：那个脚本算 Dice，这个脚本回答
 "到底哪个指标能把真阳性和假阳性分开"。
 
+★★ 历史留档（第一轮探索，2026-09）。已被 `evaluate_merge.py` 取代：
+   那边用【精确锚定】锚定了 123 对标注（把值得判断的区域标穷尽，
+   见 `decision_region_census.py`），是本项目的权威评估。
+   本文件的标注集和它输出的数字只作过程留档——
+   **结论一律以 evaluate_merge.py + decision_region_census.py 为准**。
+   为什么留着不删：它的 `_find_pair`（模糊匹配）是本项目明确淘汰的写法，
+   是"测试脚手架自己出错比没有测试更危险"的实物证据——
+   有一对标注的锚点写错了（语料里根本不存在），模糊匹配把它悄悄跳过，
+   直到换成精确锚定才当场暴露。
+
 用法：
     python spike/label_pairs.py          # 打印候选对
     python spike/label_pairs.py --eval   # 跑指标对比
@@ -19,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scraper.cleaner import normalize_width  # noqa: E402
+from evaluate_merge import resolve  # noqa: E402  ★ 精确锚定的权威实现（先全等再子串）
 
 CORPUS = Path(__file__).parent / "corpus.json"
 
@@ -107,12 +118,13 @@ LABELS: list[tuple[str, str, bool, str]] = [
         True,
         "同款，后者省略规格",
     ),
-    (
-        "Apple iPhone 18 Pro Max 5G手机 256GB 勃艮第酒红色",
-        "Apple 苹果 iPhone 18 Pro Max 5G手机 256GB",
-        True,
-        "同款，后者省略颜色",
-    ),
+    # ★ 这里原来还有一对（第一轮的第 4 对）：
+    #     "Apple iPhone 18 Pro Max 5G手机 256GB 勃艮第酒红色"（同款，后者省略颜色）
+    #     "Apple 苹果 iPhone 18 Pro Max 5G手机 256GB"
+    #   第二个锚点在语料里【一条都命中不了】——18 Pro Max 只存在带颜色的那一条。
+    #   第一轮用模糊匹配（_find_pair）时它被【悄悄跳过】，没人发现；
+    #   换成精确锚定（resolve）后当场失败。删掉，但这几行留着当证据：
+    #   模糊匹配用同样的方式掩盖过多少错误，我们永远不会知道。
     (
         "百亿补贴：酷态科 充电宝10号电能棒电芯10000毫安",
         "酷态科 充电宝10号电能棒电芯10000毫安",
@@ -160,7 +172,12 @@ LABELS: list[tuple[str, str, bool, str]] = [
 
 
 def _find_pair(corpus: list[str], a: str, b: str) -> tuple[str, str] | None:
-    """在语料里找到与给定文案最接近的两条真实标题。"""
+    """★ 已弃用（保留作反面教材，见模块 docstring 与 LABELS 里删掉的那对）。
+
+    "找到最接近的两条"恰恰是问题所在：锚点写错时它照样返回一个结果，
+    于是"算法结论"可以建立在一对根本不是标注文本的标题上。
+    已被 `evaluate_merge.resolve`（精确锚定，命中数不等于 1 就报错）取代。
+    """
     def best(target: str) -> str | None:
         tn = normalize_title(target)
         tt = set(tn.split())
@@ -210,23 +227,36 @@ def main() -> None:
 def evaluate(titles: list[str]) -> None:
     """★ 核心产出：对比三种指标在人工标注真值上的区分能力。"""
     print("=" * 96)
-    print("指标对比（在人工标注的 %d 对真实标题上）" % len(LABELS))
+    print("指标对比（历史留档：第一轮人工标注 %d 对；权威结论见 evaluate_merge.py）"
+          % len(LABELS))
     print("=" * 96)
     print(f"{'标签':<6} {'包含度':>8} {'Dice':>8} {'Jaccard':>8}  说明")
     print("-" * 96)
 
+    # ★ 锚定用 evaluate_merge.resolve 的同一套规则：先全等、再子串，
+    #   命中数必须恰好 1，否则记下来、最后一起 loud failure。
+    #   原来是 _find_pair 的模糊匹配——锚点写错了它也会给一个"最像的"，
+    #   于是"结论"可能建立在一对根本不是标注文本的标题上。
+    #   宁可 loud failure，不要 silent wrong（见模块 docstring）。
     rows: list[tuple[bool, float, float, float, str]] = []
+    unresolved: list[str] = []
     for a, b, label, note in LABELS:
-        found = _find_pair(titles, a, b)
-        if not found:
-            print(f"  ⚠️ 语料里找不到匹配对：{a[:30]} / {b[:30]}")
+        try:
+            ra, rb = resolve(titles, a), resolve(titles, b)
+        except SystemExit as exc:
+            unresolved.append(f"{a[:30]} / {b[:30]}\n{exc}")
             continue
-        ra, rb = found
         sa, sb = toks(ra), toks(rb)
         c_, d, j = containment(sa, sb), dice(sa, sb), jaccard(sa, sb)
         tag = "同款" if label else "不同"
         print(f"{tag:<6} {c_:>8.3f} {d:>8.3f} {j:>8.3f}  {note}")
         rows.append((label, c_, d, j, note))
+
+    if unresolved:
+        raise SystemExit(
+            f"\n❌ {len(unresolved)} 个锚点没能唯一锚定——上面的表不完整，"
+            "不要拿它下结论：\n\n" + "\n".join(unresolved)
+        )
 
     print()
     for name, idx in [("包含度", 1), ("Dice", 2), ("Jaccard", 3)]:
