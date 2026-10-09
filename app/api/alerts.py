@@ -1,81 +1,27 @@
 """告警接口 —— 建规则、看记录、手动查一次。
 
-    POST   /api/alerts/rules      建一条规则
-    GET    /api/alerts/rules      规则列表
-    PATCH  /api/alerts/rules/{id} 改规则（阈值 / 规则类型 / 启用停用）
-    DELETE /api/alerts/rules/{id} 删规则（连同它的触发记录）
-    GET    /api/alerts            触发记录
-    POST   /api/alerts/check      立刻查一轮（不等 worker 的 5 分钟）
+    POST/GET/PATCH/DELETE /api/alerts/rules、GET /api/alerts、
+    POST /api/alerts/check（立刻查一轮，不等 worker 的 5 分钟）
 
-================================================================================
-★ 这个文件里没有告警逻辑，一行都没有
-================================================================================
-判断"价格够不够低"、推进 armed/fired 状态机、写 alerts 行的，全是
-`app/alerts_engine.py`。这里只做三件事：把请求翻译成数据库操作、
-把结果翻译成响应模型、把非法输入挡在门外。
+★ **这个文件里没有告警逻辑，一行都没有**：判断条件、推进 armed/fired 状态机、
+  写 alerts 行的全是 `app/alerts_engine.py`（理由和 app/api/tasks.py 一样——同一
+  套规则写两遍就会分叉，尤其不能让接口自己实现一遍状态机）。
 
-理由和 `app/api/tasks.py` 一样：**同一套规则写两遍就会分叉**
-（这个项目已经因此栽过三次，见 docs/可行性评估.md 第十五节）。
-尤其不能让接口自己实现一遍状态机——那等于让"触发一次"这件事有两个实现，
-而两个实现对于"什么算同一个事件"的理解迟早会不一样。
-
-================================================================================
-四个必须在接口层拍板的决定
-================================================================================
-
-【1】`rule_type` 的合法值来自 `alerts_engine.RULE_TYPES`，不在这里另写一份
-
-    代价是 OpenAPI 上它是一个自由文本框而不是下拉框（FastAPI 的参数校验
-    需要 Enum 类型才能给出取值列表）。
-    这里选了"正确"而不是"文档好看"：**能自动生成下拉框的那个写法，
-    必然要维护第二份合法值清单**，而那份清单会分叉——
-    加一种新规则类型时改了 RULE_TYPES 忘了改枚举，接口就会挡下合法的类型。
-    分叉的代价（新类型永远建不出来）比文档少个下拉框大得多。
-
-【2】同一个商品 + 同一种规则 + 同一个阈值 → 拒绝，不建第二条
-    ★ 这条判据**建成和改成都取自同一处**（`_duplicate_conditions`）：
-      只挡"建成"的话，改一个阈值就能绕过去，防线的形状是漏的。
-
-    和 tasks.py 里"同一个源不重复入队"是同一条理由：**两条一模一样的规则
-    会对同一个价格事件各写一条 alerts、各推一次通知**。
-    状态机只能防住"一条规则重复触发"，防不住"两条规则同时触发"。
-    挡在后端而不是前端，也是同一条理由（前端的防抖挡不住 curl 和第二个标签页）。
-
-    ★★ "挡在后端"这句话本身不够——**后端怎么写才算挡住了**：
-       先查一遍再插入的写法读起来完全正确，但并发下不成立——
-       连点两次提交（不需要恶意，也不需要压测工具）就能插出两条一模一样的规则。
-       改法：把判断塞进 INSERT / UPDATE 语句**自己的 WHERE** 里；
-       完整实测数据与理由见 `_duplicate_exists` 的 docstring。
-       同一个形状在 tasks.py（入队）和 worker.py（认领任务）各有一处，三处是一课。
-
-       `_assert_not_duplicate` 这个函数因此**换了职责**：它不再判定，
-       只在写语句没写进去之后复算原因、提供报错文案。
-       这件事在它的 docstring 里单独记了一笔——"守门的"变成
-       "解释门为什么没开"，是重构里最容易骗过 review 的动作。
-
-【3】改规则 = 重新武装（`state` 回到 `armed`）
-
-    这一条不显眼，但少了它会出现一个**静默的空洞**：
-
-        规则"低于 100 提醒我" → 价格跌到 99 → 触发，state=fired
-        → 用户觉得阈值太低，改成"低于 200 提醒我"
-        → 当前价 99 < 200，条件成立，但 state 还是 fired → **跳过**
-        → 用户以为改完就会响，实际它永远不会响（除非价格先涨回 200 以上）
-
-    改阈值/规则类型，等于换了一个判断条件；改启用状态，等于重新开始看守。
-    两种情况下"之前触发过"这个事实都不再适用，所以一律回到 armed。
-    ★ 代价是改完可能立刻收到一次通知（因为条件当下就成立）——
-      这是对的：用户刚刚亲手要求了"这个条件下提醒我"。
-
-【4】删规则时显式删掉它的 alerts，而**不是**用 ON DELETE CASCADE
-
-    看似应该让数据库级联删，但本项目**没有迁移工具**（建表用 create_all，
-    它不会改动已经存在的表）。于是给模型加上 `ondelete="CASCADE"`
-    只对**新建的库**生效，而 `data/ecom.db` 和别人的库不会变——
-    同一份代码在两台机器上行为不同，正是这个项目反复记录的那类问题。
-
-    所以：显式删，写在代码里，对哪个库都一样。
-    也顺便在响应里说清楚——要保留触发历史就**停用**，别删。
+四个必须在接口层拍板的决定：
+【1】`rule_type` 的合法值来自 `alerts_engine.RULE_TYPES`，不在这里另写一份——
+     代价是 OpenAPI 上它是自由文本框，换来的是一份不会分叉的合法值清单。
+【2】同一个商品 + 同一种规则 + 同一个阈值 → 拒绝；建成和改成都取自同一处判据
+     （`_duplicate_conditions`）——只挡"建成"的话，改一个阈值就能绕过去。
+     ★★ "挡在后端"这句话本身不够——先查一遍再插入的写法读起来完全正确，但并发
+     下不成立；**改法是把判断塞进 INSERT / UPDATE 语句自己的 WHERE 里**。完整
+     实测数据与理由见 `_duplicate_exists` 的 docstring。同一个形状在 tasks.py
+     （入队）和 worker.py（认领任务）各有一处，三处是一课。
+【3】改规则 = 重新武装（`state` 回到 `armed`）：少了它会出现一个**静默的空洞**
+     ——规则"低于 100"触发过、用户改成"低于 200"，条件当下成立但 state 还是
+     fired，于是永远跳过：用户以为改完就会响，实际它永远不会响。
+【4】删规则时显式删掉它的 alerts，而**不是**用 ON DELETE CASCADE：本项目没有
+     迁移工具（建表用 create_all，它不会改动已经存在的表），加上 ondelete 只对
+     **新建的库**生效——同一份代码在两台机器上行为不同。要留历史就停用，别删。
 """
 
 from __future__ import annotations
@@ -93,28 +39,19 @@ from app.db.models import Alert, AlertRule, PriceHistory, Product
 from app.source_scope import apply_source
 from app.alerts_engine import RULE_PRICE_DROP_PCT, RULE_TYPES, check_alerts
 
-# ★ 单独把模块本身也 import 进来，只为了下面那句 OpenAPI 描述能自己写出
-#   真实模块名（`alerts_engine.__name__`），而不是手打一个字符串。
-#   手打的那个名字已经错过一次了：模块从 scraper/ 挪到 app/ 之后，
-#   描述里还写着 `check_alerts.RULE_TYPES`——而这段文字是**面向使用者**的
-#   （它出现在 /docs 的接口说明里），说错了没有任何东西会提醒你。
+# ★ 单独把模块本身也 import 进来，只为了下面那句 OpenAPI 描述能自己写出真实模块名
+#   （`alerts_engine.__name__`）而不是手打一个字符串——手打的那个名字错过一次，
+#   而这段文字是**面向使用者**的，说错了没有任何东西会提醒你。
 from app import alerts_engine
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
-# 规则总数上限。
-#
-# ★ 这不是"怕数据库撑不住"——几百行规则对 SQLite 毫无压力。
-#   限制它的原因是**检查是每 5 分钟一轮的全量扫描**：规则数直接决定
-#   那个周期性动作的代价。给它一个上限，等于给"后台开销"设了一个已知的边界，
-#   而不是"用户加多少就多少"。
-#   真实的告警系统都有这个上限（否则一次配置失误就能让检查跑不完）。
+# 规则总数上限。★ 不是"怕数据库撑不住"，而是**检查是每 5 分钟一轮的全量扫描**：
+# 规则数直接决定那个周期性动作的代价，给它上限等于给后台开销一个已知的边界。
 MAX_RULES = 100
 
 
-# ===========================================================================
-# 请求 / 响应模型
-# ===========================================================================
+# ---- 请求 / 响应模型 ----
 
 
 class RuleCreate(BaseModel):
@@ -249,16 +186,13 @@ class CheckResultOut(BaseModel):
     message: str = ""
 
 
-# ===========================================================================
-# 内部工具
-# ===========================================================================
+# ---- 内部工具 ----
 
 
 def _validate_rule_type(rule_type: str) -> str:
     """校验规则类型，非法就 422 并列出合法取值。
 
-    ★ 非法输入要**说清楚有哪些合法值**。只说"不支持的类型"的话，
-      调用方（包括前端开发者和 curl 的人）得去翻源码才知道该填什么。
+    ★ 非法输入要**说清楚有哪些合法值**，否则调用方得去翻源码才知道该填什么。
     """
     if rule_type not in RULE_TYPES:
         raise HTTPException(
@@ -274,9 +208,9 @@ def _validate_rule_type(rule_type: str) -> str:
 def _validate_threshold(rule_type: str, threshold: float) -> float:
     """跌幅阈值不能超过 100%。
 
-    ★ 跌幅是 (历史最高 - 当前) / 历史最高 × 100，它的上界是 100
-      （当前价为 0 时）。填 150 表示"要跌掉 1.5 倍"——永远不可能成立。
-      挡下来比让它静静地不触发好：后者看起来像"规则在工作，只是还没到"。
+    ★ 跌幅 = (历史最高 - 当前) / 历史最高 × 100，上界是 100（当前价为 0 时）；
+      填 150 永远不可能成立——挡下来比让它静静地不触发好，后者看起来像"规则在
+      工作，只是还没到"。
     """
     if rule_type == RULE_PRICE_DROP_PCT and threshold > 100:
         raise HTTPException(
@@ -291,10 +225,7 @@ def _validate_threshold(rule_type: str, threshold: float) -> float:
 
 
 def _fired_counts(db: Session) -> dict[int, int]:
-    """每条规则触发过几次。
-
-    ★ 一次 group by 查完，不在循环里逐个 count：
-      逐个数是 N+1 查询的经典形态（同 app/alerts_engine.py 里的理由）。
+    """每条规则触发过几次。★ 一次 group by 查完，不在循环里逐个 count（N+1）。
     """
     rows = db.execute(
         select(Alert.rule_id, func.count()).group_by(Alert.rule_id)
@@ -305,21 +236,12 @@ def _fired_counts(db: Session) -> dict[int, int]:
 def _baseline_warning(db: Session, product_id: int, rule_type: str) -> str | None:
     """给"现在配了也不会响"的规则一句提醒（不拦，只提醒）。
 
-    ★ 这一条来自实测数据，不是假想的问题：
-
-        库里 100 个真实商品（source='smzdm'）中，
-        98 个只有【1 个】价格点，2 个没有价格点，**0 个有 2 个以上**。
-        （原因见 docs/可行性评估.md 16.5：抓来的是爆料，同一商品重复爆料才会
-         产生第二个价格点，而那次采集里还没发生。）
-
-      于是给它们配跌幅规则会得到两种安静的失败：
-        · 1 个点 → 基准 = 那唯一的价 = 当前价 → 跌幅恒为 0，永远不触发
-        · 0 个点 → 每轮都记一条"判不了"（这一条至少在报告里看得见）
-
-    ★ 为什么**不拒绝**这种规则：
-      它不是错的，只是**还没到时候**——商品被再次爆料时会多出第二个价格点，
-      那时这条规则立刻就有意义了。拦下来等于禁止用户提前配好。
-      要防的是"用户以为它在看着"，所以照建、但把话说在前面。
+    ★ 实测：库里 100 个真实商品中 98 个只有 **1 个**价格点、2 个没有、**0 个有
+      2 个以上**（见 docs/可行性评估.md 16.5）——跌幅规则会得到两种安静的失败：
+      1 个点 → 基准=那唯一的价=当前价 → 跌幅恒为 0；0 个点 → 每轮记一条"判不了"
+      （这一条至少在报告里看得见）。
+    ★ 不拒绝：它不是错的，只是**还没到时候**——商品被再次爆料时会多出第二个
+      价格点。要防的是"用户以为它在看着"。
     """
     if rule_type != RULE_PRICE_DROP_PCT:
         return None
@@ -385,14 +307,10 @@ def _duplicate_conditions(
 ) -> list[object]:
     """一对"完全相同的规则"要满足的条件。
 
-    ★ **这是这条规则的唯一定义处**——建、改、以及报错时复算，三处都从这里取。
-      各写一遍的后果本文件反复记过：不是"两处实现不一致"，
-      而是**一处有、一处没有**，而防线的形状是漏的。
-
-    ★ 比较是**精确的浮点相等**，不是"差不多"。
-      引入容差就要回答"多接近算一样"，那是个需要解释的魔法数字；
-      而两条阈值相近的规则本来就是用户自己配的，不算错误——
-      真正要防的是"连点两次提交建出两条一模一样的"。
+    ★ **这是这条规则的唯一定义处**——建、改、报错复算三处都从这里取；各写一遍的
+      后果不是"两处实现不一致"，而是**一处有、一处没有**。
+    ★ 比较是**精确的浮点相等**：引入容差就要回答"多接近算一样"，那是魔法数字，
+      而真正要防的只是"连点两次提交建出两条一样的"。
     """
     conditions: list[object] = [
         AlertRule.product_id == product_id,
@@ -414,23 +332,10 @@ def _duplicate_exists(
 ):
     """把上面那组条件变成一个能塞进**写语句的 WHERE** 里的 EXISTS。
 
-    ★ 为什么要塞进写语句里，而不是写在写之前：
-      先查后写（`_assert_not_duplicate(...)` → 没抛异常 → `db.add(...)`）
-      是并发下不成立的——两个请求各自查到"没有重复"，然后各自插入。
-
-      实测（真实文件库，4 个并发 POST /api/alerts/rules，
-      把"查完、还没写"的那条缝隙从微秒级撑到 50ms 以便稳定复现）：
-
-          响应：(200, id=1) (200, id=2) (200, id=3) (200, id=4)
-          库里：4 条一模一样的规则
-
-      ★ 而这是本文件顶部【2】那段承诺想要防的事：两条相同规则会对同一个
-        价格事件各写一条 alerts、各推一次通知——"连点两次提交"就够了，
-        不需要恶意。文件里写着"挡在后端而不是前端"，但先查后写的后端
-        在并发下并不比前端防抖更可靠。
-
-      SQLite 的写是串行的，所以判断一旦落在写语句自己的 WHERE 里，
-      两条语句必然一前一后执行，后到的那条会看到前一条刚提交的行。
+    ★ 为什么不能写在写之前：先查后写在并发下会插出重复行——两个请求各自查到
+      "没有重复"，然后各自插入（实测 4 个并发 POST 插出 4 条一模一样的规则）。
+    ★ 改法是把判断写进 SQL 的 WHERE：SQLite 的写是串行的，两条语句必然一前一后
+      执行，后到的那条会看到前一条刚提交的行。
     """
     return (
         select(literal(1)).where(*_duplicate_conditions(
@@ -452,25 +357,11 @@ def _assert_not_duplicate(
 ) -> None:
     """有完全相同的规则就 409。
 
-    ★ 这个函数的**职责在本轮 review 里变了，必须说清楚**，否则读代码的人
-      会以为防线还是它：它现在**不做判定**，只在写语句没写进去之后
-      **复算一遍原因**（好把"是哪一条重复了"写进报错里）。
-
-      判定已经由 `_duplicate_exists` 塞进写语句的 WHERE 里做完了——
-      真正的防线在数据库那条语句上，这里只是**报错文案的提供者**。
-
-      ★ 这件事值得单独记一笔：一个"检查函数"从"守门的"变成"解释为什么
-        门没开"，是重构里最容易骗过 review 的动作——
-        名字还叫 `_assert_not_duplicate`，调用点也还在，但它的失败
-        不再意味着"挡下来了"，而是"已经挡下来了，现在只是告诉你原因"。
-        所以写语句那边**必须**同时带上 `~_duplicate_exists(...)`，
-        少了它，这里就从"报错"悄悄退化成"唯一的防线"——
-        而那正是这个文件最开始的样子。
-
+    ★ 它现在**不做判定**，只在写语句没插进去之后**复算一遍原因**（把"是哪一条
+      重复了"写进报错）。真正的防线在写语句的 WHERE 上，这里只是**报错文案的
+      提供者**——所以写语句那边**必须**同时带上 `~_duplicate_exists(...)`：少了
+      它，这里就从"报错"悄悄退化成"唯一的防线"，而那正是这个文件最开始的样子。
     ★ 建成和改成都必须走到同一条判据（`_duplicate_conditions`）。
-      只挡"建成"的话，防线可以被绕过：
-        规则 A（商品 5，低于 100）、规则 B（商品 5，低于 150）
-        → 把 A 的阈值改成 150 → **两条一模一样的规则**，谁也没挡住。
     """
     duplicate = db.execute(
         select(AlertRule).where(
@@ -497,10 +388,9 @@ def _assert_not_duplicate(
 def _assert_under_rule_cap(db: Session) -> None:
     """规则总数到上限就 422。
 
-    ★ 和上面那个一样，这个函数现在是**报错文案的提供者**：
-      上限的判定已经塞进 create_rule 的写语句 WHERE 里了
-      （见 `_rule_count_below_cap`）。分开的理由是它原来就在重复检查之前，
-      报错的优先级要保持不变（既超上限又重复时报 422，不是 409）。
+    ★ 它现在只是**报错文案的提供者**：判定已塞进 create_rule 写语句的 WHERE 里
+      （见 `_rule_count_below_cap`）；分开是为了保持报错优先级（既超限又重复时
+      报 422）。
     """
     total = db.scalar(select(func.count()).select_from(AlertRule)) or 0
     if total >= MAX_RULES:
@@ -517,26 +407,22 @@ def _assert_under_rule_cap(db: Session) -> None:
 def _rule_count_below_cap():
     """规则数还没到上限——一个能塞进写语句 WHERE 里的条件。
 
-    ★ 上限也要进写语句，理由是同一个：先数一遍再插入，在并发下
-      可以一起越过上限（虽然要凑够 100 个并发请求才明显，但形状是一样的）。
-      `MAX_RULES` 在这里**每次调用时**读取，不写成默认参数——
-      测试用 monkeypatch 把它改小来验上限，读成默认参数会让那个测试失效。
+    ★ 上限也要进写语句：先数一遍再插入，并发下可以一起越过上限。
+    ★ `MAX_RULES` 在这里**每次调用时**读取而不是默认参数——测试用 monkeypatch
+      改小它来验上限，读成默认参数会让那个测试失效。
     """
     return select(func.count()).select_from(AlertRule).scalar_subquery() < MAX_RULES
 
 
-# ===========================================================================
-# 端点：规则
-# ===========================================================================
+# ---- 端点：规则 ----
 
 
 @router.post("/rules", response_model=AlertRuleOut)
 def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
     """建一条告警规则。
 
-    ★ 新规则一律从 `armed` 开始，所以**如果条件当下就成立，下一轮检查会立刻触发**。
-      这是对的：用户说"低于 200 提醒我"，而它现在就是 180——
-      他需要知道这件事，而不是"等它先涨回去再跌下来"。
+    ★ 新规则一律从 `armed` 开始，所以**条件当下就成立的话，下一轮检查会立刻
+      触发**——用户说"低于 200 提醒我"而它现在就是 180，他需要知道这件事。
     """
     _validate_rule_type(payload.rule_type)
     _validate_threshold(payload.rule_type, payload.threshold)
@@ -547,10 +433,8 @@ def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
             status_code=404, detail=f"没有 id={payload.product_id} 的商品"
         )
 
-    # ★ 一条 SQL 完成"两道检查 + 插入"，不能写成先查后插。
-    #   两道检查是：① 规则数没到上限（MAX_RULES）② 没有一模一样的规则。
-    #   理由（含实测数据）写在 `_duplicate_exists` 的 docstring 里——
-    #   这里是同一个问题的第二处。
+    # ★ 一条 SQL 完成"两道检查 + 插入"（① 规则数没到上限 ② 没有一模一样的规则），
+    #   不能写成先查后插；理由（含实测数据）见 `_duplicate_exists` 的 docstring。
     new_id = db.execute(
         insert(AlertRule)
         .from_select(
@@ -588,10 +472,8 @@ def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
             rule_type=payload.rule_type,
             threshold=payload.threshold,
         )
-        # 两个条件现在都成立，但刚刚那条语句没插进去——
-        # 只可能是有人在这一瞬间并发删了规则（把上限腾出来了 /
-        # 把那条重复的删了）。**不能返回 200**：那等于告诉调用方
-        # "规则建好了"，而实际上库里没有这一行。
+        # 两个条件现在都成立，但那条语句没插进去——只可能是有人在这一瞬间并发删
+        # 了规则。**不能返回 200**：那等于告诉调用方"规则建好了"，而库里没有。
         raise HTTPException(
             status_code=503,
             detail=(
@@ -600,9 +482,8 @@ def create_rule(db: DbDep, payload: RuleCreate) -> AlertRuleOut:
             ),
         )
 
-    # 这里不需要 expire：上面是 Core 插入，会话里没有对应的 ORM 对象，
-    # 所以这次 get 必然真的去查库。（批量 UPDATE 那条路就必须 expire，
-    # 理由见 worker.py 的 recover_stale_tasks——PATCH 那边是那种情况。）
+    # 这里不需要 expire：上面是 Core 插入，会话里没有对应的 ORM 对象。
+    # （批量 UPDATE 那条路就必须 expire，见 worker.py 的 recover_stale_tasks。）
     rule = db.get(AlertRule, new_id)
     assert rule is not None  # 刚插进去的行，除非并发删了
     return _rule_out(
@@ -622,10 +503,8 @@ def list_rules(
     """规则列表，最新的在前。
 
     ★ 一次 join 出商品标题，不做懒加载（N+1）。
-    ★ 支持 `?source=`：这条查询的主表是 alert_rules，但它**join 了 Product
-      且一条规则恰好对应一个商品**，所以过滤 `Product.source` 正好是
-      "只看这个数据源的规则"。这是 apply_source 的第二种合法形状，
-      写在 deps.py 的约定里（那里也写了它不适用的形状）。
+    ★ 支持 `?source=`：主表是 alert_rules，但 join 了 Product 且**一条规则恰好
+      对应一个商品**——apply_source 的第二种合法形状（见 app/source_scope.py）。
     """
     stmt = (
         select(AlertRule, Product)
@@ -665,9 +544,8 @@ def update_rule(
         or (payload.enabled is not None and payload.enabled != rule.enabled)
     )
 
-    # ★ 重置状态放在"有改动"的分支里，而不是无条件执行：
-    #   一个空 PATCH（或者传了和当前值相同的值）不该改变状态机的状态。
-    #   "保存了一下但什么都没改，于是重新武装了"是个很难查的怪事。
+    # ★ 重置状态放在"有改动"的分支里：一个空 PATCH（或传了和当前值相同的值）不该
+    #   改变状态机的状态——"保存了一下但什么都没改，于是重新武装了"是很难查的怪事。
     if changed:
         values: dict[str, object] = {"state": "armed"}
         if new_type != rule.rule_type:
@@ -677,11 +555,9 @@ def update_rule(
         if payload.enabled is not None and payload.enabled != rule.enabled:
             values["enabled"] = payload.enabled
 
-        # ★ "改完不能和别的规则撞成一对"这条判断，塞在 UPDATE 自己的 WHERE 里，
-        #   而不是写在它前面。写成先查后改的话，两个并发 PATCH 会各自
-        #   查到"没撞"，然后各自改——于是又出现两条一模一样的规则。
-        #   形状和 create_rule 那一处完全相同，理由和实测数据见
-        #   `_duplicate_exists` 的 docstring。
+        # ★ "改完不能和别的规则撞成一对"塞在 UPDATE 自己的 WHERE 里，而不是写在
+        #   它前面：先查后改的话，两个并发 PATCH 会各自查到"没撞"然后各自改。
+        #   理由和实测见 `_duplicate_exists`。
         result = db.execute(
             update(AlertRule)
             .where(
@@ -715,10 +591,9 @@ def update_rule(
                 ),
             )
 
-        # ★ 这一行不能省，理由和 worker.py 的 recover_stale_tasks 里那段一样：
-        #   批量 UPDATE **不会**把新值同步到会话里已有的对象上。
-        #   不 expire 的话，下面读到的 rule 还带着改动前的字段——
-        #   响应里会显示旧阈值，而库里已经是新值（"库改对了，读的人看到旧值"）。
+        # ★ 这一行不能省：批量 UPDATE **不会**把新值同步到会话里已有的对象上，不
+        #   expire 的话下面读到的 rule 还是旧值（"库改对了，读的人看到旧值"，
+        #   见 16.10）。
         db.expire_all()
         rule = db.get(AlertRule, rule.id)
         assert rule is not None  # 上面刚确认过它还在
@@ -729,9 +604,8 @@ def update_rule(
         rule,
         product,
         _fired_counts(db).get(rule.id, 0),
-        # ★ 无条件算，不是只在"这次改动使它变成跌幅规则"时算：
-        #   要提示的是"这条规则现在响不了"，和它是哪次改出来的无关。
-        #   （改成跌幅规则和只改跌幅阈值，两条路径都要提示。）
+        # ★ 无条件算，不是只在"这次改动使它变成跌幅规则"时算：要提示的是"这条规则
+        #   现在响不了"，和它是哪次改出来的无关。
         warning=_baseline_warning(db, rule.product_id, rule.rule_type),
     )
 
@@ -740,9 +614,8 @@ def update_rule(
 def delete_rule(db: DbDep, rule_id: int = Path(description="规则 id")) -> dict[str, object]:
     """删一条规则，连同它的触发记录。
 
-    ★ 要保留历史就**停用**（PATCH enabled=false），别删。
-      见文件顶部【4】：这里显式删而不是靠 ON DELETE CASCADE，
-      因为本项目没有迁移工具，级联只对新建的库生效。
+    ★ 要保留历史就**停用**（PATCH enabled=false），别删——显式删而不是靠
+      ON DELETE CASCADE 的理由见文件顶部【4】。
     """
     rule = _get_rule(db, rule_id)
 
@@ -762,9 +635,7 @@ def delete_rule(db: DbDep, rule_id: int = Path(description="规则 id")) -> dict
     }
 
 
-# ===========================================================================
-# 端点：触发记录
-# ===========================================================================
+# ---- 端点：触发记录 ----
 
 
 @router.get("", response_model=AlertListOut)
@@ -775,12 +646,9 @@ def list_alerts(
 ) -> AlertListOut:
     """触发记录，最新的在前。★ 同样支持 `?source=`（理由见 list_rules）。
 
-    ★ 每条的 `rule_type` / `threshold` 取的是**触发时的快照**，不是规则当前的值。
-      理由见 AlertOut 的字段说明——一句话：规则能改，事件不能跟着改。
-
-      `rule` 仍然要 join，但只为了两件事：取 `product_id` 和 `product_title`
-      （商品也会有名字，但那是商品自己的属性，不是"配置"），
-      以及 `?source=` 过滤要走 product 这一层。
+    ★ 每条的 `rule_type` / `threshold` 取**触发时的快照**，不是规则当前值；join
+      `rule` 只为了取 `product_id` / `product_title` 和让 `?source=` 过滤能走
+      product 这一层。
     """
     stmt = (
         select(Alert, AlertRule, Product)
@@ -798,25 +666,10 @@ def list_alerts(
                 rule_id=alert.rule_id,
                 product_id=rule.product_id,
                 product_title=product.title,
-                # ★ 快照优先，没有快照才回退到规则当前值。
-                #
-                #   ★ 判空一律用 `is not None`，**不用 `or`**。
-                #     这两列里 threshold 是浮点数，而 `0.0` 是 falsy——
-                #     写成 `alert.threshold_at_trigger or rule.threshold`
-                #     的话，一条阈值为 0 的历史记录会被当成"没有快照"，
-                #     静默换成一个**别的数字**显示出来。
-                #
-                #     今天库里没有阈值为 0 的规则（实测：alert_rules 只有 1 行，
-                #     price_below / 100.0），POST/PATCH 也把 gt=0 挡在门外。
-                #     所以这不是在修一个已知的坏数据，是在避开一类**看不见**的
-                #     错法：它的表现是界面上显示了一个完全正常的数字，
-                #     没有报错、没有日志、和正确结果长得一模一样。
-                #     多打 6 个字符换掉这种可能性，划算。
-                #
-                #   ★ 走 else 分支的只可能是**加列之前**写下的记录。
-                #     迁移故意不做数据回填（见 app/db/migrate.py 的边界说明），
-                #     所以这里回退到"当前规则值"——也就是回到加列之前的行为，
-                #     而不是编一个值出来冒充快照。
+                # ★ 快照优先，没有快照才回退到规则当前值（加列之前的记录，迁移
+                #   不做数据回填——回退就是回到加列前的行为，不是编一个值）。
+                #   ★ 判空一律用 `is not None`，**不用 `or`**：threshold 可以是
+                #     0.0 而 `or` 会把一条阈值为 0 的历史记录静默换成别的数字。
                 rule_type=(
                     alert.rule_type_at_trigger
                     if alert.rule_type_at_trigger is not None
@@ -837,33 +690,21 @@ def list_alerts(
     )
 
 
-# ===========================================================================
-# 端点：手动查一轮
-# ===========================================================================
+# ---- 端点：手动查一轮 ----
 
 
 @router.post("/check", response_model=CheckResultOut)
 def run_check(db: DbDep) -> CheckResultOut:
     """立刻查一轮，不等 worker 的 5 分钟。
 
-    ★ 为什么这件事**可以**在 Web 进程里做，而采集不行：
-
-      采集不行是因为 Playwright 在 Windows 的 uvicorn 事件循环里必崩
-      （见 scraper/worker.py 的模块注释），而且长任务不能绑在请求上。
-      而告警检查是一次纯数据库的读写，几毫秒就完了，没有这两个问题。
-
-    ★ 那"告警跑在 worker 里"的意义是什么？
-      是**周期性**这件事不该由 Web 层承担，而不是"只有 worker 能碰它"。
-      两个进程同时检查也是安全的：状态转换是带条件的 UPDATE
-      （`WHERE state='armed'`），谁先到谁赢，后到的拿到 0 行、安静退出。
-      正因为如此，手动触发一次是安全的——这恰好也是那条原子性设计
-      给出来的一个额外好处。
-
-    ★ **不接受 `?source=`**，和上面两个列表端点不一样，这是有意的：
-      它是一次**动作**，不是一次查询。让它跟着界面上的数据源开关走，
-      就会出现"我在 mock 视图下点了检查，结果我那条真实商品的规则
-      没被查到"——而且不会有任何提示。检查永远是全量的，
-      返回的报告也是全量的；要看某个数据源的情况，去看列表。
+    ★ 为什么这件事**可以**在 Web 进程里做，而采集不行：采集不行是 Playwright 在
+      Windows 的 uvicorn 事件循环里必崩、长任务不能绑在请求上；告警检查是纯数据库
+      读写，几毫秒就完了。
+    ★ "告警跑在 worker 里"的意义是**周期性**不该由 Web 层承担，而不是"只有 worker
+      能碰它"：状态转换是带条件的 UPDATE（`WHERE state='armed'`），谁先到谁赢，
+      所以两个进程同时检查是**安全**的——手动触发一次同理。
+    ★ **不接受 `?source=`**：它是一次**动作**不是查询——跟着界面上的数据源开关走会
+      出现"我在 mock 视图下点了检查，结果真实商品的规则没被查到"，且没有任何提示。
     """
     report = check_alerts(db)
     return CheckResultOut(

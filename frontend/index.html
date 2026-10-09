@@ -6,30 +6,17 @@
 <title>电商竞品情报分析平台 · 总览</title>
 <link rel="stylesheet" href="static/css/style.css">
 
-<!-- ==========================================================================
-     ECharts 及其本地兜底
-
-     ★ 版本必须是 5.6.0，两个都不能动：
-       · 5.5.1 —— 是网上博客和 AI 生成代码里最常见的版本号，
-                  但实测在 bootcdn / staticfile 上都是 **404**
-       · 6.x   —— echarts-wordcloud 2.1.0 官方兼容声明是 `echarts ^5.0.1`，
-                  升到 6 之后的报错是 "series.wordCloud not exists"，
-                  这句话会把人引去查"是不是插件没引"，而不是"是不是版本不对"
-
-     ★ 兜底为什么用 document.write 而不是动态 appendChild：
-       动态插入的 <script> 默认是**异步**的，后面的脚本会先执行，
-       到那时 echarts 还没到——于是兜底看起来"没生效"。
-       document.write 是在解析期同步插入，能保证顺序。
-       （代价：它会阻塞解析。但这里换来的正是我们要的顺序保证。）
-     ======================================================================= -->
+<!-- ECharts 5.6.0 + 本地兜底。版本不能动：
+     5.5.1 在 bootcdn / staticfile 上是 404；6.x 与 echarts-wordcloud 2.1.0（兼容声明 ^5.0.1）不兼容。
+     兜底用 document.write 而不是 appendChild：动态插入的 <script> 是异步的，后面的脚本会先跑，
+     而 document.write 在解析期同步插入，能保证顺序。 -->
 <script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.6.0/echarts.min.js"></script>
 <script>
   window.echarts || document.write('<script src="vendor/echarts.min.js"><\/script>');
 </script>
 <script src="https://cdn.bootcdn.net/ajax/libs/echarts-wordcloud/2.1.0/echarts-wordcloud.min.js"></script>
 <script>
-  // 插件的 UMD 包装会把自己挂在 `window['echarts-wordcloud']` 上，
-  // 所以用它判断加载是否成功（插件没有提供别的探测方式）。
+  // 插件 UMD 包装把自己挂在 window['echarts-wordcloud'] 上，用它判断加载是否成功。
   window['echarts-wordcloud'] ||
     document.write('<script src="vendor/echarts-wordcloud.min.js"><\/script>');
 </script>
@@ -55,13 +42,7 @@
   <!-- 总览卡片 -->
   <section class="cards" id="cards"></section>
 
-  <!--
-    全局提示条。★ 它承载的是"这个数据源整体上缺了什么"，
-    而不是某一张图缺了什么——单张图的缺失由各自的图内提示负责。
-    两层提示分开，是因为它们回答的问题不同：
-      全局条："这个数据源是什么状态"
-      图内条："这张图为什么是空的"
-  -->
+  <!-- 全局提示条：承载"这个数据源整体上缺了什么"（单张图的缺失由图内提示负责）。 -->
   <div class="notice" id="global-notice"></div>
 
   <section class="charts">
@@ -104,19 +85,9 @@
 <script src="static/js/api.js"></script>
 <script src="static/js/charts.js"></script>
 <script>
-/* ============================================================================
- * 页面装配
- *
- * 整体是"先渲染骨架、再并发拉数据"：
- * 五个接口之间没有依赖，串行等会让首屏慢 5 倍。
- * ========================================================================== */
+/* 页面装配：先渲染骨架、再并发拉数据——五个接口互不依赖，串行等会让首屏慢 5 倍。 */
 
-/** 渲染数据源切换按钮。
- *
- *  ★ 计数来自 /api/stats/sources，所以"两个数据源各有多少条"
- *    在界面上是**可见**的——这是"双数据源隔离"最直接的证据，
- *    比在 README 里写一段话有力得多。
- */
+/** 渲染数据源切换按钮。计数来自 /api/stats/sources——让"双数据源各有多少条"在界面上可见。 */
 async function renderSwitcher() {
   const box = document.getElementById('source-switcher');
   const active = currentSource();
@@ -126,8 +97,7 @@ async function renderSwitcher() {
     const data = await apiGet('/api/stats/sources');
     for (const s of data.sources) counts[s.source] = s.product_count;
   } catch (err) {
-    // 拿不到计数不影响切换功能，按钮上不显示数字就行。
-    // ★ 不在这里弹错误：接口本身还能用，弹一个红框只会让人以为整个服务挂了。
+    // 拿不到计数不影响切换功能，按钮上不显示数字即可；不弹错误框（接口本身还能用）。
     console.warn('数据源清单加载失败，切换按钮将不显示计数', err);
   }
 
@@ -136,9 +106,7 @@ async function renderSwitcher() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.setAttribute('aria-pressed', String(s.id === active));
-    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 一处——
-    //   这里原本自己求和，另外两页写 counts['all']（恒 undefined），
-    //   于是同一个按钮在四个页面上有四种表现。见那个函数的注释。
+    // "全部"的计数规则只在 api.js 的 sourceCount 一处（原先四页各写一遍、表现不一）。
     const n = sourceCount(s.id, counts);
     btn.innerHTML = n === undefined
       ? s.label
@@ -149,7 +117,7 @@ async function renderSwitcher() {
     btn.onclick = () => {
       if (s.id === currentSource()) return;
       setSource(s.id);
-      location.reload();   // 简单直接：重新拉一遍所有数据
+      location.reload();
     };
     box.appendChild(btn);
   }
@@ -168,9 +136,8 @@ function renderCards(ov) {
         ? `均 ${(ov.price_point_count / ov.product_count).toFixed(1)} 点/商品` : '—' },
     { label: '价格中位数', value: price ? fmtPrice(price.median) : '—',
       sub: price ? `${fmtPrice(price.min)} ~ ${fmtPrice(price.max)}` : '无数据' },
-    // ★ 销量这一格是"数据源差异"最直观的体现：
-    //   Mock 有，真实采集没有。空着 + 一句说明，而不是显示 0——
-    //   显示 0 会被读成"一件都没卖出去"，那是完全不同的事实。
+    // 销量是"数据源差异"最直观的体现：Mock 有、真实采集没有。空着 + 说明，而不是显示 0——
+    // 显示 0 会被读成"一件都没卖出去"，那是完全不同的事实。
     ov.has_sales
       ? { label: '销量合计', value: fmtInt(ov.sales.total),
           sub: `最高单品 ${fmtInt(ov.sales.max)}` }
@@ -185,15 +152,8 @@ function renderCards(ov) {
     </div>`).join('');
 }
 
-/** 并发拉取 4 张图的数据。
- *
- *  ★ 用 Promise.all 而不是 await 四次：四个接口互不依赖，
- *    串行的话首屏时间等于四者之和。
- *  ★ 但**任何一个失败都不该让整页白屏**——所以不是 Promise.all 直接
- *    抛错，而是每张图各自 catch 后把自己的空态显示出来。
- *    第一版是裸的 Promise.all，结果 onerror 一挂整页什么都不显示，
- *    而控制台只有一个错，很容易以为是接口全挂了。
- */
+/** 并发拉取 4 张图的数据：Promise.all 并发（串行会让首屏等于四者之和）；
+ *  但每个各自 catch——任一失败只显示自己的空态，不让整页白屏。 */
 async function loadCharts() {
   const jobs = [
     ['/api/stats/price-distribution', renderPriceDistribution,
@@ -226,12 +186,8 @@ async function loadCharts() {
     renderCards(ov);
     showNotice('global-notice', ov.notice);
   } catch (err) {
-    // ★ err.message 也要转义。它不是我们写的句子：api.js 会把后端的
-    //   `detail` 原样带进来，而 FastAPI 的 422 里那个结构包含
-    //   `"input": <请求里传的原值>`——也就是说这串文字里可能出现
-    //   别处来的内容。目前没有能把 URL 参数喂到这里的路径
-    //   （?source= 和 ?product_id= 都在读进来时就校验/转数字了），
-    //   所以这条现在是防御性的；但"来源不是自己"这一点不会变。
+    // err.message 也要转义：api.js 会把后端 detail 原样带过来（FastAPI 422 里含请求原值），
+    // 来源不是我们自己写的句子。
     document.getElementById('cards').innerHTML =
       `<div class="card"><div class="label">加载失败</div>
        <div class="value">—</div><div class="sub">${escapeHtml(err.message)}</div></div>`;

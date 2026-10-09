@@ -1,21 +1,12 @@
 """Mock 采集源测试。
 
-================================================================================
-这份测试守的是一条【性质】，不是几个数字
-================================================================================
-Mock 源的全部价值在于它可以和 `seed.py` 的直写路径**收敛到同一个库状态**。
-这不是"能跑就行"，而是一条可以被推翻的断言：
+守的是一条【性质】：Mock 源的全部价值在于能和 seed.py 的直写路径**收敛到同一个库状态**——
+"同一个 (count, days, seed_value)，不管 seed 直写还是走采集管道，得到同一批商品、
+同样的标题、同样的价格"。一旦不成立，`?source=mock` 下的统计会因为"数据从哪个入口进来"
+而不同，而这种差异极难排查：两个入口单看都是对的。
 
-    "同一个 (count, days, seed_value)，不管是 seed 直写还是走采集管道，
-     得到的是同一批商品、同样的标题、同样的价格。"
-
-一旦这条不成立，`?source=mock` 下的统计就会因为"数据是从哪个入口进来的"
-而不同——而这种差异极难排查，因为两个入口单看都是对的。
-
-★ 为什么用【默认参数】对齐 seed 的生成器，而不是自己挑一组小参数：
-  随机数流的对齐要求走完 `build_products(rng, count, days)` 的完整循环。
-  传 count=20 得到的第 21 条产品和 seed 的第 21 条不是同一个——
-  价格序列、销量、店铺全会错位。所以对齐只能用默认值。
+★ 对齐只能用【默认参数】：随机数流的对齐要求走完 `build_products(rng, count, days)` 的完整循环，
+传 count=20 得到的第 21 条和 seed 的第 21 条不是同一个（价格序列、销量、店铺全错位）。
 """
 
 from __future__ import annotations
@@ -39,23 +30,20 @@ from scraper.sources.mock import PER_PAGE, MockSource
 def seed_products() -> list[dict]:
     """seed.py 同一套参数生成的商品，用来做对齐基准。
 
-    ★ 这里重跑一遍 build_products，而不是去问 seed() 要——
-      seed() 会清库写库，而这条测试要验证的恰恰是"生成器本身的输出"。
+    ★ 重跑一遍 build_products 而不是去问 seed() 要——seed() 会清库写库，
+    而这里要验证的恰恰是"生成器本身的输出"。
     """
     rng = np.random.default_rng(DEFAULT_SEED)
     return build_products(rng, DEFAULT_PRODUCT_COUNT, DEFAULT_DAYS)
 
 
-# ===========================================================================
 # 与 seed 生成器对齐
-# ===========================================================================
 
 
 def test_first_page_matches_seed_generator_exactly(seed_products):
-    """★ 前 20 条必须和 seed 生成的逐字节一致（除 recorded_at）。
+    """★ 前 20 条必须和 seed 生成的逐字段一致（除 recorded_at）。
 
-    这是整个文件最重要的一条。不成立的话，Mock 采集会在
-    `?source=mock` 下造出第二批商品，或者拿错位的价格去覆盖 seed 的数据。
+    不成立的话，Mock 采集会在 `?source=mock` 下造出第二批商品，或拿错位的价格覆盖 seed 的数据。
     """
     _layer, deals, _stats = MockSource().fetch(pages=1)
 
@@ -74,12 +62,9 @@ def test_first_page_matches_seed_generator_exactly(seed_products):
 def test_deals_carry_sales_and_shop(seed_products):
     """★ Mock 源必须带销量和店铺——这是它和 SMZDM 源最大的不同。
 
-    SMZDM 好价页整页没有"已售"/"销量"字样（见 docs 发现 2），
-    所以真实数据的 sales 恒为 NULL、店铺占比饼图在 ?source=smzdm 下是空的。
-    Mock 数据的价值就是把这些图撑起来。
-
-    ★ 这两个字段是 RawDeal 上的可选字段，不是 ingest 里的分支——
-      管道不该知道"哪个源没有销量"。
+    SMZDM 好价页没有"已售"/"销量"字样，所以真实数据的 sales 恒为 NULL、
+    店铺占比饼图在 ?source=smzdm 下是空的；Mock 数据的价值就是把这些图撑起来。
+    ★ 这两个字段是 RawDeal 上的可选字段，不是 ingest 里的分支——管道不该知道"哪个源没有销量"。
     """
     _layer, deals, _stats = MockSource().fetch(pages=2)
 
@@ -89,14 +74,11 @@ def test_deals_carry_sales_and_shop(seed_products):
 
 
 def test_price_raw_round_trips_through_cleaner(seed_products):
-    """★ 价格必须是**原文**，而且洗回来要和原值完全相同。
-
-    这是"转换刻意倒着走"那一步的验收：把已经算好的浮点价格重新写成
-    `"199.9元"`，好让下游的 cleaner.parse_price 真正跑一遍。
+    """★ 价格必须是**原文**，而且洗回来要和原值完全相同——"转换刻意倒着走"那一步的验收：
+    把算好的浮点价格重新写成 `"199.9元"`，让下游 cleaner.parse_price 真正跑一遍；
     直接塞浮点就绕过了清洗层，而那正是要被验证的东西。
 
-    ★ 用 `:g` 而不是 `:%.2f` 格式化：149.90 洗回来也是 149.9，
-      数值一样，但 `:g` 不引入"两位小数"这个源站并不存在的约定。
+    ★ 用 `:g` 而不是 `:%.2f`：149.90 洗回来也是 149.9，但 `:g` 不引入"两位小数"这个源站没有的约定。
     """
     _layer, deals, _stats = MockSource().fetch(pages=1)
 
@@ -116,13 +98,8 @@ def test_price_raw_round_trips_through_cleaner(seed_products):
 def test_repeated_fetch_agrees_on_identity(seed_products):
     """两次 fetch 的商品身份/标题/价格完全一致。
 
-    ★ 断言的是"前一组字段"，不是整个 RawDeal——
-      recorded_at 每次都不同（它是抓取时刻），
-      写成 `fetch(...) == fetch(...)` 会因为时间戳而假红。
-      我第一版就是这么写的，跑出来才发现。
-
-      这里逐字段比对，就是为了让"到底哪部分确定、哪部分不确定"
-      在测试里写得明明白白，而不是靠一句 `==` 含糊过去。
+    ★ 断言的是"前一组字段"不是整个 RawDeal——recorded_at 每次都不同（它是抓取时刻），
+    写成 `fetch(...) == fetch(...)` 会因为时间戳而假红。
     """
     first = MockSource().fetch(pages=2)[1]
     second = MockSource().fetch(pages=2)[1]
@@ -138,12 +115,9 @@ def test_repeated_fetch_agrees_on_identity(seed_products):
 
 
 def test_repeated_fetch_uses_fresh_rng(seed_products):
-    """★ 每次 fetch 都重新建 rng —— 用同一个 rng 连着取两次会错位。
-
-    如果实现里把 rng 存成实例属性，第二次调用拿到的是随机数流里
-    靠后的位置，产出完全不同的数据。这条测试就是钉住这个的：
-    第一页和第二页的内容必须不同（证明 rng 在前进），
-    但两次"第一页"必须相同（证明每次重新开始）。
+    """★ 每次 fetch 都重新建 rng——用同一个 rng 连着取两次会错位（把 rng 存成实例属性
+    就会这样：第二次调用拿到随机数流里靠后的位置，产出完全不同的数据）。
+    第一页和第二页必须不同（rng 在前进），但两次"第一页"必须相同（每次重新开始）。
     """
     src = MockSource()
     page1 = src.fetch(pages=1)[1]
@@ -156,27 +130,21 @@ def test_repeated_fetch_uses_fresh_rng(seed_products):
 
 
 def test_different_seed_value_gives_different_data():
-    """换个种子就该是另一批数据。
-
-    少了这条，一个"永远返回同一份写死数据"的实现也能通过上面所有测试。
-    """
+    """换个种子就该是另一批数据——少了这条，"永远返回同一份写死数据"的实现也能通过上面所有测试。"""
     a = MockSource(count=100, seed_value=1).fetch(pages=1)[1]
     b = MockSource(count=100, seed_value=2).fetch(pages=1)[1]
 
     assert [d.title for d in a] != [d.title for d in b]
 
 
-# ===========================================================================
 # 分页与统计
-# ===========================================================================
 
 
 def test_page_count_is_capped_by_dataset_size():
     """请求的页数超过数据集大小时，pages_ok 按**实际产出**算。
 
-    ★ 不这么做的话，一个小 count 的源在"抓 100 页"时会报"100 页成功"，
-      而实际只有 1 页有数据。这个数字会显示在任务进度里，
-      假的进度比没有进度更糟——它会让人以为采集在正常工作。
+    ★ 否则小 count 的源"抓 100 页"会报"100 页成功"而实际只有 1 页有数据——
+    这个数字显示在任务进度里，**假的进度比没有进度更糟**，它会让人以为采集在正常工作。
     """
     src = MockSource(count=30, seed_value=7)
 
@@ -201,9 +169,8 @@ def test_all_deals_returns_full_dataset():
 def test_zero_pages_is_rejected():
     """pages < 1 直接报错，而不是"安静地返回空列表"。
 
-    ★ 静默返回空的后果：任务会显示 success、progress 100%、
-      消息是"没有解析到任何爆料（页面结构可能变了）"——
-      而真相是调用方传错了参数。排查方向会被完全带偏。
+    ★ 静默返回空的后果：任务显示 success、progress 100%、消息是"没有解析到任何爆料
+    （页面结构可能变了）"——而真相是调用方传错了参数，排查方向被完全带偏。
     """
     with pytest.raises(ValueError):
         MockSource().fetch(pages=0)
@@ -212,8 +179,8 @@ def test_zero_pages_is_rejected():
 def test_source_is_offline_and_declares_itself():
     """Mock 源必须自称 'mock'，且 stats.layer 说明数据来自内存。
 
-    layer 是"数据是哪一层给的"的答案。SMZDM 那边可能是 html 或 browser，
-    这里是 memory——看到 memory 就知道这批数据没经过网络。
+    layer 回答"数据是哪一层给的"：SMZDM 可能是 html 或 browser，这里是 memory——
+    看到 memory 就知道这批数据没经过网络。
     """
     src = MockSource()
 
@@ -227,32 +194,21 @@ def test_source_is_offline_and_declares_itself():
 def test_source_satisfies_datasource_protocol():
     """运行时检查：MockSource 确实长得像 DataSource。
 
-    ★ 这是 base.py 选 Protocol 而不是 ABC 的理由的实测——
-      MockSource 没有继承任何东西，只要求"长得像"。
+    ★ base.py 选 Protocol 而不是 ABC 的理由的实测——MockSource 没有继承任何东西，只要求"长得像"。
     """
     from scraper.base import DataSource
 
     assert isinstance(MockSource(), DataSource)
 
 
-# ===========================================================================
 # ★★ 收敛：两个入口写出来的库状态必须一致
-#
-# 上面几节验的是"MockSource 吐出的 RawDeal 和 seed 生成器一致"，
-# 那是**内存里**的一致。这一节验的是**库里**的一致——
-# 也就是本文件开头那条性质的完整形态：
-#
-#     "同一个 (count, days, seed_value)，不管是 seed 直写还是走采集管道，
-#       得到的是同一批商品、同样的标题、同样的价格。"
-#
-# 内存一致 ≠ 库里一致：中间还隔着 clean_deal、归并判定、两张表的 upsert。
-# 那一段才是真正会出事的地方，而它的失败方式是**静默的**——
-# 采集"没归并上"只是多出 100 个商品，没有任何报错。
-# ===========================================================================
 
-# 这一节要跑完整的 seed + 采集，1000 × 90 天太慢，用小参数。
-# ★ count/days 必须【两边传同一组】，因为随机数流的对齐要求走完
-#   build_products 的完整循环（见文件顶部说明）。
+
+# 上面几节验的是**内存里**的一致（MockSource 吐的 RawDeal 和 seed 生成器一致）；
+# 这一节验的是**库里**的一致——中间还隔着 clean_deal、归并判定、两张表的 upsert，
+# 那一段才是真正会出事的地方，而它的失败方式是**静默的**（"没归并上"只是多出 100 个商品）。
+# 跑完整的 seed + 采集 1000 × 90 天太慢，用小参数；count/days 必须【两边传同一组】
+# （随机数流的对齐要求走完 build_products 的完整循环，见文件顶部说明）。
 _PROBE_COUNT = 100
 _PROBE_DAYS = 30
 
@@ -285,19 +241,14 @@ def _products_snapshot(db) -> dict[str, tuple]:
 def test_crawl_converges_with_seed_direct_write(db):
     """★★ 全文件最重要的一条：seed 直写 → 采集 → 商品表逐字段不变。
 
-    这个测试是 MockSource 存在的**全部理由**的验收。
-    它不成立的话，演示时点一下"采集"就会在库里造出第二批商品，
-    而两次看统计图得到的数字不同——**取决于你上次点没点采集**。
+    这是 MockSource 存在的**全部理由**的验收：不成立的话，演示时点一下"采集"
+    就会在库里造出第二批商品，两次看统计图得到的数字不同——**取决于你上次点没点采集**。
+    实测（count=100, days=30, seed=20260928）：报告"新商品 0，刷新 100，新增价格点 100"，
+    商品表 100 行 → 100 行、**0 处差异**。
 
-    实测（count=100, days=30, seed=20260928）：
-        采集报告  "解析 100 条，新商品 0，刷新 100，新增价格点 100"
-        商品表    100 行 → 100 行，**0 处差异**
-
-    ★ 走的是"刷新"分支而不是"归并"分支，这本身就是正确的：
-      同一批次生成的数据里，每条爆料的 source_id 和库里商品的 source_id
-      完全相同（都是 mock-000xx），`resolve_target` 的**形态 ①**
-      一眼就认出来了，根本不需要进相似度比对。
-      这也是 resolve_target 存在的意义——能确定的事不靠猜。
+    ★ 走"刷新"分支而不是"归并"分支本身就是正确的：同一批数据里每条爆料的 source_id
+    和库里商品的完全相同（都是 mock-000xx），`resolve_target` 的**形态 ①**一眼认出，
+    根本不需要进相似度比对——能确定的事不靠猜。
     """
     from scraper import ingest, seed
 
@@ -335,17 +286,11 @@ def test_crawl_converges_with_seed_direct_write(db):
 def test_crawl_observes_now_while_seed_owns_the_history(db):
     """★ 商品表收敛，但 price_history **必然不同**——而这个不同是对的。
 
-    两边"谁有资格写历史"是不一样的：
+    两边"谁有资格写历史"不一样：seed 直写有生成器的特权，一次造出 90 天完整序列
+    （source_ref 为 NULL）；采集只能观测"此刻"、一次采一条——所以采集后价格点**多出 count 条**。
 
-        seed 直写   有生成器的特权，一次造出 90 天的完整序列（source_ref 为 NULL）
-        采集        只能观测"此刻"，一次采一条
-
-    所以采集之后价格点会**多出 count 条**，一条商品一条。
-
-    ★ 如果哪天这条断言失败了，先别改测试，先想清楚是哪一边变了：
-        · 变成"多出 0 条"  → 采集的价格点被唯一约束吃掉了，
-                            多半是有人给 source_ref 填了值
-        · 变成"多出 100 条以上" → 归并/刷新把同一条爆料写了两遍
+    ★ 若哪天断言失败，先别改测试，先想清楚是哪一边变了：变成"多出 0 条"→ 采集的价格点
+    被唯一约束吃掉了（多半有人给 source_ref 填了值）；变成"多出 100 条以上"→ 归并/刷新写了两遍。
     """
     from scraper import ingest, seed
 
@@ -355,10 +300,8 @@ def test_crawl_observes_now_while_seed_owns_the_history(db):
     ).scalar_one()
     assert seeded_points == _PROBE_COUNT * _PROBE_DAYS
 
-    # ★ seed 的价格点 source_ref 全是 NULL。
-    #   这不是"忘了填"，而是 Mock 数据的本质：它没有"爆料 id"这个东西。
-    #   而 SQLite 的 UNIQUE 把多个 NULL 视为互不相同，
-    #   所以同一商品的多条历史不会被唯一约束挡住。
+    # ★ seed 的价格点 source_ref 全是 NULL，不是"忘了填"——Mock 数据没有"爆料 id"这个东西；
+    #   SQLite 的 UNIQUE 把多个 NULL 视为互不相同，所以同一商品的多条历史不会被挡住
     nulls = db.execute(
         select(func.count())
         .select_from(PriceHistory)
@@ -377,17 +320,16 @@ def test_crawl_observes_now_while_seed_owns_the_history(db):
     )
     assert report.prices_new == _PROBE_COUNT
 
-    # ★ 采集写进去的那条带着 source_ref（= 源站 id），和 seed 的 NULL 区分开。
-    #   这正是两种来源在同一张表里能共存的原因。
+    # ★ 采集写进去的那条带着 source_ref（= 源站 id），和 seed 的 NULL 区分开——
+    #   这正是两种来源能在同一张表里共存的原因
     crawled = db.execute(
         select(PriceHistory.recorded_at, PriceHistory.price)
         .where(PriceHistory.source_ref == "mock-00000")
     ).all()
     assert len(crawled) == 1, "同一条爆料被写了两遍"
 
-    # ★ 采集的那一刻比 seed 序列的最后一天更晚——
-    #   seed 的序列结束在 start + (days-1) = now - 1 天。
-    #   所以采集点确实"更新"，它会成为趋势图上最新的那个点。
+    # ★ 采集那一刻比 seed 序列的最后一天更晚（seed 结束在 start + (days-1) = now - 1 天），
+    #   所以采集点确实"更新"，它会成为趋势图上最新的那个点
     last_seeded = db.execute(
         select(func.max(PriceHistory.recorded_at)).where(
             PriceHistory.source_ref.is_(None)
@@ -395,8 +337,8 @@ def test_crawl_observes_now_while_seed_owns_the_history(db):
     ).scalar_one()
     assert crawled[0].recorded_at > last_seeded
 
-    # ★ 而且采集点的价格 = seed 写在 products.price 上的那个值。
-    #   两边对不上，趋势图末端和列表页就会显示两个数。
+    # ★ 而且采集点的价格 = seed 写在 products.price 上的那个值；
+    #   两边对不上，趋势图末端和列表页就会显示两个数
     assert crawled[0].price == pytest.approx(
         db.execute(
             select(Product.price).where(Product.source_id == "mock-00000")

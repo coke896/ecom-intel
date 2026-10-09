@@ -6,13 +6,7 @@
 <title>电商竞品情报分析平台 · AI 分析</title>
 <link rel="stylesheet" href="static/css/style.css">
 
-<!-- ==========================================================================
-     这一页**不引 ECharts**。
-
-     不是省事，是这一页确实一张图都没有——报告是文字。
-     多引一个 1MB 的库只会让页面变慢，而它一行都用不上。
-     （对比 index.html / products.html：那两页引了 ECharts + 本地兜底。）
-     ========================================================================== -->
+<!-- 这一页不引 ECharts：一张图都没有（报告是文字），多引一个 1MB 的库只会让页面变慢。 -->
 </head>
 
 <body>
@@ -46,52 +40,30 @@
       <span class="muted" id="status"></span>
     </div>
 
-    <!-- 这一层承载"为什么现在没有报告"，而不是"报告本身有问题"。
-         和 index.html 的分层一样：整体状态和局部状态分开。 -->
+    <!-- 这一层承载"为什么现在没有报告"（整体状态和局部状态分开）。 -->
     <div class="notice" id="page-notice"></div>
 
     <!-- 报告正文挂载点 -->
     <div id="report"></div>
 
-    <!-- 空态。★ 初始就显示，因为"页面刚打开、还没有报告"是最常见的状态。 -->
+    <!-- 空态：初始就显示，因为"页面刚打开、还没有报告"是最常见的状态。 -->
     <div class="empty-state show" id="empty">还没有生成过分析报告。点上面的按钮即可。</div>
   </div>
 </main>
 
 <script src="static/js/api.js"></script>
 <script>
-/* ============================================================================
- * 分析报告页
- *
- * ---------------------------------------------------------------------------
- * ★ 一条安全规则，全文件都遵守：报告正文一律用 `textContent` 渲染，
- *   **绝不拼 innerHTML**。
- *
- *   报告是模型生成的，而模型读到的输入里包含**采集来的商品标题**。
- *   也就是说，任何能被写进商品标题的东西（"<img src=x onerror=...>"）
- *   都有可能被模型原样复述到报告里——而如果这串东西被当成 HTML 解析，
- *   它就在我们自己的页面上执行了。
- *
- *   这条路径不是假想的：数据来源是外部网站，标题不由我们控制。
- *   用 textContent 之后这个口子从根上不存在——它没有"要不要转义"的判断，
- *   因为它根本不解析 HTML。
- *
- * ---------------------------------------------------------------------------
- * 页面状态只有三个字段，但每一个都对应一个真实会出问题的地方：
- * ========================================================================== */
+/* 分析报告页。
+ * 安全规则（全文件）：报告正文一律用 textContent 渲染，绝不拼 innerHTML——
+ * 报告是模型生成的，而模型读到的输入包含采集来的商品标题（不由我们控制），
+ * 当 HTML 解析就等于在自己页面上执行别人写的脚本。 */
 
 const state = {
-  // 正在请求中。★ 必须有：一次生成要 10~30 秒，没有它用户会反复点按钮，
-  //   而**每一次点击都是一次真实的付费调用**。
+  // 请求中标志：一次生成要 10~30 秒，没有它用户会反复点——每次点击都是真实付费调用。
   busy: false,
 
-  // 屏幕上这份报告是**按哪个数据源**生成的。null 表示"不知道"。
-  // ★ 这是本页最容易出错的地方：报告表里没有 source 列（设计如此，
-  //   理由见 app/api/analysis.py 里 get_latest_report 的注释），
-  //   所以从 `latest` 拿到的报告无法知道它是给哪个数据源生成的。
-  //   用户切到 smzdm 之后，屏幕上留着的可能还是一份按 mock 数据写的报告——
-  //   而报告里会写着"销量最高的商品是……"，在 smzdm 上根本不成立。
-  //   这时**必须说话**，不能让用户对着错的报告做判断。
+  // 屏幕上这份报告对应的数据源；null = 不知道（报告表里没有 source 列，设计如此）。
+  // 切换后屏幕上可能是别的数据源的报告——必须说话，不能让用户对着错的报告做判断。
   reportSource: null,
 
   // 有没有报告正在显示。
@@ -108,7 +80,7 @@ const emptyEl = document.getElementById('empty');
  * 小工具
  * ------------------------------------------------------------------------ */
 
-/** 建一个元素。★ 第三个参数走 textContent，不是 innerHTML（见文件头的规则）。 */
+/** 建一个元素。第三个参数走 textContent，不是 innerHTML（见文件头的规则）。 */
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -120,15 +92,11 @@ function setStatus(text) { statusEl.textContent = text || ''; }
 
 function setBusy(busy, message) {
   state.busy = busy;
-  // ★ 两个按钮**一起**禁用。只禁用一个的话，用户在"生成"转圈时点「强制重算」
-  //   会发出第二个请求，两个请求同时跑、各花一次 token，最后谁赢看运气。
+  // 两个按钮一起禁用：只禁一个的话，用户在转圈时点「强制重算」会并发两个请求、各花一次 token。
   runBtn.disabled = busy;
   rerunBtn.disabled = busy;
-  // ★ 只有**明确给了文案**才动状态栏，不能写成 `setStatus(message || '')`。
-  //   后者的问题：generate() 结尾是 `finally { setBusy(false) }`，
-  //   而它上一句刚写下"分析完成，本次消耗 N token"——
-  //   两行在同一个 tick 里跑，那句话写完立刻被自己的 finally 擦成空串，
-  //   用户永远看不到。而"这次花了多少 token"恰恰是这一页最该让人看到的数字。
+  // 只有明确给了文案才动状态栏：写成 setStatus(message || '') 的话，
+  // generate() 的 finally 会把刚写下的"消耗 N token"在同一 tick 里擦成空串。
   if (message !== undefined) setStatus(message);
 }
 
@@ -140,9 +108,7 @@ function showNotice(text, kind) {
   box.classList.add('show');
 }
 
-/* ---------------------------------------------------------------------------
- * 数据源切换器（和另外两页同一个实现，计数来自接口）
- * ------------------------------------------------------------------------ */
+/* 数据源切换器（和另外两页同一个实现，计数来自接口） */
 
 async function renderSwitcher() {
   const box = document.getElementById('source-switcher');
@@ -158,10 +124,7 @@ async function renderSwitcher() {
     const btn = el('button');
     btn.type = 'button';
     btn.textContent = s.label;
-    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 那一处。
-    //   这里原本写的是 `counts[s.id]`，而接口**不返回** all 这一项
-    //   （它按库里实际存在的 source 逐条返回）——于是「全部」按钮上
-    //   一直不显示数字，另外两页却显示。同一件事两种表现。
+    // "全部"的计数规则在 api.js 的 sourceCount 一处（接口不返回 all 项，原先恒不显示数字）。
     const n = sourceCount(s.id, counts);
     if (n !== undefined) {
       btn.appendChild(el('span', 'count', n));
@@ -171,9 +134,7 @@ async function renderSwitcher() {
     btn.addEventListener('click', () => {
       setSource(s.id);
       renderSwitcher();
-      // ★ 切换数据源**不重新加载报告**，而是重新判断"屏幕上这份还对不对"。
-      //   直接清空会更省事，但那样用户一切换就丢失了正在看的内容；
-      //   而多数时候他只是在对比两个数据源，报告还是想留着的。
+      // 切换数据源不重新加载报告，只重新判断"屏幕上这份还对不对"——直接清空会丢失用户正在看的内容。
       onSourceChanged();
     });
     box.appendChild(btn);
@@ -224,10 +185,7 @@ function renderReport(data) {
 
   reportEl.appendChild(el('div', 'report-headline', c.headline || '（这份报告没有一句话结论）'));
 
-  // ---- 元信息 ----
-  // ★ 这些是给**排查**用的，不是给用户读的。放在正文上方一行小字里，
-  //   因为"报告怎么和上次不一样"是这类页面最常见的问题，
-  //   而指纹/模型/token 三个数字恰好能回答其中的大部分。
+  // ---- 元信息：给排查用的，"报告怎么和上次不一样"靠指纹/模型/token 三个数字回答。
   const meta = el('div', 'kv');
   const pairs = [
     ['生成时间', fmtTime(data.created_at)],
@@ -251,9 +209,7 @@ function renderReport(data) {
     box.appendChild(el('h3', null, sec.title));
     box.appendChild(el('p', null, sec.finding));
     if (sec.evidence) {
-      // ★ 依据单独排版（等宽字体 + 左边框）。这个视觉区分是有意的：
-      //   报告最常见的失败是"结论和数字对不上"，
-      //   分开之后一眼就能看出这句判断的依据是什么、能不能对上。
+      // 依据单独排版（等宽 + 左边框）：报告最常见的失败是"结论和数字对不上"，分开一眼可查。
       box.appendChild(el('p', 'report-evidence', sec.evidence));
     }
     reportEl.appendChild(box);
@@ -263,15 +219,13 @@ function renderReport(data) {
   const groups = [
     ['opportunities', '机会点', ''],
     ['risks', '风险', ''],
-    // ★ 「数据限制」放最后，而且给它最重的样式。理由见 style.css 里那段注释：
-    //   它是这份报告最诚实的地方，也正是这个项目最想展示的东西。
+    // 「数据限制」放最后且样式最重：它是这份报告最诚实的地方。
     ['data_limits', '这批数据支撑不了什么结论', 'limits'],
   ];
   const lists = el('div', 'report-lists');
   for (const [key, title, cls] of groups) {
     const items = c[key] || [];
-    // 空列表直接不渲染。渲染一个空的「风险」小节会让人以为"没有风险"，
-    // 而实际含义是"模型没提"——这两件事不一样，宁可不显示。
+    // 空列表不渲染：渲染一个空的「风险」会读成"没有风险"，实际含义是"模型没提"。
     if (!items.length) continue;
     const box = el('div', 'report-list' + (cls ? ' ' + cls : ''));
     box.appendChild(el('h4', null, title));
@@ -289,11 +243,8 @@ function renderNoticeOnly(data) {
   reportEl.replaceChildren();
   emptyEl.classList.add('show');
   emptyEl.textContent = data.notice || '暂无报告。';
-  // ★ 这里**不**清 page-notice（原本有一句 showNotice('', '')，是错的）。
-  //   空态文案属于报告区（就是上面那行），而 page-notice 装的是
-  //   "服务本身出了什么事"（比如没配 key）——两根不同的轴。
-  //   共用一个格子就会互相擦，而被擦掉的那条恰恰是解释
-  //   "按钮为什么是灰的"那条。见下面 init() 里的顺序。
+  // 这里不清 page-notice：空态文案属于报告区，page-notice 装的是"服务本身出了什么事"
+  // （比如没配 key）——共用一个格子会互相擦，擦掉的恰是解释"按钮为什么灰"的那条。
   setStatus('');
 }
 
@@ -305,7 +256,7 @@ async function loadLatest() {
   try {
     const data = await apiGet('/api/analysis/latest');
     if (data.notice) { renderNoticeOnly(data); return; }
-    // ★ 来源未知：`latest` 不带数据源信息（设计如此）。
+    // 来源未知：latest 不带数据源信息（设计如此）。
     state.reportSource = null;
     renderReport(data);
   } catch (err) {
@@ -314,8 +265,7 @@ async function loadLatest() {
 }
 
 async function generate(force) {
-  // ★ 双保险：按钮已经 disabled 了，但键盘回车、快速双击都可能绕过去。
-  //   而绕过一次的代价是**真的多花一次 token**。
+  // 双保险：按钮已 disabled，但回车/快速双击可能绕过——绕过一次就多花一次 token。
   if (state.busy) return;
 
   const src = currentSource();
@@ -336,9 +286,7 @@ async function generate(force) {
       ? '已命中缓存（同样的数据、同样的 prompt 版本和模型，没有重复调用）'
       : `分析完成，本次消耗 ${fmtInt(data.tokens_used)} token`);
   } catch (err) {
-    // ★ 503 单独说：它不是"出错了"，而是"服务没配好"，
-    //   而这两种情况用户该做的事完全不同（一个去配 key，一个是程序 bug）。
-    //   后端的 detail 已经是一句能照着做的话，这里只加上下文。
+    // 503 单独说：它不是"出错了"而是"服务没配好"，两种情况用户该做的事完全不同。
     const msg = err.message || '';
     if (msg.startsWith('503')) {
       showNotice('无法调用 GLM：' + msg.replace(/^503\s*/, '') +
@@ -362,15 +310,12 @@ rerunBtn.addEventListener('click', () => generate(true));
 (async function init() {
   await renderSwitcher();
 
-  // ★ 顺序要紧：**先 loadLatest()，再健康检查。**
-  //   反过来的话，loadLatest 走到 renderNoticeOnly 时那句 setStatus('')
-  //   会把这里刚写下的 'LLM 未配置' 擦掉——顺序错了，功能就少一半。
+  // 顺序要紧：先 loadLatest() 再健康检查——反过来，renderNoticeOnly 的
+  // setStatus('') 会把这里刚写下的 'LLM 未配置' 擦掉。
   await loadLatest();
 
-  // 健康检查：没配 key 就**提前**说，而不是让用户点了按钮才看到报错。
-  // ★ 只禁用"生成/重算"两个按钮，不禁用整页——
-  //   报告可能已经在缓存里了，那种情况下不需要 key 也能看
-  //   （这条路径是后端刻意保留的，见 app/api/analysis.py 的模块注释）。
+  // 健康检查：没配 key 提前说；只禁用"生成/重算"按钮——报告可能已在缓存里，
+  // 不需要 key 也能看（这条路径是后端刻意保留的）。
   try {
     const health = await apiGet('/api/health');
     if (!health.llm_configured) {
@@ -382,11 +327,8 @@ rerunBtn.addEventListener('click', () => generate(true));
       );
       setStatus('LLM 未配置');
 
-      // ★ 光把按钮变灰还不够。报告区的空态文案是**后端**给的
-      //   （"点「生成分析报告」即可调用 GLM 分析当前数据源。"），
-      //   而这句话此刻是一句**做不到的建议**——按钮正是灰的。
-      //   于是页面上出现"按这里"+"此处按不动"，各自单看都合理，合起来是矛盾的。
-      //   前端此刻掌握了更准的信息，就该覆盖它。
+      // 空态文案是后端给的"点按钮即可生成"，而按钮此刻是灰的——前端掌握更准的信息，
+      // 就该覆盖它，否则页面上"按这里"和"此处按不动"合起来是矛盾的。
       if (emptyEl.classList.contains('show')) {
         emptyEl.textContent =
           '未配置 GLM API Key，暂时无法生成报告。已有的报告仍然可以查看。';

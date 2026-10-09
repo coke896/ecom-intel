@@ -1,33 +1,10 @@
 """告警接口：建规则、改规则、看记录、手动查一轮。
 
-================================================================================
-这份测试守的是什么
-================================================================================
-`tests/test_alerts.py` 守的是**状态机**（判断对不对、状态推得对不对）。
-这一份守的是**接口**，而接口层坏起来是另一种形状——它不会算错数，
-它**放不该放的东西进来，或者把该说的话说漏**：
-
-  · `rule_type` 校验松了 → 库里出现一条谁也不认识的规则，
-    而它每 5 分钟被判一次"判不了"，界面上安安静静
-  · 跌幅阈值 150% 放进来 → 永远不会触发的规则，看起来像"还没到"
-  · 重复规则没挡住 → 一个价格事件写两条 alerts
-  · 改规则时**不重置状态** → 改了阈值却永远不响（文件顶部【3】那个静默空洞）
-  · 改规则时**无条件重置状态**（哪怕什么都没改）→ 保存一下就把 fired 清掉了
-  · 删规则时 `delete(Alert)` **漏了 where** → 删一条规则，全库的触发记录都没了
-  · 错误信息只说"不合法" → 调用方得去翻源码才知道合法值是什么
-
-共同点：**全都不报错**，只是数据库里多了一条或少了全部。
-
-================================================================================
-★ 两处刻意的写法
-================================================================================
-1. **`MAX_RULES` 用 monkeypatch 改小**，不真建 100 条规则。
-   真建 100 条要发 100 次请求，慢，而且测的是"100 这个数字"——
-   而这里要测的是"到上限时会拒绝、且告诉调用方上限是多少"。
-
-2. **每条测试自己断言"前提成立"再断言"结果"**。
-   比如测"重新武装"之前先断言规则确实是 fired——
-   否则一个 constant 实现（永远 armed）也能让测试变绿。
+test_alerts.py 守状态机，这一份守**接口**——接口层坏起来不会算错数，而是
+"放不该放的东西进来，或者把该说的话说漏"（校验松、重复没挡、改规则重置
+状态、删规则漏 where），而且**全都不报错**。
+两处刻意写法：MAX_RULES 用 monkeypatch 改小、不真建 100 条；每条测试先断言
+"前提成立"再断言"结果"，否则 constant 实现也能绿。
 """
 
 from __future__ import annotations
@@ -53,10 +30,7 @@ from tests.factories import (
 
 @pytest.fixture()
 def client(db):
-    """把接口的数据库依赖换成测试会话。
-
-    ★ 和 test_tasks.py 里那份是同一个写法，包括 finally 里的 clear()。
-    """
+    """把接口的数据库依赖换成测试会话（同 test_tasks.py，含 finally 里的 clear()）。"""
     app.dependency_overrides[get_db] = lambda: db
     try:
         yield TestClient(app)
@@ -73,13 +47,8 @@ def make(db):
     return product, add_rule
 
 
-# ===========================================================================
-# 小工具
-#
-# ★ `state_of` / `set_state` / `set_price` / `add_alert` / `count_alerts`
-#   都住在 tests/factories.py。test_alerts.py 用的是同一批函数——
-#   各写一份的话，某天修好了其中一份的取数方式，另一份就继续按老写法"通过"。
-# ===========================================================================
+# 小工具（state_of / set_state / set_price / add_alert / count_alerts 都住在
+# tests/factories.py：test_alerts.py 用的是同一批函数，避免两份实现各自漂移）
 
 
 def create_rule(client, product_id: int, **kw) -> dict:
@@ -91,9 +60,7 @@ def create_rule(client, product_id: int, **kw) -> dict:
     return resp.json()
 
 
-# ===========================================================================
 # 一、建规则
-# ===========================================================================
 
 
 def test_create_rule_returns_it(client, db, make):
@@ -110,13 +77,8 @@ def test_create_rule_returns_it(client, db, make):
 
 
 def test_new_rule_starts_armed(client, db, make):
-    """★ 新规则必须是 armed。
-
-    ★ 这一条不只在测"初始值填对了"，它决定了**新建即触发**的行为：
-      armed 意味着下一轮检查就会判它。如果哪天有人为了"别吵到用户"
-      把它改成 fired，用户配的规则就会永远不响，
-      而界面上一切正常（enabled=True、价格也确实低于阈值）。
-    """
+    """★ 新规则必须是 armed：它决定了**新建即触发**的行为——初始值若被
+    改成 fired，用户配的规则会永远不响，而界面上一切正常（enabled=True）。"""
     product, _ = make
     data = create_rule(client, product.id, threshold=250.0)
     assert data["state"] == "armed"
@@ -142,12 +104,8 @@ def test_create_rule_with_unknown_type_is_422(client, db, make):
 
 
 def test_type_error_lists_every_valid_value(client, db, make):
-    """★ 报错要说清楚**有哪些合法值**。
-
-    ★ 只断言 422 是不够的：一个把 detail 写成"参数错误"的实现也能过。
-      而真正让人少绕弯的是那份合法值清单——调用方（前端开发者、curl 的人）
-      不该为了知道能填什么去翻源码。
-    """
+    """★ 报错要说清楚**有哪些合法值**：只断言 422 的话，一个把 detail 写成
+    "参数错误"的实现也能过——而合法值清单正是让人少绕弯的东西。"""
     product, _ = make
     resp = client.post(
         "/api/alerts/rules",
@@ -184,21 +142,16 @@ def test_drop_pct_above_100_is_rejected(client, db, make):
 
 
 def test_drop_pct_exactly_100_is_allowed(client, db, make):
-    """★ 边界：跌 100% 是"价格掉到 0"，是可能事件（真实数据里就有 0 元的）。
-
-    上界是闭区间，写成 `>= 100 拒绝` 就把这条合法规则挡掉了。
-    """
+    """★ 边界：跌 100% 是"价格掉到 0"，是可能事件（真实数据里就有 0 元的）；
+    上界是闭区间，"达到 100 就拒绝"的实现会把这条合法规则挡掉。"""
     product, _ = make
     data = create_rule(client, product.id, rule_type="price_drop_pct", threshold=100.0)
     assert data["threshold"] == 100.0
 
 
 def test_price_below_may_exceed_100(client, db, make):
-    """★ 100 这个上界只对**跌幅**成立，不是给所有阈值设的。
-
-    价格 800 元的商品配一条"低于 500 提醒我"完全正常。
-    如果实现把校验写成了"阈值不能超过 100"，这个用例会红。
-    """
+    """★ 100 这个上界只对**跌幅**成立：价格 800 元的商品配一条"低于 500
+    提醒我"完全正常——实现写成"阈值不能超过 100"的话这条会红。"""
     product, _ = make
     data = create_rule(client, product.id, threshold=500.0)
     assert data["threshold"] == 500.0
@@ -245,12 +198,8 @@ def test_same_threshold_other_type_is_fine(client, db, make):
 
 
 def test_nearly_the_same_threshold_is_a_different_rule(client, db, make):
-    """★ 去重是**精确匹配**，不是"差不多"。
-
-    ★ 引入容差就要回答"多接近算一样"，那是个需要解释的魔法数字，
-      而两条阈值相近的规则本来就是用户自己配的，不算错误——
-      真正要防的是"连点两次提交建出两条一模一样的"。
-    """
+    """★ 去重是**精确匹配**，不是"差不多"：引入容差就要回答"多接近算一样"
+    这个魔法数字——要防的是"连点两次提交建出两条一模一样的"。"""
     product, _ = make
     create_rule(client, product.id, threshold=100.0)
     create_rule(client, product.id, threshold=100.001)
@@ -258,7 +207,7 @@ def test_nearly_the_same_threshold_is_a_different_rule(client, db, make):
     assert client.get("/api/alerts/rules").json()["total"] == 2
 
 
-# ---- 建规则时的"它响不了"提醒（★ 来自实测数据，不是假想的问题）------------
+# ---- 建规则时的"它响不了"提醒（来自实测数据）----
 
 
 def test_price_below_never_warns(client, db, make):
@@ -268,11 +217,8 @@ def test_price_below_never_warns(client, db, make):
 
 
 def test_drop_pct_without_history_warns_undecidable(client, db, make):
-    """★ 夹具默认不造价格历史点 → 跌幅规则每轮都会"判不了"。
-
-    ★ 库里 100 个真实商品里**有 2 个**是这个状态（实测），
-      而它在界面上和"价格还没到"长得一样。
-    """
+    """★ 夹具默认不造价格历史点 → 跌幅规则每轮都会"判不了"（实测：100 个
+    真实商品里有 2 个是这个状态，而它在界面上和"价格还没到"长得一样）。"""
     product, _ = make
     data = create_rule(client, product.id, rule_type="price_drop_pct", threshold=20.0)
 
@@ -283,14 +229,10 @@ def test_drop_pct_without_history_warns_undecidable(client, db, make):
 
 
 def test_drop_pct_with_one_point_warns_it_cannot_fire(client, db, make):
-    """★ 本组最重要的一条：98% 的真实商品就是这个状态。
-
-    只有 1 个价格点时，跌幅的基准 = 那唯一的价 = 当前价 → 跌幅恒为 0 →
-    **这条规则永远不会触发，而且它不报错、不算"判不了"、界面上安安静静**。
-    （实测：100 个真实商品里 98 个只有 1 个价格点，2 个没有，0 个有 2 个以上。）
-
-    ★ 断言里要出现"不会触发"这个意思：只断言 `warning is not None`
-      的话，一个提示"记得多喝水"的实现也能过。
+    """★ 本组最重要的一条：只有 1 个价格点时，跌幅基准 = 当前价 → 跌幅恒为 0，
+    **规则永远不会触发，且不报错、不算"判不了"、界面上安安静静**（实测：
+    100 个真实商品里 98 个只有 1 个价格点）。断言必须出现"不会触发"——
+    否则一个提示"记得多喝水"的实现也能过。
     """
     product, _ = make
     add_point(db, product, 89.9)  # 只有一个价格点
@@ -301,11 +243,8 @@ def test_drop_pct_with_one_point_warns_it_cannot_fire(client, db, make):
 
 
 def test_drop_pct_with_two_points_does_not_warn(client, db, make):
-    """★ 反证：有 2 个点时**不能**发提醒。
-
-    ★ 少了这条，一个"跌幅规则一律提示"的实现也能让上面两条变绿，
-      而那样的提醒很快就会变成谁都不看的噪音。
-    """
+    """★ 反证：有 2 个点时**不能**发提醒——否则"跌幅规则一律提示"的实现
+    也能让上面两条变绿，而那样的提醒很快会变成谁都不看的噪音。"""
     product, _ = make
     add_point(db, product, 200.0)
     add_point(db, product, 89.9)
@@ -360,9 +299,7 @@ def test_rejected_rule_is_not_written(client, db, make):
     assert db.query(AlertRule).count() == 0
 
 
-# ===========================================================================
 # 二、改规则（★ 本文件最重要的一组）
-# ===========================================================================
 
 
 def test_disable_rule(client, db, make):
@@ -388,19 +325,11 @@ def test_reenabling_a_fired_rule_rearms_it(client, db, make):
 
 
 def test_changing_threshold_rearms_a_fired_rule(client, db, make):
-    """★ 本文件最重要的一条。
+    """★ 本文件最重要的一条：改了阈值却不重置状态，会出现**静默的空洞**——
+    规则"低于 100"已触发 → 用户把阈值改成 200（当前价 99 < 200）→ state
+    还是 fired → 跳过，而用户以为改完就会响。
 
-    少了它会出现一个**静默的空洞**：
-
-        规则"低于 100" → 跌到 99 → 触发（state=fired）
-        → 用户把阈值改成 200
-        → 当前价 99 < 200，条件成立，但 state 还是 fired → 跳过
-        → **用户以为改完就会响，实际它永远不会响**
-
-    ★ 反过来说，那条断言 `state == "armed"` 之所以有意义，
-      是因为**先断言了它原来是 fired**——否则一个"永远不动 state"
-      的实现也能让测试变绿。
-    """
+    ★ 断言 `state == "armed"` 有意义，是因为**先断言了它原来是 fired**。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=100.0)["id"]
     set_state(db, rule_id, "fired")
@@ -421,11 +350,8 @@ def test_changing_rule_type_rearms(client, db, make):
 
 
 def test_empty_patch_leaves_state_alone(client, db, make):
-    """★ 一个空 PATCH 不该改变状态机的状态。
-
-    "保存了一下但什么都没改，于是重新武装了"是个很难查的怪事：
-    界面上用户只是点了个保存，然后收到一条他早已看过的通知。
-    """
+    """★ 一个空 PATCH 不该改变状态机的状态：用户只是点了个保存，不该收到一条
+    他早已看过的通知（"什么都没改却重新武装了"是个很难查的怪事）。"""
     product, _ = make
     rule_id = create_rule(client, product.id)["id"]
     set_state(db, rule_id, "fired")
@@ -459,12 +385,8 @@ def test_patch_rejects_unknown_type(client, db, make):
 
 
 def test_patch_validates_threshold_against_the_new_type(client, db, make):
-    """★ 改成跌幅规则、同时给一个 150 的阈值 → 必须拦下。
-
-    ★ 校验要对着**改完之后**的类型做，不是改之前那个。
-      实现里如果先赋值再校验，或者拿旧类型去校验，
-      这条会红——而库里会多出一条永远不触发的规则。
-    """
+    """★ 改成跌幅规则、同时给 150 的阈值 → 必须拦下：校验要对着**改完之后**
+    的类型做——拿旧类型校验的实现会放出一条永远不触发的规则。"""
     product, _ = make
     rule_id = create_rule(client, product.id)["id"]
 
@@ -476,11 +398,8 @@ def test_patch_validates_threshold_against_the_new_type(client, db, make):
 
 
 def test_patch_validates_threshold_when_type_is_already_drop_pct(client, db, make):
-    """★ 另一条路径：类型本来就是跌幅，只改阈值。
-
-    "payload 里没传 rule_type"和"规则本来就是跌幅"是两种走法，
-    实现里少写一个分支就会漏掉其中一条。
-    """
+    """★ 另一条路径：payload 里没传 rule_type、规则本来就是跌幅——实现里
+    少写一个分支就会漏掉这条。"""
     product, _ = make
     rule_id = create_rule(
         client, product.id, rule_type="price_drop_pct", threshold=20.0
@@ -491,12 +410,9 @@ def test_patch_validates_threshold_when_type_is_already_drop_pct(client, db, mak
 
 
 def test_rejected_patch_leaves_the_rule_untouched(client, db, make):
-    """★ 422 之后规则必须原样不动。
-
-    ★ 如果实现是"先赋值、再校验"，被拒的这次请求已经改掉了内存里的对象，
-      而 commit 可能由下一个请求带出去——于是"报错了但值变了"。
-      这里断言的是**库里的值**（先 expire_all 再读）。
-    """
+    """★ 422 之后规则必须原样不动：实现若是"先赋值、再校验"，被拒的请求
+    已经改掉了内存里的对象，而 commit 可能被下一个请求带出去。这里断言的
+    是**库里的值**（先 expire_all 再读）。"""
     product, _ = make
     rule_id = create_rule(client, product.id, rule_type="price_drop_pct", threshold=20.0)["id"]
     set_state(db, rule_id, "fired")
@@ -511,12 +427,9 @@ def test_rejected_patch_leaves_the_rule_untouched(client, db, make):
 
 
 def test_patch_cannot_create_a_duplicate(client, db, make):
-    """★ PATCH 必须和 POST 走同一套去重。理由见 _assert_not_duplicate。
-
-    只挡建成的话，防线可以被绕过：
-      规则 A（低于 100）、规则 B（低于 150）→ 把 A 改成 150
-      → 两条一模一样的规则，一个价格事件写两条 alerts。
-    """
+    """★ PATCH 必须和 POST 走同一套去重（理由见 _assert_not_duplicate）：
+    只挡建成的话，把 A 的阈值改成和 B 一样就绕过去了——两条一模一样的
+    规则，一个价格事件写两条 alerts。"""
     product, _ = make
     a = create_rule(client, product.id, threshold=100.0)["id"]
     b = create_rule(client, product.id, threshold=150.0)["id"]
@@ -527,11 +440,8 @@ def test_patch_cannot_create_a_duplicate(client, db, make):
 
 
 def test_patch_to_its_own_current_value_is_not_a_duplicate(client, db, make):
-    """★ 去重要排除**自己**。
-
-    否则"把阈值改成它现在这个值"会被判成和自己重复——一个荒谬的 409，
-    而它只在"改别的字段时顺带传上了阈值"这种正常操作里出现。
-    """
+    """★ 去重要排除**自己**：否则"改别的字段时顺带传上当前阈值"这种正常
+    操作会被判成和自己重复，得到一个荒谬的 409。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=100.0)["id"]
 
@@ -542,9 +452,7 @@ def test_patch_to_its_own_current_value_is_not_a_duplicate(client, db, make):
     assert resp.json()["enabled"] is False
 
 
-# ===========================================================================
 # 三、规则列表
-# ===========================================================================
 
 
 def test_list_rules_is_empty_initially(client, db):
@@ -574,10 +482,7 @@ def test_list_rules_counts_fired_alerts(client, db, make):
 
 
 def test_fired_count_is_per_rule(client, db, make):
-    """★ 计数不能串台：A 的触发次数不能记到 B 头上。
-
-    ★ 一个"忘了 where 或忘了 group by"的实现会让两条规则都显示总数。
-    """
+    """★ 计数不能串台：忘了 where / group by 的实现会让两条规则都显示总数。"""
     product, _ = make
     a = create_rule(client, product.id, threshold=100.0)["id"]
     b = create_rule(client, product.id, threshold=200.0)["id"]
@@ -602,11 +507,8 @@ def test_list_rules_is_newest_first(client, db, make):
 
 
 def test_list_rules_includes_disabled_ones(client, db, make):
-    """★ 停用的规则也要出现在列表里。
-
-    ★ 过滤掉的话，它在界面上就消失了，用户**再也没法把它打开**——
-      而 enabled=False 的全部意义就是"暂时关掉，以后还能开"。
-    """
+    """★ 停用的规则也要出现在列表里：过滤掉它就在界面上消失，用户再也
+    没法把它打开——而 enabled=False 的意义就是"暂时关掉，以后还能开"。"""
     product, _ = make
     rule_id = create_rule(client, product.id)["id"]
     client.patch(f"/api/alerts/rules/{rule_id}", json={"enabled": False})
@@ -625,12 +527,9 @@ def test_list_rules_respects_limit(client, db, make):
 
 
 def test_list_rules_filters_by_source(client, db, make):
-    """★ `?source=` 在告警页同样可用（它就是 apply_source 的第二种合法形状）。
-
-    ★ 这条同时验证了 deps.py 里写的那个约定：**主表不是 Product 也能用**，
-      前提是每条结果恰好对应一个商品。断言两侧都要有——
-      只断言"过滤后剩 1 条"的话，一个把全部数据都过滤掉的实现也能过。
-    """
+    """★ `?source=` 在告警页同样可用，也验证 deps.py 的约定：**主表不是
+    Product 也能用**，前提是每条结果恰好对应一个商品。两侧都断言——
+    只断言"过滤后剩 1 条"的话，一个把全部数据都过滤掉的实现也能过。"""
     product, _ = make  # 默认 source="mock"
     real = product_factory(db)(sid="s-1", title="真实商品", source="smzdm", channel="jingxin")
     create_rule(client, product.id, threshold=100.0)
@@ -656,11 +555,8 @@ def test_list_alerts_filters_by_source(client, db, make):
 
 
 def test_check_is_not_filtered_by_source(client, db, make):
-    """★ 手动查一轮是**动作**，不是查询——它永远检查全部规则。
-
-    ★ 跟着界面上的数据源开关走的话，会出现"我在 mock 视图下点了检查，
-      结果我那条真实商品的规则没被查到"，而且没有任何提示。
-    """
+    """★ 手动查一轮是**动作**，不是查询——永远检查全部规则：跟着界面上的
+    数据源开关走的话，"mock 视图下点检查，真实商品的规则没被查到"且毫无提示。"""
     product, _ = make
     real = product_factory(db)(sid="s-1", title="真实商品", source="smzdm", channel="jingxin")
     create_rule(client, product.id, threshold=999.0)   # mock，条件成立
@@ -671,9 +567,7 @@ def test_check_is_not_filtered_by_source(client, db, make):
     assert body["fired"] == 2
 
 
-# ===========================================================================
 # 四、删规则
-# ===========================================================================
 
 
 def test_delete_rule_removes_it(client, db, make):
@@ -700,12 +594,9 @@ def test_delete_says_how_many_alerts_went_with_it(client, db, make):
 def test_delete_does_not_touch_other_rules_alerts(client, db, make):
     """★ `delete(Alert)` 漏掉 where 就会删光全表——这条守着它。
 
-    ★ 这条断言的形态是刻意选的：不是"剩下的记录数对不对"，
-      而是**具体哪一条**还在。数量对得上但删错行的实现是存在的
-      （比如 where 写成 `Alert.id == rule_id`，恰好数量也能对上）。
-
-    ★ 先 commit 再删：夹具只 flush，见 tests/factories.py 的模块说明。
-    """
+    ★ 断言的是**具体哪一条**还在，不是数量：数量对得上但删错行的实现是
+      存在的（比如 where 写成 `Alert.id == rule_id`）。
+    ★ 先 commit 再删：夹具只 flush（见 tests/factories.py 模块说明）。"""
     product, _ = make
     a = create_rule(client, product.id, threshold=100.0)["id"]
     b = create_rule(client, product.id, threshold=200.0)["id"]
@@ -732,9 +623,7 @@ def test_delete_mentions_the_alternative(client, db, make):
     assert "停用" in body["notice"]
 
 
-# ===========================================================================
 # 五、触发记录
-# ===========================================================================
 
 
 def test_list_alerts_is_empty_initially(client, db):
@@ -758,12 +647,8 @@ def test_list_alerts_carries_everything_the_ui_needs(client, db, make):
 
 
 def test_notified_is_false(client, db, make):
-    """★ 恒为 False——本项目没有外部推送渠道。
-
-    ★ 这条断言的作用不是"验证一个字段的值"，而是**把这个事实钉住**：
-      哪天接了推送，会有人来改它，那时他会看到这里写着
-      "现在恒为 False"以及为什么。界面上不要把 False 画成"推送失败"。
-    """
+    """★ 恒为 False——本项目没有外部推送渠道。这条的作用是**把事实钉住**：
+    哪天接了推送会有人来这里改它；界面上别把 False 画成"推送失败"。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=88.0)["id"]
     add_alert(db, rule_id)
@@ -772,13 +657,9 @@ def test_notified_is_false(client, db, make):
 
 
 def test_list_alerts_is_newest_first(client, db, make):
-    """★ 两条记录的 `triggered_at` 几乎相同（同一次测试里连着插的）。
-
-    ★ 所以这条实际测的是**兜底排序列**：只按 triggered_at 排的话，
-      同一秒内触发的多条记录顺序由数据库自己决定（SQLite 通常按 rowid，
-      但那是实现细节）。少了 `Alert.id.desc()`，翻页时记录会重复或漏掉，
-      而单看一次请求完全正常。
-    """
+    """★ 两条记录的 `triggered_at` 几乎相同，所以这条实际测的是**兜底排序列**：
+    只按 triggered_at 排的话，同一秒内多条的顺序由数据库自己决定——少了
+    `Alert.id.desc()`，翻页时会重复或漏掉，而单看一次请求完全正常。"""
     product, _ = make
     rule_id = create_rule(client, product.id)["id"]
     old = add_alert(db, rule_id, price=99.0)
@@ -798,24 +679,13 @@ def test_list_alerts_respects_limit(client, db, make):
 
 
 def test_editing_a_rule_does_not_rewrite_its_past_records(client, db, make):
-    """改了规则之后，**历史记录**仍然说自己触发时的那个条件。
+    """★ 改了规则之后，**历史记录**仍说自己触发时的那个条件——事件的字段
+    不该随配置变。历史记录若去读规则表的当前值，就会出现"价格低于 ¥50 ｜
+    触发价 ¥89.9"（89.9 < 50 是假），而前端（alerts.html 的 ruleText）
+    正是拿这两个值渲染的。
 
-    ★ 这条守的是一句话：**事件的字段不该随配置变**。
-
-      `PATCH /rules/{id}` 是**就地**改 `rule_type` / `threshold` 的，
-      它不碰 alerts 表（只有 DELETE 规则才连带删记录）。所以历史记录
-      如果去读规则表的当前值，就会出现：
-
-          价格低于 ¥50 ｜ 触发价 ¥89.9     ← 89.9 < 50 是假
-
-      这条记录在**宣称一条条件不成立的规则触发过**。而前端那一列
-      （frontend/alerts.html 的 ruleText）就是拿这两个值渲染的，
-      矛盾会直接显示给人看。
-
-    ★ 用真实触发路径之外的工厂造记录是有意的：
-      这里要测的是**读取侧**怎么取这两个值，不是触发侧怎么写。
-      触发侧由 test_alerts.py::test_trigger_writes_the_rule_snapshot 守。
-    """
+    ★ 刻意用工厂而不是真实触发路径造记录：这里测**读取侧**怎么取这两个值，
+      触发侧由 test_alerts.py::test_trigger_writes_the_rule_snapshot 守。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=100.0)["id"]
     add_alert(db, rule_id, price=89.9)
@@ -828,8 +698,7 @@ def test_editing_a_rule_does_not_rewrite_its_past_records(client, db, make):
     resp = client.patch(f"/api/alerts/rules/{rule_id}", json={"threshold": 50.0})
     assert resp.status_code == 200, resp.text
 
-    # 规则本身确实被改了——不先断言这个的话，一个"PATCH 根本没生效"的
-    # 实现也能让下面的断言全绿（那就成了空转）
+    # 规则本身确实被改了——不然一个"PATCH 根本没生效"的实现也能让下面全绿
     assert resp.json()["threshold"] == 50.0
 
     after = client.get("/api/alerts").json()["items"][0]
@@ -842,13 +711,9 @@ def test_editing_a_rule_does_not_rewrite_its_past_records(client, db, make):
 
 
 def test_editing_the_rule_type_does_not_rewrite_its_past_records(client, db, make):
-    """改成跌幅规则后，历史记录仍然说"价格低于"，不说"跌了百分之多少"。
-
-    ★ 和上一条是同一个病，但形状不同，所以单独测：
-      改的是**类型**而不是阈值，症状从"不等式是假的"变成
-      **"触发价"这一列对百分比规则根本没有意义**——
-      跌幅规则里没有"触发价低于阈值"这回事，阈值是百分比。
-    """
+    """改成跌幅规则后，历史记录仍然说"价格低于"——同一个病、另一种形状：
+    改的是**类型**，症状从"不等式是假的"变成"触发价这一列对百分比规则
+    根本没有意义"（跌幅的阈值是百分比）。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=100.0)["id"]
     add_alert(db, rule_id, price=89.9)
@@ -872,21 +737,15 @@ def test_editing_the_rule_type_does_not_rewrite_its_past_records(client, db, mak
 def test_a_record_without_a_snapshot_falls_back_to_the_current_rule(client, db, make):
     """加列之前写下的记录（快照为 NULL）回退到规则当前值。
 
-    ★ 为什么这个回退是对的，而不是"编一个值"：
-      这些记录本来就没有快照，回退到当前值 = **回到加列之前的行为**。
-      另一条路（迁移时把"当前值"回填进去）才是编造——它把"不知道"
-      伪装成"知道"，而且伪装得很好：界面上看不出任何区别。
-      见 app/db/migrate.py 里"故意不做数据回填"那段。
-
-    ★ `snapshot=False` 必须显式写出来，这是工厂的默认值刻意的反面
-      （默认造真实形状，老形状要明说）。
-    """
+    ★ 回退 = **回到加列之前的行为**；另一条路（迁移时把"当前值"回填）才是
+      编造——把"不知道"伪装成"知道"，还伪装得很好（见 app/db/migrate.py
+      里"故意不做数据回填"那段）。
+    ★ `snapshot=False` 要显式写：工厂默认造真实形状，老形状要明说。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=100.0)["id"]
     add_alert(db, rule_id, price=89.9, snapshot=False)
 
-    # 前提：这一行**真的**没有快照。不先断言这个的话，
-    # 一个"工厂忘了写 NULL"的实现会让这条用例测到别的路径却照样绿。
+    # 前提：这一行真的没有快照——不先断言的话，会测到别的路径却照样绿
     stored = db.get(Alert, client.get("/api/alerts").json()["items"][0]["id"])
     assert stored.rule_type_at_trigger is None
     assert stored.threshold_at_trigger is None
@@ -895,16 +754,13 @@ def test_a_record_without_a_snapshot_falls_back_to_the_current_rule(client, db, 
     assert item["threshold"] == 100.0
     assert item["rule_type"] == "price_below"
 
-    # ★ 反着再走一步：改成 50 之后，这条**没有快照**的记录是会跟着变的
-    #   （它的值只能来自规则表）。把它断言出来，是为了让"回退"这件事
-    #   的代价是可见的——而不是让人以为老记录也被保护了。
+    # ★ 反着再走一步：没有快照的记录会跟着规则变（值只能来自规则表）——
+    #   把代价断言出来，而不是让人以为老记录也被保护了
     client.patch(f"/api/alerts/rules/{rule_id}", json={"threshold": 50.0})
     assert client.get("/api/alerts").json()["items"][0]["threshold"] == 50.0
 
 
-# ===========================================================================
 # 六、手动查一轮
-# ===========================================================================
 
 
 def test_check_with_no_rules_says_so(client, db):
@@ -914,12 +770,8 @@ def test_check_with_no_rules_says_so(client, db):
 
 
 def test_check_fires_a_rule_that_is_already_true(client, db, make):
-    """★ 新建即触发：价格 199 已经低于阈值 250，查一轮就应该响。
-
-    ★ 这是"用户配了一条当下就成立的规则"的正常情形——
-      worker 每 5 分钟查一次，所以现实里最多等 5 分钟；
-      手动查一轮让演示和调试不必等。
-    """
+    """★ 新建即触发：价格 199 已经低于阈值 250，查一轮就该响——worker
+    每 5 分钟查一次，手动查一轮让演示和调试不必等。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=250.0)["id"]
 
@@ -932,11 +784,8 @@ def test_check_fires_a_rule_that_is_already_true(client, db, make):
 
 
 def test_check_twice_fires_once(client, db, make):
-    """★ 走完整 HTTP 路径的三态验证：第二次必须什么都不发生。
-
-    ★ test_alerts.py 里已经测过状态机本身；这里测的是
-      "接口调的就是那个状态机"，而不是又写了一遍判断。
-    """
+    """★ 走完整 HTTP 路径的三态验证：第二次必须什么都不发生——测的是
+    "接口调的就是那个状态机"，状态机本身在 test_alerts.py 已测过。"""
     product, _ = make
     rule_id = create_rule(client, product.id, threshold=250.0)["id"]
 
@@ -963,11 +812,8 @@ def test_check_rearms_when_price_goes_back_up(client, db, make):
 
 
 def test_check_reports_undecidable(client, db, make):
-    """★ 判不了要和"没触发"分开报，界面上也是两种颜色。
-
-    ★ 跌幅规则 + 商品没有任何历史价 → 算不出基准 → 判不了。
-      如果实现把这种情况并进"没触发"，用户会以为"规则在工作、价格还没到"。
-    """
+    """★ 判不了要和"没触发"分开报（界面上也是两种颜色）：跌幅规则 + 没有
+    历史价 → 算不出基准，并进"没触发"的话用户会以为"规则在工作、价格没到"。"""
     product, _ = make
     create_rule(
         client, product.id, rule_type="price_drop_pct", threshold=20.0
@@ -991,11 +837,8 @@ def test_check_skips_disabled_rules(client, db, make):
 
 
 def test_check_returns_a_report_not_a_bare_number(client, db, make):
-    """★ 四个计数必须在响应里齐全。
-
-    ★ 少一个（尤其是 undecidable）不会报错——前端拿 undefined 当 0 渲染，
-      于是"3 条规则判不了"在界面上就是"今天没有任何异常"。
-    """
+    """★ 四个计数必须在响应里齐全：少一个（尤其是 undecidable）不会报错——
+    前端拿 undefined 当 0 渲染，"3 条规则判不了"就成了"今天没有任何异常"。"""
     product, _ = make
     create_rule(client, product.id, threshold=250.0)
 

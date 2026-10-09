@@ -1,14 +1,6 @@
-/* ============================================================================
- * 全局样式
- *
- * 纯手写 CSS，没有 Tailwind / Bootstrap / 任何构建步骤。
- * 理由和"前端用纯 HTML"是同一个：这是一个**作品集项目**，
- * 面试官 clone 下来要能直接打开。多一个 npm install 就多一半的人不会打开。
- *
- * 用 CSS 变量而不是写死颜色，是为了让"图表配色"和"页面配色"能对上——
- * ECharts 那边要读同一批色值（见 charts.js 里的 palette）。
- * 两边写死两套色值，改主题时必然改漏一处，然后就出现"图上有个不认识的蓝色"。
- * ========================================================================== */
+/* 全局样式。纯手写 CSS，没有 Tailwind / Bootstrap / 任何构建步骤——
+   面试官 clone 下来要能直接打开，多一个 npm install 就多一半的人不会打开。
+   用 CSS 变量让图表配色和页面配色对得上（ECharts 读同一批色值，见 charts.js 的 palette）。 */
 
 :root {
   --bg: #f6f7f9;
@@ -32,9 +24,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  /* 中文字体栈：把系统中文字体排在前面。
-     顺序很讲究——macOS 上如果先写 Arial，中文会走 Arial 的
-     回退字体，字重和行高都不对。 */
+  /* 中文字体栈：系统中文排在前面——先写 Arial 的话中文会走 Arial 的回退字体，字重和行高都不对。 */
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
                "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
   font-size: 14px;
@@ -77,12 +67,8 @@ nav.pages a {
 nav.pages a:hover { background: var(--bg); color: var(--text); }
 nav.pages a.active { background: var(--accent-soft); color: var(--accent); }
 
-/* --------------------------------------------------------------------------
- * 数据源切换（分段控件）
- *
- * ★ 这一个控件是整个项目的门面：它让"双数据源隔离"这件事
- *   在界面上**可见**，而不是只能写在 README 里。
- * ------------------------------------------------------------------------ */
+/* 数据源切换（分段控件）。这个控件是整个项目的门面：
+   它让"双数据源隔离"在界面上可见，而不是只能写在 README 里。 */
 .switcher {
   display: flex;
   background: var(--bg);
@@ -108,8 +94,7 @@ nav.pages a.active { background: var(--accent-soft); color: var(--accent); }
   color: var(--accent);
   box-shadow: var(--shadow);
 }
-/* 没有数据的源：淡一点，但仍然可点——
-   点进去看到空态提示，本身就是演示的一部分。 */
+/* 没有数据的源淡一点但仍可点：点进去看到空态提示，本身就是演示的一部分。 */
 .switcher button.empty { color: var(--text-faint); }
 .switcher button .count { color: var(--text-faint); font-weight: 400; margin-left: 4px; font-size: 12px; }
 .switcher button[aria-pressed="true"] .count { color: var(--accent); opacity: .7; }
@@ -145,7 +130,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 20px; }
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 16px;
-  min-width: 0;              /* ★ 没有这行，grid 子项里的长表格会把布局撑破 */
+  min-width: 0;              /* 没有这行，grid 子项里的长表格会把布局撑破 */
 }
 .panel h2 {
   margin: 0 0 2px;
@@ -154,18 +139,12 @@ main { max-width: 1440px; margin: 0 auto; padding: 20px; }
 }
 .panel .hint { color: var(--text-faint); font-size: 12px; margin-bottom: 10px; }
 
-/* ECharts 容器必须有显式高度，否则 canvas 高度为 0，图完全不显示
-   ——而控制台一个错都没有，这是最容易卡住新手的一步。 */
+/* ECharts 容器必须有显式高度，否则 canvas 高度为 0、图不显示且控制台不报错。 */
 .chart { width: 100%; height: 340px; }
 .chart.tall { height: 520px; }
 
-/* --------------------------------------------------------------------------
- * 空态 / 提示
- *
- * ★ 这个块是本项目"诚实呈现"的落点。真实电商的销量不在网页端公开，
- *   所以 ?source=smzdm 下销量图必然是空的。
- *   空白的图看起来像系统坏了；一句解释才是诚实的。
- * ------------------------------------------------------------------------ */
+/* 空态 / 提示：真实电商的销量不在网页端公开，?source=smzdm 下销量图必然为空；
+   空白的图看起来像系统坏了，一句解释才是诚实的。 */
 .notice {
   display: none;
   background: var(--warn-bg);
@@ -190,33 +169,11 @@ main { max-width: 1440px; margin: 0 auto; padding: 20px; }
 }
 .empty-state.show { display: flex; }
 
-/* --------------------------------------------------------------------------
- * 表格
- *
- * ★ 表格的横向滚动容器（下面 th 的 sticky 依赖它，改之前先读这段）
- *
- * 为什么不能只写 <div style="overflow-x:auto">：
- *   CSS 规范规定：overflow-x 和 overflow-y 里只要有一个不是 visible，
- *   另一个就会被**计算成 auto**。所以这个 div 不管有没有东西可滚，
- *   都是一个**双向的滚动容器**。
- *   而 position: sticky 是相对**最近的滚动容器**定位的——不是相对视口。
- *
- *   于是 th 上原来那句 `top: 58px`（本意是"滚动时别被 58px 高的顶栏盖住"），
- *   含义悄悄变成了"距这个 div 自己的顶边 58px"。
- *   表头在正常流里的位置**就是**这个 div 的顶边（偏移 0），
- *   小于 58px 这个下界 → 表头被**向下推开 58px**，正好压住头两行数据，
- *   而它原来待的位置空了出来。看起来就是"表格顶部被啃掉一块"。
- *
- *   ★ 这个 bug 只在**人眼确认**那一轮才被发现：
- *     它不报错、不影响任何一条测试，HTML 和 CSS 都完全合法。
- *
- * 修法不是把 sticky 删掉（那会留下一句不干活的 CSS），
- * 而是让这个容器名副其实：给它一个上限高度，它才真的会滚，
- * 表头也才真的粘得住（见下面 th 的 top: 0）。
- *
- * max-height 只封顶、不撑高：规则表只有一行时它就是个普通盒子，
- * 不会凭空多出一块空白。
- * ------------------------------------------------------------------------ */
+/* 表格横向滚动容器（下面 th 的 sticky 依赖它）。
+ * overflow-x 一旦不是 visible，规范会把 overflow-y 计算成 auto——这个 div 因此是双向
+ * 滚动容器，而 sticky 是相对最近的滚动容器定位，不是视口。写 top: 58px（本意躲开顶栏）
+ * 会被解释成"距 div 顶边 58px"，把表头往下推、压住头两行；修法是给容器上限高度让它
+ * 名副其实（见下面 th 的 top: 0）。这个 bug 不报错、不影响测试，只能靠人眼看出来。 */
 .table-scroll {
   overflow: auto;
   max-height: min(70vh, 720px);
@@ -235,10 +192,8 @@ table.data th {
   font-size: 12px;
   background: #fbfbfc;
   position: sticky;
-  /* ★ 必须是 0，不能写顶栏高度（比如 58px）。
-     表头粘的是**它所在的滚动容器**（.table-scroll），不是视口；
-     写非 0 的值会把表头往下推、压住数据行。
-     完整的来龙去脉见上面 .table-scroll 那段注释。 */
+  /* 必须是 0，不能写顶栏高度：表头粘的是它所在的滚动容器（.table-scroll），
+     非 0 会把表头往下推、压住数据行；来龙去脉见上面那段。 */
   top: 0;
   z-index: 1;                /* 粘住的表头要盖住从它下面滚过去的行 */
   white-space: nowrap;
@@ -248,10 +203,8 @@ table.data th.sortable:hover { color: var(--accent); }
 table.data tbody tr { cursor: pointer; }
 table.data tbody tr:hover { background: #fafbfc; }
 
-/* ★ 标题列用 CSS 截断而不是后端截断。
-   后端那个 title_short 是给图表图例用的（那边没有 CSS）；
-   表格这边 hover 能看到完整标题，用 CSS 更自然，
-   而且不会因为窗口宽度变化而露出一个固定的省略号。 */
+/* 标题列用 CSS 截断而不是后端截断：后端 title_short 是给图表图例用的（那边没有 CSS）；
+   表格这边 hover 能看到全文，用 CSS 更自然，也不会因窗口宽度变化露出固定省略号。 */
 td.title-cell {
   max-width: 380px;
   overflow: hidden;
@@ -261,17 +214,8 @@ td.title-cell {
 .num { font-variant-numeric: tabular-nums; text-align: right; }
 .muted { color: var(--text-faint); }
 
-/* --------------------------------------------------------------------------
- * 缩略图
- *
- * ★ 尺寸写在 CSS 上而不是 <img> 的 width/height 属性上，是为了
- *   **图片还没加载出来时列宽就已经定住**。否则图一个个加载完成，
- *   整张表会一格一格地往右挪——列表在眼前"跳"一下，很难看。
- *
- * ★ 有图和没图用的是同一个 40×40 的框：这样同一列里所有行的
- *   文字起始位置是对齐的，而"没有图"读起来是"这里空着"，
- *   不是"这一行缺了点什么"。
- * ------------------------------------------------------------------------ */
+/* 缩略图。尺寸写在 CSS 而不是 <img> 属性上：图片没加载出来时列宽已定住，
+   否则表会一格一格往右挪；有图和没图用同一个 40×40 的框，同列文字起始对齐。 */
 .thumb {
   display: block;
   width: 40px;
@@ -284,9 +228,8 @@ img.thumb { object-fit: cover; }
 /* 没有图 / 取不到图：虚线框，比实线更明确地表示"这里是空的" */
 .thumb-empty { border-style: dashed; }
 
-/* 详情主图。★ 上限给得比缩略图宽松得多——这一屏就是专门看它的。
-   不设 max-width: 100% 的话，一张大图会把弹窗撑破（900px 宽），
-   而 .modal 上没有 overflow: hidden，撑破了就是整页横向滚动。 */
+/* 详情主图：上限比缩略图宽松得多。不设 max-width 的话大图会撑破 900px 弹窗、
+   而 .modal 没有 overflow: hidden，撑破了就是整页横向滚动。 */
 #m-figure img {
   display: block;
   max-width: 100%;
@@ -308,9 +251,7 @@ img.thumb { object-fit: cover; }
 .tag.src-mock { background: #f0f9ff; border-color: #bae6fd; color: #0369a1; }
 .tag.src-smzdm { background: #f0fdf4; border-color: #bbf7d0; color: #15803d; }
 
-/* --------------------------------------------------------------------------
- * 分页与工具条
- * ------------------------------------------------------------------------ */
+/* 分页与工具条 */
 .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
 .toolbar input[type="search"], .toolbar select {
   font: inherit;
@@ -335,17 +276,11 @@ img.thumb { object-fit: cover; }
 .pager button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .pager button:disabled { opacity: .45; cursor: default; }
 
-/* --------------------------------------------------------------------------
- * 报告页
- *
- * ★ 报告正文全部由**模型生成**，渲染时全部走 `textContent`，不碰 innerHTML。
- *   理由见 analysis.html 里那段注释——简单说：模型输出是**不可信文本**，
- *   把它当 HTML 解析等于给自己开一个 XSS 口子，
- *   而开口子的路径是"数据源里某条商品标题里带了 <script>"。
- * ------------------------------------------------------------------------ */
+/* 报告页。报告正文全部由模型生成，渲染走 textContent、不碰 innerHTML——
+   模型输出是不可信文本，当 HTML 解析等于给自己开一个 XSS 口子，
+   而开口子的路径是"数据源里某条商品标题里带了 script"。理由见 analysis.html。 */
 
-/* 通用按钮。★ 之前只有 .pager button 和 .switcher button 两套局部样式，
-   报告页需要一对"主操作 + 次操作"，所以抽一个通用的出来。 */
+/* 通用按钮：原先只有局部样式，报告页需要"主操作 + 次操作"，所以抽一个通用的出来。 */
 .btn {
   font: inherit;
   padding: 6px 14px;
@@ -363,11 +298,9 @@ img.thumb { object-fit: cover; }
   font-weight: 550;
 }
 .btn.primary:hover:not(:disabled) { background: #1d4ed8; color: #fff; }
-/* 禁用态要**看起来**不可点：生成报告要花 token，
-   按钮看起来能点而实际点了没反应，会让人反复点，每次都是一次付费调用。 */
+/* 禁用态要看起来不可点：生成报告花 token，看着能点却没反应会让人反复点，每次都付费。 */
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 
-/* 报告正文挂载点。 */
 .report-headline {
   font-size: 19px;
   font-weight: 650;
@@ -375,8 +308,7 @@ img.thumb { object-fit: cover; }
   margin: 4px 0 10px;
 }
 
-/* 「这份报告说的是哪个数据源」的提示。
-   数据源切换之后，屏幕上留着的还是上一份报告——这时必须说话。 */
+/* "这份报告说的是哪个数据源"的提示：切换之后屏幕上留的还是上一份报告，这时必须说话。 */
 .report-stale {
   background: var(--warn-bg);
   border: 1px solid var(--warn-border);
@@ -394,9 +326,8 @@ img.thumb { object-fit: cover; }
 }
 .report-section h3 { margin: 0 0 4px; font-size: 14px; font-weight: 620; }
 .report-section p { margin: 0 0 6px; }
-/* 依据：用 monospace + 左边框，视觉上明确区分"判断"和"数字"。
-   这个区分是有意的——报告最常见的失败就是**结论和数字对不上**，
-   分开排版能让人一眼看出"这句判断的依据是什么"。 */
+/* 依据：monospace + 左边框，明确区分"判断"和"数字"——
+   报告最常见的失败是结论和数字对不上，分开排版一眼可查。 */
 .report-evidence {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
@@ -412,9 +343,8 @@ img.thumb { object-fit: cover; }
 .report-list h4 { margin: 0 0 6px; font-size: 13px; font-weight: 620; }
 .report-list ul { margin: 0; padding-left: 18px; }
 .report-list li { margin-bottom: 4px; }
-/* ★ 三组列表用颜色分开，其中「数据限制」是**最重要的一组**：
-   它是这份报告最诚实的地方——写清楚"这批数据支撑不了什么结论"。
-   给它最重的边框，是因为它是面试时最该被看到的一段。 */
+/* 三组列表用颜色分开，「数据限制」是最重要的一组：它写清"这批数据支撑不了什么结论"，
+   是这个项目最想被看到的一段。 */
 .report-list.limits {
   background: var(--warn-bg);
   border: 1px solid var(--warn-border);
@@ -468,10 +398,8 @@ img.thumb { object-fit: cover; }
  * 告警页
  * ------------------------------------------------------------------------ */
 
-/* 规则状态徽章（看守中 / 已触发）。
-   ★ 文字本身就把两种状态分开了，颜色只是加强。
-     只靠颜色的话，色盲、截图、黑白打印都会丢掉这个信息——
-     而"这条规则会不会再响"恰恰是这一页最需要被看懂的东西。 */
+/* 状态徽章：文字本身已把两种状态分开，颜色只是加强——只靠颜色的话，
+   色盲、截图、黑白打印都会丢掉"这条规则会不会再响"这个信息。 */
 .state-badge {
   display: inline-block;
   padding: 1px 8px;
@@ -484,12 +412,10 @@ img.thumb { object-fit: cover; }
 .state-armed { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
 .state-fired { background: #fff7ed; border-color: #fed7aa; color: #c2410c; }
 
-/* 告警页的表格行没有"点开详情"的行为（其它页面有），
-   所以光标不能是说谎的手型。 */
+/* 告警页的表格行没有"点开详情"的行为，光标不能是说谎的手型。 */
 #rules-body tr, #alerts-body tr { cursor: default; }
 
-/* 检查报告。★ 它的存在感要比一般提示强一点：
-   "判不了"那种情况在别处完全看不见（没写记录、没报错），
+/* 检查报告：存在感比一般提示强——"判不了"在别处完全看不见（没写记录、没报错），
    这里是它唯一的出口。 */
 .check-report {
   margin-top: 4px;

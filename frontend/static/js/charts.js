@@ -1,38 +1,17 @@
-/* ============================================================================
- * 图表渲染
- *
- * 每个 render 函数都遵循同一套约定：
- *
- *      renderXxx(elId, data)
- *        · 如果 data 里带了 notice → 把提示条显示出来
- *        · 如果数据是空的          → 显示空态文字，隐藏画布
- *        · 否则                    → 正常画图
- *
- * ★ 为什么"空"和"有提示"要分开处理，而不是只用一种：
- *   两种情况的文案位置不一样。
- *     · 完全没数据（?source=smzdm 的销量图）→ 提示条就是唯一内容，
- *       应该占满整个图表区，否则用户看到一块空白会以为坏了
- *     · 有数据但需要说明（店铺占比只有一个"未知店铺"）→ 图要照画，
- *       提示条挂在图上方当注解
- *   把它硬塞进一种形态，必然有一边别扭。
- * ========================================================================== */
+/* 图表渲染。每个 render 函数遵循同一套约定：
+ *   renderXxx(elId, data)：data 带 notice → 显示提示条；数据为空 → 显示空态；否则正常画图。
+ * "空"和"有提示"分开处理：完全没数据时提示条就是唯一内容（否则一块空白像坏了），
+ * 有数据但需说明时图照画、提示当注解。 */
 
-/* ---------------------------------------------------------------------------
- * ECharts 实例登记表
- *
- * ★ 为什么要有这张表：容器宽度变化时 ECharts **不会**自己重画，
- *   必须显式调用 `chart.resize()`。没有这一步，把窗口拉宽之后
- *   图还是原来那么大，右边留一片空白。
- *   登记所有实例，再挂一个全局 resize 监听，一处解决。
- * ------------------------------------------------------------------------ */
+/* ECharts 实例登记表：容器宽度变化时 ECharts 不会自己重画，必须显式 resize()；
+   登记所有实例 + 一个全局 resize 监听，一处解决。 */
 const _charts = new Map();
 
 function _getChart(elId) {
   const el = document.getElementById(elId);
   if (!el) return null;
   let chart = _charts.get(elId);
-  // 容器尺寸变了（比如从空态切回有数据）时，旧实例的尺寸信息是过期的，
-  // resize() 必须在 setOption 之前调用。
+  // 容器尺寸变了（比如从空态切回有数据）时，旧实例的尺寸是过期的，resize() 要在 setOption 前调用。
   if (!chart) {
     chart = echarts.init(el);
     _charts.set(elId, chart);
@@ -44,12 +23,8 @@ window.addEventListener('resize', () => {
   for (const chart of _charts.values()) chart.resize();
 });
 
-/** 配色。
- *
- *  ★ 和后端无关，只影响观感，但刻意只用 6 个颜色循环：
- *    颜色多于 6 种之后人眼就分不清了，饼图上会出现
- *    "这两个扇区好像一个颜色"的情况，那种图还不如不画。
- */
+/* 配色。刻意只用 6 个颜色循环：颜色多于 6 种之后人眼分不清，
+   饼图上"这两个扇区好像一个颜色"还不如不画。 */
 const PALETTE = ['#2563eb', '#0891b2', '#7c3aed', '#db2777', '#ea580c', '#65a30d'];
 
 const AXIS_STYLE = {
@@ -58,9 +33,7 @@ const AXIS_STYLE = {
   splitLine: { lineStyle: { color: '#f1f3f6' } },
 };
 
-/* ---------------------------------------------------------------------------
- * 空态 / 提示
- * ------------------------------------------------------------------------ */
+/* 空态 / 提示 */
 
 function showNotice(elId, text, kind = 'warn') {
   const el = document.getElementById(elId);
@@ -75,11 +48,8 @@ function showNotice(elId, text, kind = 'warn') {
   el.classList.add('show');
 }
 
-/** 在"显示画布"和"显示空态"之间切换。
- *
- *  ★ 注意两个都要显式设置：只 show 一个而不 hide 另一个的话，
- *    上一次的数据还在下面留着，会出现"空态文字和旧图表叠在一起"。
- */
+/** 在"显示画布"和"显示空态"之间切换。两个都要显式设置，
+ *  只 show 一个会让空态文字和旧图表叠在一起。 */
 function toggleEmpty(chartElId, emptyElId, isEmpty, message) {
   const chartEl = document.getElementById(chartElId);
   const emptyEl = document.getElementById(emptyElId);
@@ -88,29 +58,18 @@ function toggleEmpty(chartElId, emptyElId, isEmpty, message) {
     if (isEmpty && message) emptyEl.textContent = message;
     emptyEl.classList.toggle('show', isEmpty);
   }
-  // 从空态切回有数据时，容器此前是 display:none（宽高为 0），
-  // ECharts 记下的尺寸是 0——必须 resize 一次才能正确绘制。
+  // 从空态切回有数据时必须 resize：容器此前 display:none、宽高为 0，ECharts 记下的尺寸是 0。
   if (!isEmpty) {
     const chart = _charts.get(chartElId);
     if (chart) chart.resize();
   }
 }
 
-/* ---------------------------------------------------------------------------
- * 图表 1：价格分布
- * ------------------------------------------------------------------------ */
+/* 图表 1：价格分布 */
 
 function renderPriceDistribution(elId, emptyId, noticeId, data) {
-  // ★ 提醒的**颜色**按"图画没画出来"分：这是全项目第一处"提醒和已经画好的图同屏"。
-  //
-  //   其余几处的提醒都只在空态出现，所以默认的黄色告警色是对的。
-  //   但这里有两类完全不同的情况：
-  //     图是空的（一个价格都没有）→ 真的有问题，黄色
-  //     图已经画出来了，只是有几个商品没价格 → 只是说明，蓝色
-  //   把后者也涂成黄色，等于为一个 2% 的偏差拉响警报——
-  //   而告警一旦变成噪音，真正该看的那个就没人看了（同 dedup 里
-  //   "灰色地带不能塞满假阳性"那条取舍）。
-  //
+  // 提醒的颜色按"图画没画出来"分：图空 → 黄色告警；图画出来了只是有几个商品没价格 → 蓝色说明。
+  // 把后者也涂成黄色等于为一个 2% 的偏差拉警报——告警变成噪音，真正该看的就没人看了。
   //   判断依据就是"有没有柱子"，不需要后端再多返回一个字段。
   const hasBars = !!(data.buckets && data.buckets.length);
   showNotice(noticeId, data.notice, hasBars ? 'info' : 'warn');
@@ -171,14 +130,11 @@ function renderPriceDistribution(elId, emptyId, noticeId, data) {
   }, true);
 }
 
-/* ---------------------------------------------------------------------------
- * 图表 2：销量 Top20
- * ------------------------------------------------------------------------ */
+/* 图表 2：销量 Top20 */
 
 function renderSalesTop(elId, emptyId, noticeId, data) {
-  // ★ 这里是全项目最需要"好好说人话"的地方。
-  //   真实电商的销量不在网页端公开，所以 ?source=smzdm 下必然是空的。
-  //   一条解释，把"看起来像坏了"变成"这是已知的、有意的边界"。
+  // 真实电商的销量不在网页端公开，?source=smzdm 下必然是空的；
+  // 一条解释把"看起来像坏了"变成"已知的、有意的边界"。
   showNotice(noticeId, data.notice);
 
   if (!data.items || !data.items.length) {
@@ -189,8 +145,7 @@ function renderSalesTop(elId, emptyId, noticeId, data) {
 
   const chart = _getChart(elId);
   if (!chart) return;
-
-  // ECharts 的 y 轴类目默认是**从下往上**排的，所以要反过来喂数据，
+  // ECharts 的 y 轴类目默认从下往上排，所以要反过来喂数据，第 1 名才会在最上面。
   // 第 1 名才会出现在最上面。
   const items = [...data.items].reverse();
 
@@ -198,17 +153,9 @@ function renderSalesTop(elId, emptyId, noticeId, data) {
     grid: { left: 150, right: 70, top: 16, bottom: 34 },
     tooltip: {
       trigger: 'item',
-      // ★ tooltip 里显示**完整标题**，而不是图例上那个被截断的。
-      //
-      //   这不是可有可无的装饰：后端截断图例标签时，无论怎么截
-      //   都不能保证不同的 SKU 一定长得不一样（颜色后面常常还跟着
-      //   "商务款/送礼佳品"这类营销语）。所以"图例只负责放得下，
-      //   全文交给 tooltip"是这个问题真正的修法。
-      //   见 app/textutil.py 的模块注释。
-      // ★ 返回的字符串**会被 echarts 赋给 innerHTML**，所以要自己转义。
-      //   这几个字段全部来自采集数据（标题、品牌、店铺），
-      //   而"文本填进 DOM 用 textContent"这条纪律管不到这里——
-      //   详见 api.js 里 escapeHtml 上方那段注释。
+      // tooltip 显示完整标题：后端截断图例标签无法保证不同 SKU 长得不一样
+      // （颜色后面常跟营销语），"图例只负责放得下、全文交给 tooltip"才是修法（见 app/textutil.py）。
+      // 返回的字符串会被 echarts 赋给 innerHTML，必须自己转义（见 api.js 的 escapeHtml）。
       formatter: (p) => {
         const it = items[p.dataIndex];
         return [
@@ -249,9 +196,7 @@ function renderSalesTop(elId, emptyId, noticeId, data) {
   }, true);
 }
 
-/* ---------------------------------------------------------------------------
- * 图表 3：店铺占比
- * ------------------------------------------------------------------------ */
+/* 图表 3：店铺占比 */
 
 function renderShopShare(elId, emptyId, noticeId, data) {
   showNotice(noticeId, data.notice);
@@ -268,17 +213,15 @@ function renderShopShare(elId, emptyId, noticeId, data) {
   chart.setOption({
     tooltip: {
       trigger: 'item',
-      // ★ 同样是 innerHTML 出口，理由见上面销量排行那条注释。
+      // 同样是 innerHTML 出口，理由见上面销量排行那条注释。
       formatter: (p) => {
         const it = data.items[p.dataIndex];
         return [
           `<b>${escapeHtml(it.shop)}</b>`,
           it.platform ? `平台：${escapeHtml(it.platform)}` : null,
           `商品数：<b>${it.product_count}</b>（${fmtPct(it.share)}）`,
-          // ★ 无价商品会被排除在均价之外（均价只能对算得出来的价格求平均），
-          //   所以两者不等时**必须把分母写出来**。不写的话
-          //   "商品数 100 ｜ 均价 ¥99"会被读成"100 件商品的均价是 99"，
-          //   而真实采集源今天就是这个情况（100 条里 2 条解析不出价格）。
+          // 无价商品被排除在均价外，两者不等时必须写出分母，
+          // 否则"商品数 100 ｜ 均价 ¥99"会被读成 100 件商品的均价。
           it.avg_price !== null
             ? `均价：${fmtPrice(it.avg_price)}` +
               (it.priced_count < it.product_count
@@ -291,8 +234,7 @@ function renderShopShare(elId, emptyId, noticeId, data) {
     series: [
       {
         type: 'pie',
-        radius: ['42%', '68%'],   // 环形而不是实心饼：中间那块空白
-                                  // 反而让外围的扇区更容易比较长度
+        radius: ['42%', '68%'],   // 环形而不是实心饼：中间空白让外围扇区更容易比较长度
         center: ['50%', '52%'],
         data: data.items.map((it) => ({ name: it.shop, value: it.product_count })),
         itemStyle: { borderColor: '#fff', borderWidth: 2 },
@@ -303,9 +245,7 @@ function renderShopShare(elId, emptyId, noticeId, data) {
           fontSize: 11,
         },
         labelLine: { length: 10, length2: 10 },
-        // ★ 扇区多的时候外标签必然互相压。hideOverlap 让 ECharts
-        //   自动藏掉挤在一起的标签，而不是画成一团黑。
-        //   （被藏掉的信息仍然可以 hover 出来。）
+        // hideOverlap 让挤在一起的外标签自动藏掉（被藏的信息仍可 hover），而不是画成一团黑。
         labelLayout: { hideOverlap: true },
         emphasis: { scale: true, scaleSize: 6 },
       },
@@ -313,9 +253,7 @@ function renderShopShare(elId, emptyId, noticeId, data) {
   }, true);
 }
 
-/* ---------------------------------------------------------------------------
- * 图表 4：关键词词云
- * ------------------------------------------------------------------------ */
+/* 图表 4：关键词词云 */
 
 let _wordCloudWarned = false;
 
@@ -332,18 +270,15 @@ function renderKeywords(elId, emptyId, noticeId, data) {
   if (!chart) return;
 
   const option = {
-    // ★ 词云的 name 是 jieba 从商品标题里切出来的，仍然属于外部数据，
-    //   一样要转义（理由同销量排行的 tooltip）。
+    // 词云的 name 是 jieba 从商品标题里切出来的外部数据，一样要转义。
     tooltip: { formatter: (p) => `${escapeHtml(p.name)}：出现 <b>${p.value}</b> 次` },
     series: [
       {
         type: 'wordCloud',
         shape: 'circle',
-        // 尺寸范围：太小看不清，太大放不下几个词。
-        // 12~48 在 340px 高的容器里大约能塞下 60~90 个词。
+        // 尺寸范围：太小看不清、太大放不下几个词；12~48 能塞下约 60~90 个词。
         sizeRange: [12, 48],
-        rotationRange: [0, 0],   // 不旋转。中文竖排/斜排在词云里几乎读不出来，
-                                 // 而且会让整体看起来很乱——这是纯观感取舍。
+        rotationRange: [0, 0],   // 不旋转：中文竖排/斜排几乎读不出来，纯观感取舍。
         gridSize: 6,
         drawOutOfBound: false,
         layoutAnimation: true,
@@ -361,18 +296,9 @@ function renderKeywords(elId, emptyId, noticeId, data) {
   try {
     chart.setOption(option, true);
   } catch (err) {
-    /* ★ 这个 try/catch 是为一个**特定的、报错信息会误导人的**故障准备的。
-     *
-     *   echarts-wordcloud 插件加载失败（CDN 挂 + 本地 vendor 也没下到）时，
-     *   ECharts 抛的是：
-     *       "series.wordCloud not exists. Load it first."
-     *   这句话会把人引向"是不是我 type 写错了 / 是不是要 import"，
-     *   而真实原因是插件脚本压根没到位。
-     *
-     *   所以这里把它翻译成一句能直接行动的话。
-     *   （另一个已知的坑：插件 2.1.0 只兼容 echarts ^5.0.1，
-     *     升到 ECharts 6 也会报同一句错。所以本地 vendor 锁的是 5.6.0。）
-     */
+    /* try/catch 是为一个报错信息会误导人的故障准备的：echarts-wordcloud 插件没加载出来时
+       ECharts 报 "series.wordCloud not exists. Load it first."——会把人引向"type 写错了"。
+       （另一个坑：插件 2.1.0 只兼容 echarts ^5.0.1，升到 6 也报同一句错，所以 vendor 锁 5.6.0。） */
     if (!_wordCloudWarned) {
       _wordCloudWarned = true;
       console.error('[词云] 渲染失败，通常是 echarts-wordcloud 插件没加载出来：', err);
@@ -385,26 +311,15 @@ function renderKeywords(elId, emptyId, noticeId, data) {
   }
 }
 
-/* ---------------------------------------------------------------------------
- * 图表 5：单个商品的价格历史（详情弹窗里用）
- * ------------------------------------------------------------------------ */
+/* 图表 5：单个商品的价格历史（详情弹窗里用） */
 
 function renderPriceHistory(elId, data) {
   const chart = _getChart(elId);
   if (!chart) return;
 
-  // ★ 没有价格点时**必须显式清空**，不能直接 return。
-  //
-  //   _getChart 是按容器 id 缓存实例的，而详情弹窗只换内容、不换容器——
-  //   所以关掉弹窗再打开另一件商品时，画布不会自己重置。
-  //   直接 return 的话，上一件商品的曲线会**原样留在新商品的标题下面**，
-  //   看起来就是"这件商品的价格历史"，而它是假的。
-  //
-  //   真实数据里马上能撞到：id=1023、id=1098 这两条 smzdm 商品的价格点数为 0，
-  //   而其余 98 条都 ≥1 点。先开有点的、再开这两条，就会看到残留。
-  //
-  //   "为什么没有价格点"由详情接口的 notice 负责解释（弹窗里 m-notice 那块），
-  //   这里只负责一件事：**别把上一条曲线留着冒充这一条的。**
+  // 没有价格点时**必须显式清空**，不能直接 return：_getChart 按容器 id 缓存实例、
+  // 详情弹窗只换内容不换容器，直接 return 会把上一件商品的曲线原样留在新标题下面冒充它。
+  // （"为什么没有价格点"由详情接口的 notice 解释；这里只负责别留假曲线。）
   if (!data.points.length) {
     chart.clear();
     return;
@@ -423,9 +338,8 @@ function renderPriceHistory(elId, data) {
         return [
           fmtTime(pt.recorded_at),
           `价格：<b>${fmtPrice(pt.price)}</b>`,
-          // ★ 把 source_ref 显示出来，是为了让"事件归并"这件事可见：
-          //   每个价格点对应一篇爆料文章，同一个商品被反复爆料，
-          //   这里就会长出多个点。这是 mock 数据给不了的证据。
+          // 把 source_ref 显示出来让"事件归并"可见：每个价格点对应一篇爆料，
+          // 同一商品被反复爆料就会长出多个点——这是 mock 数据给不了的证据。
           pt.source_ref ? `来源爆料：${escapeHtml(pt.source_ref)}` : null,
         ].filter(Boolean).join('<br/>');
       },
@@ -433,7 +347,7 @@ function renderPriceHistory(elId, data) {
     xAxis: {
       type: 'category',
       data: times,
-      name: data.x_axis_label,   // ★ 如实标注：x 轴到底是什么时间
+      name: data.x_axis_label,   // 如实标注：x 轴到底是什么时间
       nameLocation: 'middle',
       nameGap: 30,
       nameTextStyle: { color: '#9ca3af' },
@@ -444,9 +358,7 @@ function renderPriceHistory(elId, data) {
     yAxis: {
       type: 'value',
       name: '元',
-      scale: true,        // ★ 不从这个 0 开始。价格全在 100~130 之间时，
-                          //   从 0 起画会把 30 元的波动压成一条直线，
-                          //   看起来"价格就没变过"——那是图在骗人。
+      scale: true,        // 不从 0 开始：价格全在 100~130 时从 0 起画会把波动压成直线——那是图在骗人。
       nameTextStyle: { color: '#9ca3af' },
       ...AXIS_STYLE,
     },
@@ -454,8 +366,7 @@ function renderPriceHistory(elId, data) {
       {
         type: 'line',
         data: prices,
-        smooth: false,      // 不做平滑：平滑会在两个数据点之间
-                            // 画出实际不存在的中间值，价格曲线尤其不该这样
+        smooth: false,      // 不做平滑：平滑会画出实际不存在的中间值，价格曲线不该这样。
         symbolSize: 4,
         lineStyle: { color: PALETTE[0], width: 2 },
         itemStyle: { color: PALETTE[0] },
@@ -468,9 +379,8 @@ function renderPriceHistory(elId, data) {
             { type: 'max', name: '最高', itemStyle: { color: '#dc2626' } },
           ],
         },
-        // 只有一个点时（真实采集的常态）线画不出来，
-        // 但 symbol 还看得见。markPoint 也照常显示，
-        // 于是"这个商品只被爆料过一次"在图上仍然有信息量。
+        // 只有一个点时线画不出来，但 symbol 和 markPoint 照常显示，
+        // "只被爆料过一次"在图上仍然有信息量（真实采集的常态）。
       },
     ],
   }, true);

@@ -1,23 +1,8 @@
-"""Mock 数据自检图 —— 在阶段① 就暴露"数据一眼假"。
+"""Mock 数据自检图：在阶段① 就暴露"数据一眼假"（统计指标证明不了形状对）。
 
-================================================================================
-为什么要在最早期画这三张图
-================================================================================
-Mock 数据的统计指标（中位数、变异系数、幂律指数）只能证明**数字**对，
-证明不了**形状**对。
-
-一个真实踩过的例子：价格序列最初写成 `p[t] = p[t-1] * (1 + ε)`，
-所有统计指标都"正常"——中位数对、量级对、没有负值。
-但画出来是一条**一路下滑的滑梯**：乘性误差累积导致 90 天后价格
-只剩初始值的 12%。这个错误用数字查不出来，用眼睛一眼就看出来了。
-
-所以这三张图不是"给别人看的演示素材"，而是**开发期的自检工具**：
-  · 价格直方图   → 检验分布形状（对数正态应该是右偏的单峰，不是均匀的方块）
-  · Top20 条形图 → 检验幂律梯度（应该每根柱都可见，不是一根高十九根贴地）
-  · 单商品曲线   → 检验无漂移（应该围绕基准价波动，不是滑梯或单调上涨）
-
-顺带它们也是 README 的配图——一份有数据分布图的 README，
-和一份只有截图的 README，可信度完全不同。
+三张图的用途：价格直方图 → 检验分布形状（右偏单峰）；Top20 条形图 → 检验幂律梯度；
+单商品曲线 → 检验无漂移（曾有累乘误差让价格一路下滑成滑梯，数字查不出、图上一眼看穿）。
+顺带它们也是 README 的配图。
 
 用法：
     python spike/plot_seed.py            # 用已入库的数据画
@@ -34,9 +19,8 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 
-# ★ 必须在 import pyplot 之前设置后端。
-#   Windows 上默认后端会尝试开 GUI 窗口，在无头环境（CI、远程终端）会挂。
-#   Agg 是纯文件输出后端，不需要显示器。
+# 必须在 import pyplot 之前设置后端：Windows 默认后端会开 GUI 窗口，无头环境（CI、远程终端）会挂。
+# Agg 是纯文件输出后端。
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
@@ -50,9 +34,7 @@ from app.db.models import PriceHistory, Product  # noqa: E402
 # 输出目录
 CHARTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "charts"
 
-# ★ 中文字体设置。不设的话所有中文标签会变成一排方框（tofu），
-#   图上写着"□□□□"，等于没画。
-#   Windows 上用微软雅黑，Linux 上退到思源黑体。
+# 中文字体：不设的话中文标签全变方框（tofu）；Windows 用微软雅黑，Linux 退到思源黑体。
 plt.rcParams["font.sans-serif"] = [
     "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei",
 ]
@@ -94,22 +76,8 @@ def plot_price_histogram(prices: np.ndarray) -> Path:
     """图 1：价格分布直方图。检验形状是右偏单峰，不是均匀方块。"""
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    # ★ 分箱必须对齐价格网格（quantize_price 的 10 元步长），否则会出现混叠。
-    #
-    #   这是画第一版时踩到的：用 bins=50（约 12 元一箱）时，图上出现一串
-    #   突兀的尖刺——因为 289.9 和 299.9 被分进同一箱、而 299.9 和 309.9
-    #   被分进两箱，于是某些箱子是别人的两倍高。
-    #
-    #   那不是数据的问题，是**对一个离散变量用了任意宽度的箱子**。
-    #   价格本来就是离散的（真实电商同样如此），把箱子对齐到网格，
-    #   图才是诚实的。
-    #
-    # ★ 300 元以上会出现"空洞"，这也不是丢数据：
-    #   quantize_price 的步长在 300 元处从 10 元跳到 50 元，
-    #   所以 350 附近的取值只会是 349.9、400 附近的只会是 399.9——
-    #   用 10 元宽的箱子去装，中间那些箱子自然是空的。
-    #   真实电商的心理定价本来就是这样分段的，所以不修数据，
-    #   而是让图**自己说明**这件事（见下面文本框里那一行）。
+    # 分箱必须对齐价格网格（quantize_price 的 10 元步长），否则出现混叠；
+    # >300 元出现"空洞"是 50 元步长定价所致（图里已注明），不是丢数据。
     grid = 10
     bins = np.arange(
         grid * np.floor(prices.min() / grid),
@@ -128,19 +96,16 @@ def plot_price_histogram(prices: np.ndarray) -> Path:
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
 
-    # ★ 把关键统计量写在图里，这样这张图既是自检工具也是文档素材——
-    #   看的人不用去翻代码就知道数据是用什么参数生成的。
+    # 关键统计量写在图里：看图的人不用翻代码就知道数据用什么参数生成。
     skew = float(np.mean(((prices - prices.mean()) / prices.std()) ** 3))
     ax.text(
         0.98, 0.95,
         f"样本 {len(prices)} 个\n"
         f"中位数 {med:.0f} 元\n"
         f"p5–p95  {np.percentile(prices, 5):.0f}–{np.percentile(prices, 95):.0f} 元\n"
-        # ★ 不要用 ✓ 之类的符号字符：微软雅黑里没有这个字形，
-        #   会渲染成一排方框，matplotlib 还会顺手打一条 UserWarning。
+        # 不用 ✓ 之类符号：微软雅黑没有该字形，会渲染成方框并触发警告。
         f"偏度 {skew:.2f}（右偏）\n"
-        # ★ 这一行是给看图的人（尤其是面试官）的解释：
-        #   不给的话，300 元以上那串空洞会被误读成"数据丢了"。
+        # 给看图的人解释 >300 元的空洞，否则会被误读成"数据丢了"。
         f"注：>300 元为 50 元步长定价，故柱间隔变宽",
         transform=ax.transAxes, ha="right", va="top", fontsize=9,
         bbox=dict(boxstyle="round", facecolor="#F5F5F5", edgecolor="#CCCCCC"),
@@ -154,22 +119,9 @@ def plot_price_histogram(prices: np.ndarray) -> Path:
 
 
 def elide(text: str, budget: int = 46) -> str:
-    """按【显示宽度】截断：中文算 2 个单位，ASCII 算 1 个。
+    """按【显示宽度】截断：中文算 2 个单位、ASCII 算 1 个。
 
-    ★ 为什么不能用 `t[:14]` 这种按字符数的截断：
-
-      这是画这一版时发现的——图上出现了三条看起来一模一样的
-      "绿联 磁吸手机指环扣 金属 …"，销量却是 45794 / 7595 / 7022，
-      看起来像"同一个商品被记了三次、销量还不一样"这种严重的数据错误。
-
-      实际去查库才发现 Top20 里 19 个标题都是唯一的：那三条是
-      **不同颜色的 SKU**（深空灰 / 黑色 / 白色），而颜色恰好是
-      标题的最后两个字，被字符截断切掉了。
-
-      → 数据没错，是**图在骗人**。按字符数截断对中文天然不公平：
-        15 个中文字占的宽度是 15 个英文字母的 1.8 倍左右，
-        而"数码配件"这个品类的标题恰恰是"品牌中文 + 型号英文 + 规格 + 颜色"，
-        最需要保留的颜色和规格都在尾部。
+    按字符数截断会把中文标题尾部的颜色/规格切掉，图上出现假的"重复商品"。
     """
     out, width = [], 0
     for ch in text:
@@ -186,8 +138,7 @@ def plot_sales_top(sales: list[int], titles: list[str], limit: int = 20) -> Path
     top = sales[:limit]
     labels = [elide(t) for t in titles[:limit]]
 
-    # 宽度从 10 加到 11：标签预算放宽到 46 个单位后需要更多横向空间，
-    # 否则 y 轴标签区会挤占绘图区，柱子变短。
+    # 宽度 11：标签预算 46 单位需要更多横向空间，否则 y 轴标签挤占绘图区。
     fig, ax = plt.subplots(figsize=(11, 6))
     # 从深到浅的蓝色梯度，视觉上强化"名次"这个维度
     colors = plt.cm.Blues(np.linspace(0.85, 0.35, len(top)))[::-1]
@@ -200,14 +151,11 @@ def plot_sales_top(sales: list[int], titles: list[str], limit: int = 20) -> Path
     ax.set_title(f"Mock 数据 · 销量 Top{limit}（幂律 α=0.85）", fontsize=13)
     ax.grid(axis="x", alpha=0.3)
 
-    # 在柱子末端标数值
     for bar, val in zip(bars, top):
         ax.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
                 f"{val:,}", va="center", fontsize=8)
 
-    # ★ 右侧留 12% 空白。
-    #   不留的话，最长那根柱子的数值标签会被画到坐标轴外面裁掉，
-    #   而偏偏被裁掉的是最显眼的第 1 名数值。
+    # 右侧留 12% 空白：否则最长柱的数值标签会被裁掉——偏偏是最显眼的第 1 名。
     ax.set_xlim(0, max(top) * 1.12)
 
     ratio = top[0] / top[-1] if top[-1] else 0
@@ -228,8 +176,7 @@ def plot_sales_top(sales: list[int], titles: list[str], limit: int = 20) -> Path
 
 def plot_price_series(series: dict[int, list[float]], sample: int = 3) -> Path:
     """图 3：抽样商品的价格曲线。检验无漂移、促销有尖峰。"""
-    # 挑价格波动有代表性的几个：按变异系数排序取中位数附近，
-    # 而不是随机取——随机取可能全抽到没促销的平线，看不出问题。
+    # 按变异系数排序取中位数附近：随机取可能全抽到没促销的平线。
     scored = sorted(
         ((np.std(v) / np.mean(v), pid, v) for pid, v in series.items() if len(v) > 40),
         key=lambda x: x[0],
@@ -247,9 +194,7 @@ def plot_price_series(series: dict[int, list[float]], sample: int = 3) -> Path:
         base = float(np.median(values))
         ax.plot(range(len(values)), values, color="#4C8BF5", linewidth=1.4)
 
-        # ★ 基准线是这张图的重点：所有价格应该围绕它波动。
-        #   如果曲线整体偏离基准线（跑成滑梯），一眼就能看出来——
-        #   这正是累乘漂移 bug 的典型症状。
+        # 基准线是重点：价格应围绕它波动；整体偏离（滑成滑梯）正是累乘漂移 bug 的症状。
         ax.axhline(base, color="#E8453C", linestyle="--", linewidth=1.2,
                    label=f"基准 {base:.0f} 元")
 

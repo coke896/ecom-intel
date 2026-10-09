@@ -1,19 +1,9 @@
 """归并逻辑测试。
 
-★ 这个文件的用例几乎全部来自真实 SMZDM 标题，而且**来自一次失败的标定**。
-
-  最初的设计是「硬门槛 + Dice 软门槛」，软门槛负责判定"是不是同一商品"。
-  用 277 条真实标题标定后这个设计被推翻了：三种相似度指标
-  （Dice / Jaccard / 包含度）都无法区分真阳性和假阳性。
-  最致命的一对是 'iPhone 18 Pro' vs 'iPhone Duo'（不同商品）
-  拿到 Dice 0.727 / 包含度 0.800，高于四个真阳性里的三个。
-
-  现在这个文件里的 test_never_merges_dangerous_pairs 就是那次标定的
-  **回归测试**——它守着"这两对永远不能被自动归并"这条底线。
-  任何人日后想放宽型号 token 的比较规则（比如改成子集相容），
-  这个测试会立刻失败，并告诉他为什么不能放宽。
-
-★ 浮点比较用 pytest.approx，不要用 ==。
+用例几乎全部来自真实 SMZDM 标题，且来自**一次失败的标定**：最初的「硬门槛 + Dice
+软门槛」设计在 277 条真实标题上被推翻——三种相似度指标都分不开真阳和假阳
+（'iPhone 18 Pro' vs 'iPhone Duo' 拿到 Dice 0.727），test_never_merges_dangerous_pairs
+是那次标定的**回归测试**。★ 浮点比较用 pytest.approx，不要用 ==。
 """
 
 from __future__ import annotations
@@ -40,9 +30,7 @@ from scraper.dedup import (
     tokenize,
 )
 
-# ===========================================================================
 # 真实语料（从 277 条真实爆料标题里摘出来的）
-# ===========================================================================
 
 T_FREECLIP2_LONG = "华为 FreeClip 2 耳夹式多单元动圈蓝牙耳机 冰莓紫 Type-C"
 T_FREECLIP2_SHORT = "华为 FreeClip 2 耳夹式耳机"
@@ -89,9 +77,7 @@ def decide_against(candidate_title: str, existing_title: str, **kw) -> Decision:
     return decide(cand, [existing_of(1, existing_title)]).decision
 
 
-# ===========================================================================
 # 标题归一化
-# ===========================================================================
 
 
 @pytest.mark.parametrize(
@@ -100,15 +86,12 @@ def decide_against(candidate_title: str, existing_title: str, **kw) -> Decision:
         # 标点切成空格，避免 "iPhone-18-Pro" 和 "iPhone 18 Pro" 被当成不同的词
         ("iPhone-18-Pro", "iphone 18 pro"),
         ("A+B", "a b"),
-        # 大小写归一
         ("IPHONE 18 PRO", "iphone 18 pro"),
-        # 全角数字归一
         ("１９９元", "199元"),
-        # 促销噪声词去掉（★ 替换成空格而不是删除，否则会粘住相邻的词）
+        # 促销噪声词去掉
         ("百亿补贴：酷态科 充电宝", "酷态科 充电宝"),
         ("今日必买：京觅 猕猴桃", "京觅 猕猴桃"),
         ("好价 包邮 苹果", "好价 苹果"),
-        # 连续空白压缩
         ("  a   b  ", "a b"),
     ],
 )
@@ -117,18 +100,13 @@ def test_normalize_title(title: str, expected: str) -> None:
 
 
 def test_noise_word_removal_does_not_glue_words_together() -> None:
-    """★ 噪声词必须【替换成空格】，不能直接删掉。
-
-    删掉的话 "百亿补贴酷态科" 会变成一个 token，切不出 "酷态科"，
-    品牌就丢了。
-    """
+    """★ 噪声词必须【替换成空格】，不能直接删掉：删掉的话 "百亿补贴酷态科" 会粘成
+    一个 token，切不出 "酷态科"，品牌就丢了。"""
     assert "酷态科" in tokenize(normalize_title("百亿补贴酷态科 充电宝"))
     assert "补贴" not in normalize_title("百亿补贴：酷态科")
 
 
-# ---------------------------------------------------------------------------
-# ★ 字母数字边界：标定时发现的真 bug
-# ---------------------------------------------------------------------------
+# 字母数字边界：标定时发现的真 bug
 
 
 @pytest.mark.parametrize(
@@ -142,12 +120,8 @@ def test_noise_word_removal_does_not_glue_words_together() -> None:
 )
 def test_alnum_boundary_split(title: str, expected_tokens: set[str]) -> None:
     """★ 字母和数字的交界处要切开。
-
-    标定时撞到的 bug：
-      同一款商品写成 'FreeClip 2'（带空格）和 'freeclip2'（不带），
-      型号 token 分别是 {2} 和 {freeclip2}，不相等，硬门槛把同款判成了两个商品。
-    这个测试守着修复。
-    """
+    ★ 标定时撞到的 bug：'FreeClip 2'（带空格）和 'freeclip2'（不带）的型号 token
+      分别是 {2} 和 {freeclip2}，硬门槛把同款判成了两个商品。"""
     assert tokenize(normalize_title(title)) == expected_tokens
 
 
@@ -158,17 +132,14 @@ def test_freClip2_spacing_variants_have_same_model_tokens() -> None:
     assert model_a == model_b == frozenset({"2"})
 
 
-# ===========================================================================
 # 型号 token 提取 —— 硬门槛的核心
-# ===========================================================================
 
 
 @pytest.mark.parametrize(
     ("title", "expected"),
     [
-        # 含数字的 token。
-        # ★ 注意 '5G手机' 切分后是 '5' + 'g手机'——'g手机' 不含数字也不在后缀词表里，
-        #   所以不进型号集；'5' 进（4G 和 5G 确实是不同 SKU）。
+        # 含数字的 token。★ '5G手机' 切分后是 '5' + 'g手机'——'g手机' 不进
+        #   型号集，'5' 进（4G 和 5G 确实是不同 SKU）。
         (T_IPHONE_18PRO, {"18", "pro", "5"}),
         (T_FREECLIP2_SHORT, {"2"}),
         # ★ 纯字母的型号后缀词也要抓——否则 iPhone 18 Pro 和 18 Pro Max 型号集相同
@@ -185,13 +156,9 @@ def test_extract_model_tokens(title: str, expected: set[str]) -> None:
 
 
 def test_model_suffix_words_catch_pro_vs_pro_max() -> None:
-    """★ 这是 MODEL_SUFFIX_WORDS 存在的唯一理由。
-
-    'Pro' 和 'Max' 是纯字母，不含数字。"只提取含数字的 token"这个朴素规则
-    会让 'iPhone 18 Pro' 和 'iPhone 18 Pro Max' 得到相同的型号集合 {18}，
-    通过硬门槛，然后被相似度（包含度 0.857）判为同一商品——
-    但它们是两个 SKU，价格也不同。
-    """
+    """★ 这是 MODEL_SUFFIX_WORDS 存在的唯一理由：'Pro'/'Max' 是纯字母不含
+    数字，"只提取含数字的 token"会让 'iPhone 18 Pro' 和 'Pro Max' 型号集都是
+    {18}，通过硬门槛后被包含度 0.857 判为同一商品——但它们是两个 SKU。"""
     _, pro, _ = sig("Apple 苹果 iPhone 18 Pro 5G手机")
     _, pro_max, _ = sig("Apple iPhone 18 Pro Max 5G手机 256GB")
     assert pro != pro_max
@@ -199,16 +166,12 @@ def test_model_suffix_words_catch_pro_vs_pro_max() -> None:
     assert "max" not in pro
 
 
-# ===========================================================================
 # 硬门槛
-# ===========================================================================
 
 
 def test_brands_compatible_fail_open_on_none() -> None:
-    """★ 提取不出品牌时视为【通过】—— 无证据不否决。
-
-    不加这条的话，白牌/杂牌商品（brand 永远是 None）永远无法归并。
-    """
+    """★ 提取不出品牌时视为【通过】——无证据不否决；不加这条的话，白牌/杂牌商品
+    （brand 永远是 None）永远无法归并。"""
     assert brands_compatible(None, None) is True
     assert brands_compatible(None, "huawei|华为") is True
     assert brands_compatible("huawei|华为", None) is True
@@ -232,23 +195,14 @@ def test_brands_compatible_matches_any_alias() -> None:
     ],
 )
 def test_extract_brand(brand_field: str | None, expected: str | None) -> None:
-    """★ 参数名从 `title` 改成了 `brand_field`。
-
-    改的不是个名字——原来叫 title 是因为早期有个"从标题猜品牌"的方案，
-    那个方案已经被否决了（猜错会同时污染硬门槛和品牌分析）。
-    参数名留着 title，读代码的人会以为这里会去看标题。
-    """
+    """★ 参数名从 `title` 改成 `brand_field`：早期"从标题猜品牌"的方案已被否决
+    （猜错会同时污染硬门槛和品牌分析），留着旧名会让人以为这里会看标题。"""
     assert extract_brand(brand_field) == expected
 
 
-# ---------------------------------------------------------------------------
-# 品牌的双形态：库里存显示形态，比对时现算规范形态
-#
-# ★ 这一节是后补的，来源是一次真实的不一致：
-#   products.brand 这一列同时存在过两种格式（"Soundcore/声阔" 和
-#   "soundcore|声阔"），取决于数据是从 seed 直写还是从采集管道进来的。
-#   后果是同一品牌的商品在硬门槛上永远匹配不上，而**归并失败不报错**。
-# ---------------------------------------------------------------------------
+# 品牌的双形态：库里存显示形态，比对时现算规范形态。★ 来源是一次真实的不一致：
+# products.brand 同时存在过 "Soundcore/声阔" 和 "soundcore|声阔" 两种格式（取决于
+# seed 直写还是采集管道），后果是同一品牌在硬门槛上永远匹配不上——不报错。
 
 
 @pytest.mark.parametrize(
@@ -257,26 +211,15 @@ def test_extract_brand(brand_field: str | None, expected: str | None) -> None:
 )
 def test_extract_brand_is_idempotent(canonical: str) -> None:
     """★ 幂等：喂规范形态进去，出来的还是它自己。
-
-    这条性质让调用方**不必知道**手上的字符串是哪种形态——
-    采集管道拿的是源站原文，`load_existing` 拿的是库里的显示形态，
-    两边都直接喂进来就对。
-
-    少一个"这个字段现在是什么格式"的隐式约定，
-    就少一整类只在某个入口才出现的 bug。而这类 bug 的特点正是
-    "只有一个入口坏掉"，最难复现。
-
-    ★ 实现上它靠的是：规范形态里没有 "/"，所以按 "/" 拆只得到一段，
-      排序后拼回来还是它自己。这不是巧合，是这个格式被选中的理由之一。
-    """
+    ★ 让调用方**不必知道**手上的字符串是哪种形态（采集管道拿源站原文、`load_existing`
+      拿库里显示形态），少一个隐式约定就少一类最难复现的 bug。
+    ★ 实现靠的是规范形态里没有 "/"。"""
     assert extract_brand(canonical) == canonical
 
 
 def test_extract_brand_round_trips_from_display_form() -> None:
-    """显示形态 → 规范形态，两种入口得到同一个结果。
-
-    左边是 seed.py 写的，右边是源站字段，指向同一家品牌。
-    """
+    """显示形态 → 规范形态：seed 直写（左）和源站字段（右）两种入口
+    得到同一个结果。"""
     assert extract_brand("Soundcore/声阔") == extract_brand("soundcore|声阔")
     # 英文名和中文名的先后顺序不影响结果（实现里做了排序）
     assert extract_brand("斯凯奇/SKECHERS") == extract_brand("SKECHERS/斯凯奇")
@@ -294,26 +237,16 @@ def test_extract_brand_round_trips_from_display_form() -> None:
     ],
 )
 def test_display_brand(raw: str | None, expected: str | None) -> None:
-    """显示形态只做一件事：去首尾空白。**不做**小写、不换分隔符。
-
-    ★ "中间空白不动"是有意为之，它守的是"这个函数的职责边界"。
-      显示形态是给人看的，任何超出"去首尾空白"的改写都会让界面
-      显示出一个源站从没写过的品牌名。
-      归一化是 extract_brand 的活，两者各管各的。
-    """
+    """显示形态只做一件事：去首尾空白。**不做**小写、不换分隔符——显示形态给
+    人看，超出这个的改写会让界面显示源站从没写过的品牌名；归一化是
+    extract_brand 的活，两者各管各的。"""
     assert display_brand(raw) == expected
 
 
 def test_display_brand_is_idempotent() -> None:
     """★ 幂等：显示形态喂进去，出来的还是它自己。
-
-    这条性质和 extract_brand 的幂等一样重要，但理由不同：
-    `ingest` 里会对**已经洗过一次**的值再调一次（clean_deal 洗、
-    写库前又洗），不幂等的话品牌名会被反复加工。
-
-    实测会出问题的是全角/半角转换——`normalize_width` 若不幂等，
-    连跑两次会把已经转好的字符再转一遍。
-    """
+    ★ `ingest` 会对已经洗过一次的值再调一次（clean_deal 洗、写库前又洗），不幂等会
+      被反复加工（实测出问题的是全角/半角转换）。"""
     for raw in ["SKECHERS/斯凯奇", "Soundcore/声阔", "华为", "ＨＬＡ"]:
         once = display_brand(raw)
         assert display_brand(once) == once, f"{raw!r} 洗两次和洗一次不一样"
@@ -321,12 +254,9 @@ def test_display_brand_is_idempotent() -> None:
 
 def test_models_compatible_requires_exact_equality() -> None:
     """★ 型号 token 要求【严格相等】，不是子集、不是有交集。
-
-    放宽成子集相容的后果：'iPhone 18 Pro' {18,pro} 会与
-    'iPhone 18 Pro Max ... 256GB' {18,pro,max,256,gb} 相容 —— 但它们是两个 SKU。
-    代价是漏掉"长标题带规格 vs 短标题不带规格"的同款，见下方
-    test_known_cost_of_strict_equality。
-    """
+    ★ 放宽成子集相容：'iPhone 18 Pro' {18,pro} 会与 'Pro Max … 256GB'
+      {18,pro,max,256,gb} 相容——但它们是两个 SKU。代价是漏掉"长标题带规格"的同款，
+      见下方 test_known_cost_of_strict_equality。"""
     assert models_compatible(frozenset({"18"}), frozenset({"18"})) is True
     assert models_compatible(frozenset(), frozenset()) is True
     # 子集不算相容
@@ -336,17 +266,10 @@ def test_models_compatible_requires_exact_equality() -> None:
 
 def test_known_cost_of_strict_equality() -> None:
     """★ 严格相等的【已知代价】，明确记下来而不是假装没有。
-
-    '华为 Pura X Max 12GB+256GB …' 与 'HUAWEI 华为 Pura X Max 手机' 是同款，
-    但后者省略了规格，型号集 {max, 12, gb, 256} vs {max} 不相等 → 漏归并。
-
-    这个代价是【主动接受】的：漏归并只是少几个价格点，
-    而放宽规则会让 iPhone 18 Pro / Pro Max 这类不同 SKU 被错归并，
-    污染价格序列且静默失真。两害相权取轻。
-
-    ★ 如果哪天想让这类对至少被人工看到，改的是 GREY_ZONE 那段逻辑，
-      不要改 models_compatible。
-    """
+    '华为 Pura X Max 12GB+256GB' 与 'HUAWEI 华为 Pura X Max 手机' 是同款，但后者
+    省略规格，型号集 {max,12,gb,256} vs {max} 不相等 → 漏归并。代价是【主动接受】：
+    漏归并只少几个价格点，放宽却会让 iPhone 18 Pro / Pro Max 被错归并、静默污染
+    价格序列。★ 想让这类对被人看到，改 GREY_ZONE 那段逻辑。"""
     _, a, _ = sig("华为 Pura X Max 12GB+256GB 橄榄金小艺伴随式AI 华为大阔折叠手机")
     _, b, _ = sig("HUAWEI 华为 Pura X Max 手机")
     assert a != b
@@ -356,9 +279,7 @@ def test_known_cost_of_strict_equality() -> None:
     ) in (Decision.NEW, Decision.MARK)
 
 
-# ===========================================================================
 # 包含度
-# ===========================================================================
 
 
 def test_containment_bounds() -> None:
@@ -372,11 +293,9 @@ def test_containment_bounds() -> None:
 
 
 def test_containment_beats_dice_on_subset_relations() -> None:
-    """★ 为什么选包含度而不是 Dice / Jaccard。
-
-    同一商品的两条爆料常常是【包含关系】（短标题的词几乎都在长标题里）。
-    Dice 和 Jaccard 对长度差异敏感，会把这种关系压到阈值以下。
-    """
+    """★ 为什么选包含度而不是 Dice / Jaccard：同一商品的两条爆料常常是【包含
+    关系】（短标题的词几乎都在长标题里），而 Dice/Jaccard 对长度差异敏感，会
+    把这种关系压到阈值以下。"""
     short = {"华为", "freeclip", "2", "耳夹式耳机"}
     long = {"华为", "freeclip", "2", "耳夹式多单元动圈蓝牙耳机", "冰莓紫", "type", "c"}
 
@@ -389,9 +308,7 @@ def test_containment_beats_dice_on_subset_relations() -> None:
     assert jaccard == pytest.approx(3 / (4 + 7 - 3))             # 0.375 差得更远
 
 
-# ===========================================================================
 # ★★★ 核心回归：致命假阳性永远不能被自动归并
-# ===========================================================================
 
 
 @pytest.mark.parametrize(
@@ -435,15 +352,9 @@ def test_containment_beats_dice_on_subset_relations() -> None:
     ],
 )
 def test_never_merges_dangerous_pairs(title_a: str, title_b: str, why: str) -> None:
-    """★ 这个文件最重要的一条测试：不同商品永远不能被自动归并。
-
-    这些对全部来自真实语料，每一对都是"看起来很像但确实不是同一商品"。
-    其中前两对的文本相似度高于多个真阳性——如果把归并决策交给相似度阈值，
-    它们必然被错误合并，价格序列里会混进别的商品的价格。
-
-    允许的决策是 NEW（当新商品）或 MARK（标记待人工核对），
-    唯独不能是 MERGE。
-    """
+    """★ 这个文件最重要的一条：不同商品永远不能被自动归并。
+    这些对全部来自真实语料，前两对的文本相似度高于多个真阳性——把决策交给相似度
+    阈值它们必然被错并。允许 NEW 或 MARK，唯独不能是 MERGE。"""
     result = decide(
         Candidate(source="smzdm", source_id="1", title=title_b),
         [existing_of(1, title_a)],
@@ -455,11 +366,8 @@ def test_never_merges_dangerous_pairs(title_a: str, title_b: str, why: str) -> N
 
 
 def test_dangerous_pairs_are_flagged_not_silently_dropped() -> None:
-    """★ 硬门槛拦下但文本高度相似的对，应该被【标记】而不是静默丢弃。
-
-    漏归并是可以人工恢复的（因为被标记了），直接丢弃则永远发现不了。
-    这两对包含度 ≥ 0.75，正是最该让人看一眼的。
-    """
+    """★ 硬门槛拦下但文本高度相似的对应被【标记】而不是静默丢弃：漏归并可
+    人工恢复，直接丢弃则永远发现不了。"""
     for a, b in [
         (T_IPHONE_18PROMAX, T_IPHONE_18PRO),
         (T_IPHONE_18PRO, T_IPHONE_DUO),
@@ -472,31 +380,15 @@ def test_dangerous_pairs_are_flagged_not_silently_dropped() -> None:
         assert "硬门槛" in result.reason
 
 
-# ===========================================================================
 # ★ 已知的漏网之鱼：Pro+ 与 Pro 会被当成同一款
-# ===========================================================================
 
 
 def test_every_model_suffix_word_can_actually_be_matched() -> None:
     """★ `MODEL_SUFFIX_WORDS` 里不许有**永远命中不了**的条目。
-
-    每条词都是在 `extract_model_tokens` 里用 `tok in MODEL_SUFFIX_WORDS`
-    比对的，而 `tok` 来自 `normalize_title(...).split()`。
-    所以一个词只有当"归一化之后还能原样作为 token 出现"时才有意义。
-
-    ★ 这条测的是一个**一般性质**，不是"pro+ 没了"这个具体事实。
-      写成 `assert "pro+" not in MODEL_SUFFIX_WORDS` 的话，
-      下一个人往表里加 "ultra+" 或 "max*" 照样能加进去——
-      而这条会连它们一起挡住。
-      （原来那条 "pro+" 就是这么进去的：写的时候看着很合理，
-        因为 `+` 在标题里确实存在，只是它在**归一化阶段**就被丢掉了，
-        根本走不到这个比对。）
-
-    ★ 判据是"从上游推导"，不是"照抄一份清单"：
-      不维护一份"哪些词合法"的名单，而是真的构造一个只含该词的输入、
-      跑一遍真实的归一化，看它能不能活到比对那一步。
-      这样归一化规则改了这个测试会自动跟上。
-    """
+    ★ 判据"从上游推导"而不是照抄清单：构造只含该词的输入、跑真实归一化，看它能
+      不能活到比对那一步。
+    ★ 测一般性质：写死断言 "pro+" 不在表里的话，下一个 "ultra+" 照样能进——原来
+      那条 "pro+" 就是这么进的（`+` 在**归一化阶段**就被丢掉了）。"""
     unreachable = sorted(
         word
         for word in MODEL_SUFFIX_WORDS
@@ -508,34 +400,12 @@ def test_every_model_suffix_word_can_actually_be_matched() -> None:
 
 
 def test_pro_plus_collapses_into_pro() -> None:
-    """★ 这条测试记录的是一个**已知的、被接受的**漏网之鱼。
-
-    `Pro` 和 `Pro+` 是两个不同 SKU，但 `normalize_title()` 会把 `+`
-    当标点丢掉，于是两者归一化后**字符串完全相同**：
-
-        小米 15 Pro 手机  → '小米 15 pro 手机'
-        小米 15 Pro+ 手机 → '小米 15 pro 手机'
-
-    型号 token 集合因此相同 → 硬门槛放行 → 包含度 1.000 → 归并。
-
-    ★ 为什么不断言"它应该拦住"：现在拦不住，而且**不值得为它改归一化**。
-      实测真实数据（100 条 smzdm 标题）带 `+` 的只有 6 条，没有一条是这个
-      形态——全是分隔符（`12GB+256GB` / `12+512` / `1壶3杯+收纳包`），
-      而丢掉 `+` 对它们恰好是对的：`12GB+256GB` → {12, 256}、
-      `12GB+512GB` → {12, 512}，区分保住了。
-      要改就得动 `normalize_title`，那会让已入库的 1100 条 `title_norm`
-      和新算出来的用两套规则（models.py 存这一列就是为了避免这个），
-      需要一次数据回填。没有真实案例支撑这个代价。
-
-    ★ 所以这条测试的作用是**设一个路标**，不是描述期望：
-      哪天有人真的去改归一化、让 Pro+ 能区分开了，这条会红——
-      那一刻他会看到这里写着"改完要回填 title_norm"。
-      写在注释里的约定会烂掉，写成测试的不会。
-
-    ★ 断言的是包含度 1.000 这个**具体数字**，不只是 decision。
-      只断言 MERGE 的话，"包含度 0.79 勉强归并"和"完全同一字符串"
-      在测试里长得一样，而这两种情况的严重程度完全不同。
-    """
+    """★ 记录一个**已知的、被接受的**漏网之鱼：Pro 和 Pro+ 会被当成同一款。
+    `normalize_title()` 把 `+` 当标点丢掉，两者归一化后字符串完全相同 → 包含度 1.000
+    → 归并。★ 不值得改：实测 100 条真实标题带 `+` 的只有 6 条且全是分隔符
+    （`12GB+256GB`），丢掉恰好是对的；改动要回填已入库的 1100 条 `title_norm`——这条
+    测试是**路标**：哪天改得能区分，它会红并提示回填。
+    ★ 断言 1.000 这个**数字**：只断言 MERGE 的话，"勉强归并"和"完全相同"长得一样。"""
     a = "小米 15 Pro 手机 12GB 256GB 白色"
     b = "小米 15 Pro+ 手机 12GB 256GB 白色"
 
@@ -556,9 +426,7 @@ def test_pro_plus_collapses_into_pro() -> None:
     assert result.score == pytest.approx(1.0)
 
 
-# ===========================================================================
 # 真阳性必须能归并
-# ===========================================================================
 
 
 @pytest.mark.parametrize(
@@ -593,9 +461,7 @@ def test_merge_updates_target_and_reports_score() -> None:
     assert "包含度" in result.reason
 
 
-# ===========================================================================
 # 三档决策
-# ===========================================================================
 
 
 def test_new_when_dissimilar() -> None:
@@ -609,10 +475,8 @@ def test_new_when_dissimilar() -> None:
 
 def test_mark_when_gate_passes_but_similarity_is_grey() -> None:
     """硬门槛过了但相似度落在灰色地带 → 标记待人工核对，不自动合并。
-
-    斯凯奇那对：品牌和型号 token 都相同（都只有 '5折'，没有真正的型号），
-    但品类词不同。这正是"规则看不出来、得靠人"的情况。
-    """
+    斯凯奇那对：品牌和型号 token 都相同（型号只有 '5折'），但品类词不同——正是
+    "规则看不出来、得靠人"的情况。"""
     result = decide(
         Candidate(source="smzdm", source_id="1", title=T_SKECHERS_M),
         [existing_of(3, T_SKECHERS_W)],
@@ -645,11 +509,8 @@ def test_picks_best_candidate_among_many() -> None:
 
 
 def test_brand_mismatch_blocks_even_identical_titles() -> None:
-    """★ 品牌不同即使标题一模一样也不归并。
-
-    这看起来反直觉（标题都相同了），但品牌来自源站的结构化字段而非标题，
-    是比标题更可信的信号。两个不同品牌的同款白牌商品确实存在。
-    """
+    """★ 品牌不同即使标题一模一样也不归并：品牌来自源站的结构化字段而非标题，
+    是比标题更可信的信号——两个不同品牌的同款白牌商品确实存在。"""
     result = decide(
         Candidate(
             source="smzdm", source_id="1",
@@ -660,23 +521,14 @@ def test_brand_mismatch_blocks_even_identical_titles() -> None:
     assert result.decision is Decision.NEW
 
 
-# ===========================================================================
 # 阈值标定的回归保护
-# ===========================================================================
 
 
 def test_thresholds_match_calibration() -> None:
-    """★ 阈值是标定出来的，不是拍脑袋的——改动必须是有意识的。
-
-    标定依据（277 条真实标题、123 对人工标注，见 spike/evaluate_merge.py）：
-      通过硬门槛后需要【拒绝】的对，包含度最高 0.667
-      通过硬门槛后需要【接受】的对，包含度最低 0.400
-      → 两类仍然重叠（11 对时"可分"是小样本巧合）：
-        0.75 是"高于假阳性上限 0.667"的保守线（裕度 0.083），
-        重叠区里的同款由灰色地带（≥0.50）标记进人工队列。
-
-    如果你在改这两个数，先跑 python spike/evaluate_merge.py 看混淆矩阵。
-    """
+    """★ 阈值是标定出来的，不是拍脑袋的（277 条真实标题、123 对人工标注，见
+    spike/evaluate_merge.py）：通过硬门槛后需【拒绝】的对包含度最高 0.667、
+    需【接受】的最低 0.400——0.75 是高于假阳性上限的保守线（裕度 0.083），
+    重叠区的同款由灰色地带（≥0.50）标记进人工队列。"""
     assert MERGE_THRESHOLD == pytest.approx(0.75)
     assert GREY_ZONE_THRESHOLD == pytest.approx(0.50)
     assert GREY_ZONE_THRESHOLD < MERGE_THRESHOLD
@@ -689,15 +541,12 @@ def test_mixed_shop_suffix_is_covered_by_threshold() -> None:
     assert decide_against(b, a) is Decision.MERGE
 
 
-# ===========================================================================
 # URL 归一化
-# ===========================================================================
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        # 协议统一
         ("http://www.smzdm.com/p/123", "https://www.smzdm.com/p/123"),
         ("https://www.smzdm.com/p/123", "https://www.smzdm.com/p/123"),
         # 去尾部斜杠
@@ -709,9 +558,7 @@ def test_mixed_shop_suffix_is_covered_by_threshold() -> None:
             "https://www.smzdm.com/p/123?utm_source=weixin&utm_medium=share",
             "https://www.smzdm.com/p/123",
         ),
-        # 域名大小写归一
         ("https://WWW.SMZDM.COM/p/123", "https://www.smzdm.com/p/123"),
-        # 默认端口去掉
         ("https://www.smzdm.com:443/p/123", "https://www.smzdm.com/p/123"),
         # 非追踪参数保留，且顺序无关
         (

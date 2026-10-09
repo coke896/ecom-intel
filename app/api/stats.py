@@ -1,41 +1,15 @@
 """统计聚合接口 —— 前端 4 张图表的数据来源。
 
-端点一览（除 `/sources` 外都支持 `?source=all|mock|smzdm`）：
+端点：sources（★ **不接受 ?source=**——它返回的就是"有哪些 source"，再按
+source 过滤它没有意义）/ overview / price-distribution / sales-top /
+shop-share / keywords，除 `/sources` 外都支持 `?source=all|mock|smzdm`。
 
-    GET /api/stats/sources             数据源清单（前端据此渲染切换按钮）
-                                       ★ **不接受 ?source=** —— 它返回的
-                                       就是"有哪些 source"，再按 source
-                                       过滤它没有意义
-    GET /api/stats/overview            总览卡片
-    GET /api/stats/price-distribution  价格分布直方图
-    GET /api/stats/sales-top           销量 Top20 条形图
-    GET /api/stats/shop-share          店铺占比饼图
-    GET /api/stats/keywords            词云
-
-★ 这里原来写的是"**全部**支持"。它不是"文档略微不准"：
-  这句话和它下面两行列出的端点直接矛盾，而读的人会相信上面那句
-  （"全部"是强断言，不需要他再数一遍）。
-  现在这个例外由 tests/test_api_smoke.py 从**路由表**核对，
-  不靠人记得改这里。
-
-================================================================================
-三个贯穿本文件的决定
-================================================================================
-1. **聚合算在 Python 里，不写在 SQL 里。**
-   本项目单表最多几万行，而且这些图表全部要"一次性看全量"（直方图本来就
-   需要所有价格才能分桶）。为此写的 SQL 窗口函数会显著更难读、更难测，
-   换来的性能收益在这个量级上测不出来。
-   ★ 但这不是"永远不用 SQL"的借口——真到百万行时的做法写在
-     `_fetch_current_prices()` 的注释里，面试被问到能答。
-
-2. **排序结果必须是确定的。**
-   每一次 `order_by` 都带一个唯一的兜底列（通常是 id 或 name）。
-   原因见 `sales_top()` 里那段注释——不确定性排序会让翻页丢数据，
-   也会让测试随机变红。
-
-3. **"没有数据"要返回 200 + 空数组 + 一句解释，不能返回 404/500。**
-   前端拿不到数据时该显示一句人话，而不是一片空白。
-   这是 plan 里明确要求的空态设计，理由见 `SALES_UNAVAILABLE_NOTICE`。
+三个贯穿本文件的决定：
+1. **聚合算在 Python 里，不写在 SQL 里。** 单表最多几万行，而这些图表都要
+   "一次性看全量"；到百万行时的做法写在 `_fetch_current_prices()` 的注释里。
+2. **排序结果必须确定**：每次 `order_by` 都带一个唯一兜底列，否则翻页丢数据，
+   测试也会随机变红（理由见 `sales_top()`）。
+3. **"没有数据"返回 200 + 空数组 + 一句解释**，不返回 404/500。
 """
 
 from __future__ import annotations
@@ -57,18 +31,9 @@ from app.textutil import elide_middle
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 
 
-# ===========================================================================
-# 空态文案（★ 放在后端，不是"UI 文案写错地方了"）
-#
-# 前端当然可以自己写一句提示，但"这个数据源为什么没有销量"是**数据的事实**，
-# 不是界面风格。放在后端有三个好处：
-#   1. 只有一处需要改。将来真接了带销量的数据源，改这里就够了，
-#      不用去前端代码里搜字符串。
-#   2. 接口自己描述自己——直接 curl 也能看懂为什么是空的，
-#      不用去翻前端源码才知道"空数组是正常的"。
-#   3. 报告导出（阶段⑤）复用同一句话，不会出现"界面上说了一套、
-#      导出的 Excel 里说的是另一套"。
-# ===========================================================================
+# ---- 空态文案（★ 放在后端，不是"UI 文案写错地方了"）--------------------------
+# "这个数据源为什么没有销量"是**数据的事实**，不是界面风格：放后端只有一处需要
+# 改；接口自己描述自己（curl 也看得懂）；导出报告也复用同一句话。
 
 SALES_UNAVAILABLE_NOTICE = (
     "该数据源无销量数据。真实电商的销量是核心商业数据，网页端不公开且反爬最严；"
@@ -81,19 +46,9 @@ NO_DATA_NOTICE = "该数据源暂无数据（尚未采集）。"
 def _empty_notice(product_count: int) -> str:
     """该数据源没有可展示的数据时，返回**正确的那一句**。
 
-    ★ 这个函数是"空态文案优先级"的唯一来源，抽出来是被测试逼的：
-
-      规则本身很简单——**先看有没有商品，再看有没有销量**。
-      我在 `overview()` 里实现了它，然后在 `sales_top()` 里忘了，
-      于是"一个还没采集过的数据源"在销量图上会显示
-      "该数据源无销量数据（真实电商不公开销量）"。
-
-      这句话单独看没问题，但它是**误导**：这个源不是"有商品但没销量"，
-      而是压根什么都没采。两句话指向的行动完全不同——
-      前者是"就这样，接受它"，后者是"去跑采集"。
-
-      同一个规则写在两个地方、只漏了一处，且**不报错**——
-      这就是把它收成一个函数的原因。
+    ★ 这是"空态文案优先级"的唯一来源。规则简单——**先看有没有商品，再看有没有
+      销量**——但它曾在 `sales_top()` 漏掉，于是还没采集过的源显示"无销量数据"：
+      那句话把人指向"接受它"而不是"去跑采集"，且不报错。
     """
     return SALES_UNAVAILABLE_NOTICE if product_count > 0 else NO_DATA_NOTICE
 
@@ -101,28 +56,17 @@ def _empty_notice(product_count: int) -> str:
 def _price_notice(price_missing: int, charted: int) -> str | None:
     """价格分布图那句话的**唯一来源**（三种状态，只有一处拼字符串）。
 
-    ★ 抽成函数而不是在端点里拼，理由和 `_empty_notice` 完全相同：
-      这张图有三种状态，而它们指向的**动作完全不同**：
-
-        · 没有数据（尚未采集）        → 去跑一次采集
-        · 有商品、但一个价格都没有    → 查解析器 / 确认这个源公不公开价格
-        · 有价格、但有几个漏的        → 知道百分比的分母是多少就行
-
-      写成三处各拼一句，就会像当初 sales-top 那样漏掉一处；
-      而漏掉的表现不是报错，是**一句听起来很合理、却把人带向错误方向的话**。
-
-    ★ `charted` 和 `price_missing` 都出现在文案里，这不是啰嗦：
-      读者要能自己算出"那个百分比的分母到底是几"。
-      只写"另有 N 个没有价格"，他仍然不知道分母是 933 还是 1000。
+    ★ 抽成函数而不是在端点里拼：三种状态指向的**动作完全不同**——没有数据
+      （尚未采集）→ 去跑采集；有商品但一个价格都没有 → 查价格解析器；有几个
+      漏的 → 至少知道百分比的分母是几。
+    ★ `charted` 和 `price_missing` 都出现在文案里：读者要能自己算出分母到底是几。
     """
     if charted == 0:
         if price_missing == 0:
             return NO_DATA_NOTICE
-        # ★ 这一句是补上的，它防的是"把'解析不出价格'说成'尚未采集'"：
-        #   实测过——3 个商品全部无价格时，接口原本返回的是
-        #   "该数据源暂无数据（尚未采集）。"，而同一屏的卡片写着"商品数 3"。
-        #   触发路径不是假设：smzdm 的价格来自列表页的 z-highlight，
-        #   解析器一旦不匹配，全部价格都会变 None。
+        # ★ 防的是"把'解析不出价格'说成'尚未采集'"：3 个商品全无价格时接口原本
+        #   返回的正是"暂无数据"，而同一屏卡片写着"商品数 3"。触发路径不是假设：
+        #   smzdm 的价格来自列表页 z-highlight，解析器一旦不匹配，价格全变 None。
         return (
             f"该数据源的 {price_missing} 个商品全部没有价格，画不出分布图。"
             f"这不是「尚未采集」——请检查价格解析器，或确认该数据源是否公开价格。"
@@ -135,21 +79,14 @@ def _price_notice(price_missing: int, charted: int) -> str | None:
     return None
 
 # 店铺占比里"没有店铺信息的商品"归到这一档。
-# ★ 必须有这一档，不能让它们悄悄消失：饼图的各扇区之和必须等于 100%，
-#   否则图上看起来"少了 15%"，而没人知道那 15% 去哪了。
+# ★ 必须有这一档，不能让它们悄悄消失：饼图各扇区之和必须等于 100%，否则图上
+#   看起来"少了 15%"，而没人知道那 15% 去哪了。
 UNKNOWN_SHOP = "未知店铺"
 
 
-# ===========================================================================
-# 响应模型
-#
-# ★ 为什么要写 Pydantic 模型，而不是直接 `return {...}`：
-#   · /docs 上会显示真实的字段结构，面试官点开就能看懂接口契约，
-#     比"点 Try it out 看返回什么"专业得多
-#   · 字段一旦被误删/改名，接口立刻报 500（ValidationError），
-#     而不是前端静默拿到 undefined 然后画出一张空图
-#   · 前端照着模型写，不用靠猜
-# ===========================================================================
+# ---- 响应模型 ------------------------------------------------------------------
+# 写 Pydantic 模型而不是直接 `return {...}`：/docs 上会显示真实的字段结构；字段
+# 一旦被误删/改名会立刻 500（ValidationError），而不是前端静默拿到 undefined。
 
 
 class SourceInfo(BaseModel):
@@ -169,8 +106,8 @@ class SourcesOut(BaseModel):
 class PriceSummary(BaseModel):
     """价格分布的几个分位点。
 
-    min/max 取的是**当前价**的极值，不是历史极值。
-    历史极值属于时间序列，在 /api/products/{id}/price-history 里。
+    ★ min/max 取的是**当前价**的极值，不是历史极值（历史极值在
+      /api/products/{id}/price-history 里）。
     """
 
     min: float
@@ -203,8 +140,7 @@ class OverviewOut(BaseModel):
     )
     has_sales: bool
 
-    # 时间范围。用字符串而不是 datetime，避免前端拿到 naive 时间后
-    # 又当成 UTC 转一遍导致差 8 小时——前端只做展示，不做时区运算。
+    # 时间范围用字符串而不是 datetime，避免前端拿到 naive 时间后又当成 UTC 转一遍。
     first_recorded_at: str | None
     last_recorded_at: str | None
     last_crawled_at: str | None
@@ -223,37 +159,29 @@ class PriceBucket(BaseModel):
 
 class PriceDistributionOut(BaseModel):
     source: str
-    # ★ 明确告诉调用方这个直方图统计的是什么价。
-    #   "当前价"（每个商品一个点）和"历史价"（每个商品 90 个点）画出来
-    #   形状完全不同，不写清楚就会出现"这个图和那张表对不上"的困惑。
+    # ★ 明确告诉调用方这个直方图统计的是什么价："当前价"（每个商品一个点）和
+    #   "历史价"（每个商品 90 个点）画出来形状完全不同。
     basis: str = "current_price_per_product"
-    # ★ `total` 是**能进桶的商品数**，不是这个数据源的商品总数。
-    #   两者在有商品缺价格时会不相等（overview 的 product_count 才是总数），
-    #   而这件事原先没有任何一处说明——接口字段叫 total，前端拿它当分母，
+    # ★ `total` 是**能进桶的商品数**，不是这个数据源的商品总数——有商品缺价格时
+    #   两者不相等（overview 的 product_count 才是总数），而前端拿它当分母，
     #   读的人自然以为是"占全部商品"。
     total: int
-    # ★ 有商品、但没有价格的商品数（= 进不了任何柱子的那些）。
-    #   名字跟 overview 的 `price_missing` 保持一致——同一个事实在两个接口上
-    #   必须同名，否则前端要同时记住两个名字，而人只会记住一个。
+    # ★ 有商品、但没有价格的商品数（= 进不了任何柱子的那些）。名字和 overview 的
+    #   `price_missing` 一致——同一个事实在两个接口上必须同名。
     price_missing: int = 0
     bucket_step: float
     buckets: list[PriceBucket]
-    # ★ 这个字段是测试逼出来的：空数据源下 `buckets: []` 返回 200，
-    #   但**没有一句话解释为什么是空的**，前端只能画一张白图。
-    #   五个统计接口里其他四个都有 notice，唯独这个漏了——
-    #   而"漏一个"正是空态设计最容易出现的失败方式（逐个端点漏）。
-    #   测试 test_all_empty_endpoints_return_200_for_a_source_with_nothing
-    #   一次性把五个都检查了，就是为了防这个。
+    # ★ 测试逼出来的字段：空数据源下 `buckets: []` 返回 200，但没有一句话解释为
+    #   什么是空的。五个统计接口里其他四个都有 notice，唯独这个漏了——而"漏一个"
+    #   正是空态设计最容易出现的失败方式。
     notice: str | None = None
 
 
 class SalesTopItem(BaseModel):
     id: int
     title: str
-    # ★ 按显示宽度截断后的标题，供图表 y 轴直接用。
-    #   为什么不交给前端截：前端的 `t[:10]` 会正好踩到项目早期那个坑
-    #   （把区分 SKU 的颜色截掉），截断规则应该是后端的一处逻辑，
-    #   见 app/textutil.py 的模块注释。
+    # ★ 按显示宽度截断后的标题，供图表 y 轴直接用。截断规则应该只有后端一处
+    #   （前端的 `t[:10]` 会正好踩到项目早期那个坑），见 app/textutil.py。
     title_short: str
     brand: str | None
     platform: str | None
@@ -337,31 +265,19 @@ class KeywordsOut(BaseModel):
     notice: str | None
 
 
-# ===========================================================================
-# 内部工具
-# ===========================================================================
+# ---- 内部工具 --------------------------------------------------------------
 
 
 def _fetch_current_prices(db, source) -> tuple[list[float], int]:
-    """取回该数据源下所有商品的**当前价**，升序排好。
+    """取回该数据源下所有商品的**当前价**，升序排好。返回 (价格列表, 空价数量)。
 
-    返回 (价格列表, 价格为空的数量)。
-
-    ★ 统计口径是 `Product.price`（每个商品一个价格），
-      **不是** `price_history` 的全部价格点。
-      两者形状完全不同：前者是"这批商品现在卖多少钱"，
-      后者是"过去 90 天所有成交记录"，会被促销期和商品数量严重加权。
-      画"价格分布"要的是前者。口径写在响应的 `basis` 字段里。
-
-    ★ 到百万行时怎么改（面试会问）：
-      分位数换成 SQL——但 SQLite 没有 percentile 函数，
-      标准做法是用窗口函数
-          SELECT price, PERCENT_RANK() OVER (ORDER BY price) ...
-      或者维护一张预聚合表（按天/按类目算好分位数）。
-      直方图则可以直接在 SQL 里 `GROUP BY CAST(price/step AS INT)`，
-      返回几十行而不是几百万行。
-      现在不这么做的原因很明确：这张表只有 1000 行，
-      上面的 SQL 会让这段代码从 10 行变成 40 行，还更难测。
+    ★ 口径是 `Product.price`（每商品一个价格），**不是** price_history 的全部
+      价格点——后者是"过去 90 天所有成交记录"，会被促销期和商品数量严重加权。
+      口径写在响应的 `basis` 字段里。
+    ★ 到百万行时怎么改（面试会问）：分位数换 SQL 窗口函数
+      （`PERCENT_RANK() OVER (ORDER BY price)`）或预聚合表；直方图直接
+      `GROUP BY CAST(price/step AS INT)`。现在不做，因为这张表只有 1000 行，
+      那些 SQL 只会让代码更难测。
     """
     stmt = apply_source(select(Product.price), source).where(Product.price.is_not(None))
     prices = sorted(float(p) for p in db.execute(stmt).scalars())
@@ -373,30 +289,24 @@ def _fetch_current_prices(db, source) -> tuple[list[float], int]:
     return prices, int(missing)
 
 
-# ★ 分桶和分位数的实现在 app/aggregate.py，不在本文件。
-#   阶段 3 的 GLM 报告要喂给模型的价格分布，必须和本接口返回给前端的
-#   是**同一份计算**——否则"图上的直方图"和"报告里的结论"可能对不上，
-#   而且两边都不报错。抽出去的详细理由见 app/aggregate.py 的模块注释。
+# ★ 分桶和分位数的实现在 app/aggregate.py，不在本文件：报告要喂给模型的价格
+#   分布必须和本接口返回给前端的是**同一份计算**，否则图和结论可能对不上。
 
 
-# ===========================================================================
-# 端点 1：数据源清单
-# ===========================================================================
+# ---- 端点 1：数据源清单 ----
 
 
 @router.get("/sources", response_model=SourcesOut)
 def list_sources(db: DbDep) -> SourcesOut:
     """列出库里有数据的 source 及各自的家底。
 
-    ★ 前端用它来渲染数据源切换按钮上的计数（"Mock（1000）"），
-      这样"两个数据源是隔离的"这件事在界面上是**可见**的，
-      而不是只能在 README 里读到。
+    ★ 前端用它渲染数据源切换按钮上的计数（"Mock（1000）"），让"两个数据源是
+      隔离的"在界面上**可见**，而不是只能在 README 里读到。
     """
     # 三张小查询分别算，而不是一条 JOIN 全搞定。
-    # ★ 一条 JOIN 的写法会更短，但 COUNT(*) 会被价格历史表放大：
-    #   一个商品有 90 个价格点时，`COUNT(*)` 数出来的是 90 而不是 1，
-    #   要写成 COUNT(DISTINCT p.id) 才对。三个简单查询加起来只有
-    #   几毫秒，却不需要读者去验证"DISTINCT 加对了没有"。
+    # ★ JOIN 写法更短，但 COUNT(*) 会被价格历史表放大（一个商品 90 个价格点会数
+    #   出 90），要写 COUNT(DISTINCT p.id) 才对；三个简单查询只有几毫秒，却不需要
+    #   读者去验证"DISTINCT 加对了没有"。
     counts = dict(
         db.execute(select(Product.source, func.count(Product.id)).group_by(Product.source)).all()
     )
@@ -429,9 +339,7 @@ def list_sources(db: DbDep) -> SourcesOut:
     )
 
 
-# ===========================================================================
-# 端点 2：总览
-# ===========================================================================
+# ---- 端点 2：总览 ----
 
 
 @router.get("/overview", response_model=OverviewOut)
@@ -447,9 +355,8 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
         apply_source(select(func.count(func.distinct(Product.shop_id))), source)
     ).scalar_one()
 
-    # ★ 价格历史要 join 回 products 才能按 source 过滤——
-    #   price_history 表自己没有 source 列（冗余存一份会带来
-    #   "两条数据不一致时信谁"的问题，血缘关系应该只有一处）。
+    # ★ 价格历史要 join 回 products 才能按 source 过滤——price_history 表自己没有
+    #   source 列（冗余存一份会带来"两条数据不一致时信谁"的问题）。
     ph = apply_source(
         select(
             func.count(PriceHistory.id),
@@ -466,9 +373,8 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
         apply_source(select(func.max(Product.last_crawled_at)), source)
     ).scalar()
 
-    # 销量汇总。★ sales 全为 NULL 时下面这几个聚合返回的是 NULL，
-    #   所以必须用 product_count 判断，不能靠 `total == 0` 判断——
-    #   真的有一个商品销量是 0 的时候，两种情况的返回值是一样的。
+    # 销量汇总。★ sales 全为 NULL 时聚合返回的是 NULL，所以必须用非空计数判断，
+    #   不能靠 `total == 0` 判断——真的有一个商品销量是 0 时，两种情况返回值一样。
     sales_row = db.execute(
         apply_source(
             select(func.sum(Product.sales), func.max(Product.sales), func.count(Product.sales)),
@@ -515,9 +421,8 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
         price_missing=int(price_missing),
         sales=sales_summary,
         has_sales=has_sales,
-        # ★ 用 isoformat(sep=" ") 而不是 isoformat()：
-        #   全库存的是 "YYYY-MM-DD HH:MM:SS"，前端如果要排序或做字符串
-        #   比较，两种格式混用会出错。统一成 SQLite 里那个格式。
+        # ★ 用 isoformat(sep=" ") 而不是 isoformat()：全库存的是
+        #   "YYYY-MM-DD HH:MM:SS"，两种格式混用会让前端排序和字符串比较出错。
         first_recorded_at=first_at.isoformat(sep=" ") if first_at else None,
         last_recorded_at=last_at.isoformat(sep=" ") if last_at else None,
         last_crawled_at=last_crawled.isoformat(sep=" ") if last_crawled else None,
@@ -525,9 +430,7 @@ def overview(db: DbDep, source: SourceDep) -> OverviewOut:
     )
 
 
-# ===========================================================================
-# 端点 3：价格分布
-# ===========================================================================
+# ---- 端点 3：价格分布 ----
 
 
 @router.get("/price-distribution", response_model=PriceDistributionOut)
@@ -538,20 +441,11 @@ def price_distribution(
 ) -> PriceDistributionOut:
     """价格分布直方图。
 
-    ★ 没有价格的商品**进不了任何一根柱子**，所以它们既不在 `total` 里、
-      也不在任何一个桶里。这件事必须说出来——同一个文件里的店铺占比
-      就是这么处理的（见 UNKNOWN_SHOP），理由写在那边：
-      "不能让它们悄悄消失……否则图上看起来少了 15%，而没人知道那 15% 去哪了"。
-
-      直方图这一侧比饼图更隐蔽：各柱之和**是**等于 total 的，
-      图自身毫无破绽。出错的是读者对百分比的理解——
-      前端拿 total 当分母（frontend/static/js/charts.js），
-      于是"这个价位占 X%"被读成占全部商品。
-      实测偏差：真实采集源 2.0%（100 个里 2 个）、all 0.2%、mock 0.0%。
-
-      **这个数今天不大**，所以它不是数据错误，是"没说清楚"。
-      但它没有下限（取决于源里有多少商品缺价格），而 total 是对外公开的
-      接口字段，调用方无从知道这件事。
+    ★ 没有价格的商品**进不了任何一根柱子**：既不在 `total` 里、也不在任何一个桶
+      里（同文件的店铺占比就是这么处理的，见 UNKNOWN_SHOP）。各柱之和**是**等于
+      total 的，图自身毫无破绽，出错的是读者对百分比的理解——前端拿 total 当分母
+      （frontend/static/js/charts.js），"这个价位占 X%"被读成占全部商品。偏差
+      今天不大（真实源 2.0%），但它**没有下限**，而 total 是对外公开的字段。
     """
     prices, price_missing = _fetch_current_prices(db, source)
 
@@ -565,10 +459,8 @@ def price_distribution(
             notice=_price_notice(price_missing, charted=0),
         )
 
-    # ★ 分桶交给 app/aggregate.bucket_prices()，它返回的 dict 形状
-    #   恰好就是 PriceBucket 需要的四个字段。
-    #   在这里自己再写一遍分桶，会让"界面上的直方图"和"AI 报告里的直方图"
-    #   有可能算出不同的桶——而且两边都不报错（理由见 app/aggregate.py）。
+    # ★ 分桶交给 app/aggregate.bucket_prices()，它返回的 dict 形状恰好就是
+    #   PriceBucket 需要的四个字段——自己再写一遍会让界面和 AI 报告算出不同的桶。
     step, buckets = bucket_prices(prices, target=target_buckets)
 
     return PriceDistributionOut(
@@ -581,9 +473,7 @@ def price_distribution(
     )
 
 
-# ===========================================================================
-# 端点 4：销量排行
-# ===========================================================================
+# ---- 端点 4：销量排行 ----
 
 
 @router.get("/sales-top", response_model=SalesTopOut)
@@ -598,17 +488,9 @@ def sales_top(
         # LEFT JOIN：没有店铺信息的商品也要能上榜（真实采集早期就是这种情况）
         .join(Shop, Product.shop_id == Shop.id, isouter=True)
         .where(Product.sales.is_not(None))
-        # ★ 兜底排序列 Product.id 不能省。
-        #
-        #   没有它的话，两个销量相同的商品在"谁排前面"上是未定义的：
-        #   SQLite 只保证 ORDER BY 的列有序，同值行之间的顺序
-        #   取决于它内部用了哪个索引、甚至取决于上次查询的缓存。
-        #   后果有两个，都不报错：
-        #     · 分页时 LIMIT/OFFSET 两次查询可能给出不同的排列，
-        #       于是某个商品在第一页和第二页**各出现一次**，
-        #       而另一个商品**一次都不出现**
-        #     · 测试偶发变红，重跑又绿了，然后被当成"flaky 测试"忽略掉
-        #   加一个唯一列当兜底，顺序就从"未定义"变成"确定"。
+        # ★ 兜底排序列 Product.id 不能省：没有它，两个销量相同的商品谁排前面是未
+        #   定义的，后果两个且都不报错——分页时某商品在两页**各出现一次**、另一个
+        #   **一次都不出现**；测试偶发变红、重跑又绿，然后被当成 flaky 忽略掉。
         .order_by(Product.sales.desc(), Product.id.asc())
         .limit(limit)
     )
@@ -633,8 +515,7 @@ def sales_top(
 
     notice = None
     if not items:
-        # ★ 只在为空时才多查一次计数——这条路径本来就慢不到哪去
-        #   （空结果集），而"有销量"的常见路径一次额外查询都不用付。
+        # ★ 只在为空时才多查一次计数——"有销量"的常见路径一次额外查询都不用付。
         product_count = db.execute(
             apply_source(select(func.count(Product.id)), source)
         ).scalar_one()
@@ -649,9 +530,7 @@ def sales_top(
     )
 
 
-# ===========================================================================
-# 端点 5：店铺占比
-# ===========================================================================
+# ---- 端点 5：店铺占比 ----
 
 
 @router.get("/shop-share", response_model=ShopShareOut)
@@ -669,52 +548,20 @@ def shop_share(
             Shop.platform.label("platform"),
             func.count(Product.id).label("cnt"),
             func.avg(Product.price).label("avg_price"),
-            # ★ 这个 count 是**下面加权平均的权重**，必须是"有价商品数"。
-            #
-            #   `avg(Product.price)` 在 SQL 里等于 SUM(price)/COUNT(price)，
-            #   分母是**非空**价格的个数——所以把若干个店铺的均价合成一个
-            #   总均价时，权重只能是各自的 COUNT(price)。
-            #
-            #   一旦用 COUNT(Product.id)（含无价商品）当权重，缺价格的商品
-            #   就会**以"它没有参与的那份均价"的名义**去加码：
-            #   一个 100 件商品里只有 1 件有价的店铺，它的均价会被当成
-            #   100 件商品的均价来加权。而缺价格正是真实采集的常态
-            #   （SMZDM 好价卡片 100 条里有 2 条解析不出价格）。
-            #
-            #   ★ 用对权重之后，这个加权平均**恰好等于**尾部所有有价商品的
-            #     直接平均（Σavgᵢ·nᵢ / Σnᵢ = ΣSUMᵢ / Σnᵢ），
-            #     于是它可以拿一条 SQL 直接核对——见 test_api_smoke.py。
+            # ★ 这个 count 是**下面加权平均的权重**，必须是"有价商品数"：`avg(price)`
+            #   的分母是**非空**价格的个数，用 COUNT(Product.id) 会让缺价商品"以它没
+            #   参与的那份均价"去加码；用对权重后，加权平均恰等于尾部有价商品的直接
+            #   平均，可以拿一条 SQL 核对（test_api_smoke.py）。
             func.count(Product.price).label("priced_cnt"),
         )
         .select_from(Product)
-        # ★ LEFT JOIN 而不是 JOIN：price 为空 / shop 为空的商品也必须被统计。
-        #   用 INNER JOIN 的话，没有店铺信息的商品会**整个消失**，
-        #   各扇区之和不足 100%，而看图上完全看不出来少了东西。
-        #   （`func.coalesce(..., UNKNOWN_SHOP)` 就是为了给这些行一个名字。）
+        # ★ LEFT JOIN 而不是 JOIN：price 为空 / shop 为空的商品也必须被统计，否则
+        #   各扇区之和不足 100%，而图上看不出少了东西（`coalesce` 给这些行一个名字）。
         .join(Shop, Product.shop_id == Shop.id, isouter=True)
-        # ★ 这里必须把 Shop.platform 也写进 GROUP BY，不能只按 Product.shop_id 分组
-        #   而把 Shop.platform 裸放在 SELECT 里。
-        #
-        #   SQLite 对裸列是宽容的：它**静默**从组里挑一个值给你。所以这条 SQL
-        #   在 SQLite 上跑得好好的，测试也全绿。而在 PostgreSQL 上它是**硬错误**：
-        #       column "s.platform" must appear in the GROUP BY clause
-        #       or be used in an aggregate function
-        #
-        #   ★ 那"挑一个值"在眼下会不会挑错？——**不会**，这一点我实测过：
-        #     在真实库快照上按 Product.shop_id 分成 18 组，逐组数
-        #     `COUNT(DISTINCT s.platform)`，**最大值为 1**。
-        #     原因是 join 条件 `Shop.id = Product.shop_id` 打在 shops 的**主键**上，
-        #     所以 platform 被 shop_id 函数决定，组内本来就只有唯一取值。
-        #
-        #   ★ 所以修它不是"修一个算错的数"，是修**可移植性**：
-        #     本项目在 README 里明确讨论过"什么时候该换 PostgreSQL"
-        #     （busy_timeout 那条边界）。换过去的那一天，这条 SQL 会当场报错，
-        #     而它是被别人改到的概率最低的那一类语句——所以现在就写对。
-        #
-        #   ★ 为什么不用 `group_by(shop_label, Shop.platform)`：
-        #     shop_label 是 `coalesce(name, '未知店铺')`，按它分组等于按**别名**分组，
-        #     会把两个 shop_id 不同的行（比如两个都叫 NULL 的）并成一组。
-        #     按 shop_id 分组才是"一家店一组"的正确语义。
+        # ★ Shop.platform 必须写进 GROUP BY：SQLite 对裸列是宽容的，它**静默**从组
+        #   里挑一个值给你，而 PostgreSQL 上这是硬错误——修的不是算错的数，是**可
+        #   移植性**。不用 `group_by(shop_label, Shop.platform)`：那是按**别名**分组，
+        #   会把两个 shop_id 不同的行（比如都叫 NULL 的）并成一组。
         .group_by(Product.shop_id, Shop.platform)
         .order_by(func.count(Product.id).desc(), shop_label)
     )
@@ -743,13 +590,8 @@ def shop_share(
     #   但百分比会被静默地重新归一化，于是每一块的占比都是错的。
     if tail:
         tail_count = sum(int(r.cnt) for r in tail)
-        # 加权平均：不能用 avg(avg_price)，那是"平均的平均"，
-        # 会让只有 1 个商品的小店和 300 个商品的大店等权。
-        #
-        # ★ 权重是 priced_cnt 而**不是** cnt——见上面 select 里那段注释。
-        #   用 count(price) 当权重之后，这个式子与"尾部所有有价商品
-        #   直接求平均"严格相等（Σavgᵢ·nᵢ / Σnᵢ = ΣSUMᵢ / Σnᵢ），
-        #   所以 test_api_smoke.py 里可以拿一条 SQL 直接核对它。
+        # 加权平均：不能用 avg(avg_price)（"平均的平均"会让小店和大店等权），
+        # 权重是 priced_cnt 而**不是** cnt——见上面 select 里那段注释。
         weighted = [r for r in tail if r.avg_price is not None and r.priced_cnt]
         avg = None
         if weighted:
@@ -783,19 +625,11 @@ def shop_share(
     )
 
 
-# ===========================================================================
-# 端点 6：词云
-# ===========================================================================
+# ---- 端点 6：词云 ----
 
 
-# ★ 分词相关的全部实现（jieba 初始化、停用词表、分词规则、大小写还原）
-#   已经搬到 app/keywords.py。
-#
-#   搬家的原因不是"文件太长了"，而是阶段 3 的 AI 报告也要用分词：
-#   如果让 analysis/payload.py 反过来 import 本模块，分析层就依赖了 Web 层
-#   （它本该能脱离 HTTP 单独跑）；而如果让它自己再写一份分词，
-#   就会出现"词云图上最大的词"和"报告里说的最高频词"不是同一个词，
-#   且两边都不报错。完整理由见 app/keywords.py 的模块注释。
+# ★ 分词相关的全部实现（jieba 初始化、停用词表、分词规则、大小写还原）都在
+#   app/keywords.py：AI 报告和词云必须是同一份分词，否则两边结果对不上且不报错。
 
 
 @router.get("/keywords", response_model=KeywordsOut)
@@ -806,20 +640,10 @@ def keywords(
 ) -> KeywordsOut:
     """词云数据。
 
-    ★ 分词在后端做，因为 jieba 是 Python 的。
-      让浏览器干这件事要么引一个几百 KB 的 JS 分词库（效果还差），
-      要么把整份词典发给前端——两头都不划算。
-
-    ★ 实测耗时（1000 个标题，本机，5 次取中位）：**46 ms**。
-      这是所有接口里最慢的一个，其余都在 2~12 ms。
-      原因很直接：它要对每个标题跑一遍 jieba，是 O(标题数) 的。
-
-      当前不做缓存，因为词云一页只请求一次，46 ms 无感。
-      但要把这个决定和它的失效条件一起记下来：
-      **标题涨到 1 万条时它会变成约 0.5 秒**，那时该做的是
-      按 (source, 商品数) 做短 TTL 缓存，或者把词频预聚合成一张表。
-      现在不加，是因为缓存会引入"改了停用词表要等 TTL 过期"的困惑，
-      而调停用词表恰恰是这个功能最高频的操作。
+    ★ 分词在后端做，因为 jieba 是 Python 的：让浏览器干要么引几百 KB 的 JS 分词
+      库（效果还差），要么把整份词典发给前端，两头都不划算。
+    ★ 实测 1000 个标题约 **46 ms**（所有接口里最慢的一个），O(标题数)；到 1 万条
+      时该做 (source, 商品数) 的短 TTL 缓存或预聚合。
     """
     titles = [
         t
@@ -834,9 +658,8 @@ def keywords(
             source=source.value, total_titles=0, items=[], notice=NO_DATA_NOTICE
         )
 
-    # ★ 分词、排序、大小写还原全部在 app/keywords.py 里，一处定义。
-    #   返回值是 [(显示形式, 归一化键, 次数)]——
-    #   排序的确定性（同分按字典序）在那边保证，理由见 rank_keywords 的注释。
+    # ★ 分词、排序、大小写还原全部在 app/keywords.py 一处定义；
+    #   返回值是 [(显示形式, 归一化键, 次数)]，排序的确定性在那边保证。
     ranked = rank_keywords(titles, limit=limit)
 
     items = [KeywordItem(name=name, value=count) for name, _key, count in ranked]

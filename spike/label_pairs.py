@@ -1,17 +1,7 @@
-"""输出待人工标注的标题对，并对比几种相似度指标的区分能力。
+"""历史留档（第一轮探索，2026-09）：标题对标注与三种相似度指标对比。
 
-配合 calibrate_dice.py 使用：那个脚本算 Dice，这个脚本回答
-"到底哪个指标能把真阳性和假阳性分开"。
-
-★★ 历史留档（第一轮探索，2026-09）。已被 `evaluate_merge.py` 取代：
-   那边用【精确锚定】锚定了 123 对标注（把值得判断的区域标穷尽，
-   见 `decision_region_census.py`），是本项目的权威评估。
-   本文件的标注集和它输出的数字只作过程留档——
-   **结论一律以 evaluate_merge.py + decision_region_census.py 为准**。
-   为什么留着不删：它的 `_find_pair`（模糊匹配）是本项目明确淘汰的写法，
-   是"测试脚手架自己出错比没有测试更危险"的实物证据——
-   有一对标注的锚点写错了（语料里根本不存在），模糊匹配把它悄悄跳过，
-   直到换成精确锚定才当场暴露。
+结论一律以 evaluate_merge.py（精确锚定 123 对）+ decision_region_census.py 为准；
+本文件的 _find_pair 模糊匹配是已淘汰的反面教材（锚点写错会被悄悄跳过）。
 
 用法：
     python spike/label_pairs.py          # 打印候选对
@@ -29,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scraper.cleaner import normalize_width  # noqa: E402
-from evaluate_merge import resolve  # noqa: E402  ★ 精确锚定的权威实现（先全等再子串）
+from evaluate_merge import resolve  # noqa: E402
 
 CORPUS = Path(__file__).parent / "corpus.json"
 
@@ -64,18 +54,8 @@ def dice(a: set[str], b: set[str]) -> float:
 
 
 def containment(a: set[str], b: set[str]) -> float:
-    """包含度 = |A∩B| / min(|A|,|B|)。
-
-    ★ 也叫 overlap coefficient / Szymkiewicz–Simpson 系数。
-      含义是"较短的那个标题有多少比例被较长的那个覆盖了"。
-      同一商品的两条爆料常常正是【包含关系】——
-      一条信息少（"华为 FreeClip 2 耳夹式耳机"），
-      一条信息多（"...多单元动圈蓝牙耳机 冰莓紫 Type-C"）。
-      短标题的每个词几乎都出现在长标题里 → 包含度接近 1。
-
-      而两个不同商品即使共享品牌和几个通用词，
-      较短的标题里总会有长标题没有的词（"女士跑鞋" vs "男士健步鞋"）
-      → 包含度明显偏低。
+    """包含度 = |A∩B| / min(|A|,|B|)（overlap coefficient）：同商品常是包含关系 → 接近 1，
+    不同商品总有不共享的词 → 明显偏低。
     """
     if not a or not b:
         return 0.0
@@ -87,16 +67,8 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return 0.0 if not a or not b else len(a & b) / len(a | b)
 
 
-# --- 人工标注的真值 ----------------------------------------------------------
-#
-# ★ 这些标签是我逐对读出来的，不是算法生成的。
-#
-#   判定标准："这两条爆料说的是不是同一款商品（同一 SKU 层面）"。
-#   同品牌不同型号 → False（这是最关键的一类，模型最容易搞混）
-#   同商品措辞不同/信息详略不同 → True
-#
-#   键是两条标题的归一化后的前缀，用 (id_a, id_b) 索引不方便写。
-#   所以在 main 里用标题包含关系匹配。
+# --- 人工标注的真值（逐对读出，非算法生成）-----------------------------------
+# 判定标准：是不是同一款商品（SKU 层面）——同品牌不同型号 → False，同商品措辞不同 → True。
 
 LABELS: list[tuple[str, str, bool, str]] = [
     # ---- 真阳性：同一商品 ----
@@ -118,13 +90,6 @@ LABELS: list[tuple[str, str, bool, str]] = [
         True,
         "同款，后者省略规格",
     ),
-    # ★ 这里原来还有一对（第一轮的第 4 对）：
-    #     "Apple iPhone 18 Pro Max 5G手机 256GB 勃艮第酒红色"（同款，后者省略颜色）
-    #     "Apple 苹果 iPhone 18 Pro Max 5G手机 256GB"
-    #   第二个锚点在语料里【一条都命中不了】——18 Pro Max 只存在带颜色的那一条。
-    #   第一轮用模糊匹配（_find_pair）时它被【悄悄跳过】，没人发现；
-    #   换成精确锚定（resolve）后当场失败。删掉，但这几行留着当证据：
-    #   模糊匹配用同样的方式掩盖过多少错误，我们永远不会知道。
     (
         "百亿补贴：酷态科 充电宝10号电能棒电芯10000毫安",
         "酷态科 充电宝10号电能棒电芯10000毫安",
@@ -172,11 +137,8 @@ LABELS: list[tuple[str, str, bool, str]] = [
 
 
 def _find_pair(corpus: list[str], a: str, b: str) -> tuple[str, str] | None:
-    """★ 已弃用（保留作反面教材，见模块 docstring 与 LABELS 里删掉的那对）。
-
-    "找到最接近的两条"恰恰是问题所在：锚点写错时它照样返回一个结果，
-    于是"算法结论"可以建立在一对根本不是标注文本的标题上。
-    已被 `evaluate_merge.resolve`（精确锚定，命中数不等于 1 就报错）取代。
+    """已弃用，保留作反面教材：锚点写错时模糊匹配照样返回一个结果，
+    已被 evaluate_merge.resolve（精确锚定，命中数 ≠ 1 就报错）取代。
     """
     def best(target: str) -> str | None:
         tn = normalize_title(target)
@@ -225,7 +187,7 @@ def main() -> None:
 
 
 def evaluate(titles: list[str]) -> None:
-    """★ 核心产出：对比三种指标在人工标注真值上的区分能力。"""
+    """对比三种指标在人工标注真值上的区分能力（历史留档，权威结论见 evaluate_merge.py）。"""
     print("=" * 96)
     print("指标对比（历史留档：第一轮人工标注 %d 对；权威结论见 evaluate_merge.py）"
           % len(LABELS))
@@ -233,11 +195,8 @@ def evaluate(titles: list[str]) -> None:
     print(f"{'标签':<6} {'包含度':>8} {'Dice':>8} {'Jaccard':>8}  说明")
     print("-" * 96)
 
-    # ★ 锚定用 evaluate_merge.resolve 的同一套规则：先全等、再子串，
-    #   命中数必须恰好 1，否则记下来、最后一起 loud failure。
-    #   原来是 _find_pair 的模糊匹配——锚点写错了它也会给一个"最像的"，
-    #   于是"结论"可能建立在一对根本不是标注文本的标题上。
-    #   宁可 loud failure，不要 silent wrong（见模块 docstring）。
+    # 锚定用 evaluate_merge.resolve 的同一套规则：先全等、再子串，命中数必须恰好 1，
+    # 否则 loud failure——宁可报错，不要悄悄拿错标题下结论。
     rows: list[tuple[bool, float, float, float, str]] = []
     unresolved: list[str] = []
     for a, b, label, note in LABELS:

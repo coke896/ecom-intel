@@ -1,51 +1,13 @@
 """Prompt 模板 + 报告的 JSON schema。
 
-================================================================================
-★ 改了本文件的任何模板字符串，必须同步改 fingerprint.PROMPT_VERSION
-================================================================================
+★ 改了本文件的任何模板字符串，必须同步改 fingerprint.PROMPT_VERSION——
+漏改的后果是"改了 prompt 却命中旧缓存"，而人会去怀疑热重载、怀疑没保存文件。
+（不把模板本身算进指纹：那样改一个错别字就作废全部缓存。）
 
-这是整个缓存机制里唯一需要人肉维护的地方，所以放在最显眼的位置。
-漏改的后果：改了 prompt，但指纹没变 → 命中旧缓存 → 拿到的还是旧报告，
-而你会去怀疑热重载、怀疑没保存文件、怀疑浏览器缓存。
-
-（为什么不把模板内容直接算进指纹，见 fingerprint.py 里的说明：
-  那样改一个错别字就会让全部缓存作废，而调 prompt 的日常就是改几十个错别字。）
-
-================================================================================
-这个 prompt 在防什么
-================================================================================
-
-一份"AI 分析报告"最常见的三种失败，都能靠 prompt 里的硬规则挡掉大半：
-
-**① 编造数字。** 模型很擅长写出"该品类均价约 200 元"这种句子，
-   而数据里根本没有这个数。对策是强制要求每条结论都带 `evidence` 字段，
-   且 evidence 里必须是**数据里出现过的数字**。
-
-**② 拿样本的数字说整体。** 这是本项目特有的风险，因为
-   prompt 里只放了 60 个商品（见 payload.py），而 summary 块里是全部 1000 个的
-   统计量。模型完全可能把样本的均价说成整体均价——
-   **而它是一个由采样方式制造出来的假结论**。
-   对策有两层：payload 里的 `sample.note` 明说这是样本，
-   system prompt 里再明令禁止。
-
-**③ 对着空数据硬编。** 没有销量数据时（真实电商的常态），
-   模型可能编出"销量最高的商品是……"。对策是把 has_sales
-   明明白白地写在数据里，并要求它在数据不足时写进 data_limits。
-
-================================================================================
-为什么输出 JSON 而不是 Markdown
-================================================================================
-
-aiwenda 那边的输出是 Markdown（给人读的）。这里必须改成 JSON，
-因为报告要被**缓存和复用**，而缓存的对象需要是结构化的：
-
-  · 可以校验（缺字段当场报错，而不是渲染时才发现）
-  · 可以测（断言"报告里有 3~5 个 section"，Markdown 做不到）
-  · 可以稳定序列化（存进 content_json 列，读出来还是同一个结构）
-  · 前端可以逐块渲染，而不是把一坨 HTML 塞进 innerHTML
-
-代价是 token 多一些（花括号和引号），以及模型偶尔会不听话。
-后者由 glm_client 的三级 JSON 提取 + 一次重试兜住。
+prompt 的硬规则针对三种常见失败：编造数据里没有的数字；拿 60 个样本的数字说
+整体（summary 才是全体统计量）；没有销量/品牌数据时硬编——对策是强制 evidence
+字段、payload 的 sample.note 与 system prompt 双层约束、data_limits 兜底。
+输出 JSON 而非 Markdown：报告要缓存复用，结构化才能校验、测试、稳定序列化。
 """
 
 from __future__ import annotations
@@ -55,8 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# 分析维度。这些是**建议**的段落标题，不是强制的——
-# 模型可以按数据情况合并或改名（schema 只约束"有 3~5 段"）。
+# 分析维度。这些是**建议**的段落标题，不是强制的——schema 只约束"有 3~5 段"。
 SECTION_HINTS: tuple[str, ...] = (
     "价格结构",
     "品牌与店铺格局",
@@ -132,40 +93,27 @@ class ReportSection(BaseModel):
 
     title: str = Field(min_length=1, max_length=40)
     finding: str = Field(min_length=1)
-    # ★ evidence 允许为空字符串，但**不允许缺失**。
-    #
-    #   这个区别是有意的：把 evidence 设成必填，等于每次都逼模型
-    #   给出一条依据（哪怕是空泛的"见 price_buckets"）；
-    #   但如果设成必填且非空，模型在确实没有数字可引时
-    #   会**编一个数字**来填满这个字段——那是比留空糟糕得多的结果。
-    #   所以：字段必须在（结构上提醒它这是要求），内容可以为空（给它退路）。
+    # ★ evidence 允许为空字符串，但**不允许缺失**：字段必填是结构上提醒它
+    #   这是要求；若设成必填且非空，模型在确实没有数字可引时会**编一个数字**
+    #   来填满字段——那比留空糟糕得多。所以字段必须在、内容可以空。
     evidence: str = ""
 
 
 class ReportContent(BaseModel):
     """报告的完整结构。
 
-    ★ 校验策略：核心字段严格，边缘字段宽松。
-
-      · headline / sections 严格 —— 它们是报告的骨架，缺了就没法渲染
-      · opportunities / risks / data_limits 给默认空列表 ——
-        强迫模型在"确实没有风险"时也要硬凑三条，只会得到三条废话
-      · `extra="ignore"` —— 模型多返回一个字段不该让整份报告失败。
-        它会自己加 `"conclusion"` 或 `"summary"` 这类字段，
-        这是模型的常见行为，不是错误。丢掉就好。
-
-    ★ 为什么每段都要有 title：渲染时前端按 title 折叠/展开。
-      没有 title 就只能给每段编号，而编号在用户眼里没有信息量。
+    ★ 校验策略：核心字段（headline / sections）严格，它们是骨架；边缘字段
+      （opportunities / risks / data_limits）给默认空列表，强迫模型硬凑只会得到废话；
+      `extra="ignore"` 容忍模型自行加 "conclusion" 这类字段（常见行为，不是错误）。
+    ★ 每段必须有 title：前端按 title 折叠/展开，编号对用户没有信息量。
     """
 
     model_config = ConfigDict(extra="ignore")
 
     headline: str = Field(min_length=1, max_length=200)
     # 3~5 段是 prompt 里要求的，这里把上下限也写进 schema。
-    # ★ 注意 min_length=1：**不能要求 min_length=3**。
-    #   真实数据稀少时（比如只有一个商品），模型只写得出 1 段，
-    #   这时卡在 3 会让整次分析失败——而"数据少所以只有一段"
-    #   是完全合理的结果。下限留给 prompt 去引导，schema 只管"别是空的"。
+    # ★ 但不能要求 min_length=3：数据稀少时（比如只有一个商品）模型只写得出 1 段，
+    #   卡在 3 会让整次分析失败——下限留给 prompt 引导，schema 只管"别是空的"。
     sections: list[ReportSection] = Field(min_length=1, max_length=8)
     opportunities: list[str] = Field(default_factory=list, max_length=8)
     risks: list[str] = Field(default_factory=list, max_length=8)
@@ -175,15 +123,9 @@ class ReportContent(BaseModel):
 def build_user_prompt(payload: dict[str, Any]) -> str:
     """把 payload 序列化成用户消息。
 
-    ★ 紧凑 JSON（`separators`）而不是缩进 JSON：
-      缩进会让每个字段多出几个空格和一个换行，60 个商品下来就是
-      一两千个 token 的纯空白。而这些 token 对模型理解结构**没有帮助**——
-      它是 JSON，结构已经由括号表达了。
-      （人读的部分由 prompt 的说明和字段名承担，不靠缩进。）
-
-    ★ `ensure_ascii=False`：中文原样输出。
-      设成 True 的话每个中文字会变成 `\\uXXXX` 六个字符，
-      不只是变长——模型看到转义序列后的理解也更差。
+    ★ 紧凑 JSON（separators）而不是缩进 JSON：缩进对模型理解结构没有帮助，
+      60 个商品下来就是一两千个 token 的纯空白。
+    ★ `ensure_ascii=False`：中文原样输出，转成转义序列不只变长、理解也更差。
     """
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 

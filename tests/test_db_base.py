@@ -1,26 +1,8 @@
 """数据库基础设施的测试：PRAGMA 与时间约定。
 
-================================================================================
-为什么这些"配置项"值得测试
-================================================================================
-它们全都是 **per-connection** 的：除了 `journal_mode` 会写进数据库文件头，
-其余三项每条新连接都要重新设置。也就是说它们**不是**"设一次就一劳永逸"的
-配置，而是依赖那个 `connect` 事件监听器每次都被正确触发。
-
-所以下面几种改动都会让它们**静默失效**：
-
-  · 把 `@event.listens_for(engine, ...)` 改成 `@event.listens_for(Engine, ...)`
-    （挂到类上——是社区反复出现的 bug，但 PRAGMA 本身还是会生效，
-      只是会污染同进程里别人的引擎，所以更难发现）
-  · 重构时把 `register_sqlite_pragmas(engine)` 那行模块级调用丢了
-  · 测试夹具自己抄一份 PRAGMA 清单，然后两边分叉
-
-失效后果：
-  · `foreign_keys` 关掉 → 插入指向不存在商品的价格历史会**静默成功**
-  · `busy_timeout` 没设 → worker 写入时 Web 查询立刻抛 "database is locked"
-  · `journal_mode` 退回 DELETE → 读写互相阻塞，偶发超时
-
-三种都没有报错，只是行为变差。所以必须有测试守着。
+这些 PRAGMA 都是 **per-connection** 的（只有 journal_mode 写进文件头），靠模块级
+注册的 `connect` 监听器每次触发——挂错地方、丢掉 register 调用都会**静默失效**
+（外键不校验 / busy_timeout 没了 / WAL 退回 DELETE），都不报错。
 """
 
 from __future__ import annotations
@@ -34,30 +16,17 @@ from sqlalchemy.engine import Engine
 from app.db import base as base_mod
 from app.db.base import SQLITE_PRAGMAS, register_sqlite_pragmas, utcnow
 
-# ★ 在模块顶层导入模型，不要在测试函数内部导入。
-#
-#   表的定义是"通过被导入"注册到 Base.metadata 上的。
-#   如果在测试函数里、create_all() **之后**才 import，metadata 还是空的，
-#   create_all 什么也不建，然后 INSERT 时报 "no such table"。
-#
-#   而且这个错误有极强的迷惑性：跑整个 tests/ 时会通过
-#   （别的测试文件先导入了 models），只有单独跑本文件才失败。
+# ★ 在模块顶层导入模型：模型靠被导入注册进 Base.metadata，若在 create_all()
+#   之后才 import，INSERT 时报 "no such table"（只在单独跑本文件时暴露）。
 from app.db.models import PriceHistory
 
 
-# ===========================================================================
 # 一、PRAGMA 真的生效（用真实文件库，因为 WAL 在内存库上不适用）
-# ===========================================================================
 
 
 def test_pragmas_are_applied_to_a_file_database(tmp_path) -> None:
-    """★ 在**真实文件库**上逐项断言 PRAGMA 生效。
-
-    ★ 为什么必须用文件库而不是内存库：
-      `:memory:` 不支持 WAL，`PRAGMA journal_mode=WAL` 会静默返回 "memory"。
-      用内存库测的话，这个断言要么写不了，要么写了也是假的
-      （这正是"测试通过但线上不一样"的经典来源）。
-    """
+    """★ 用**真实文件库**逐项断言 PRAGMA 生效：`:memory:` 不支持 WAL，`PRAGMA
+    journal_mode=WAL` 会静默返回 "memory"，用内存库这个断言就是假的。"""
     eng = create_engine(f"sqlite:///{(tmp_path / 't.db').as_posix()}")
     register_sqlite_pragmas(eng)
 
@@ -72,16 +41,9 @@ def test_pragmas_are_applied_to_a_file_database(tmp_path) -> None:
 
 
 def test_pragmas_reapply_on_every_new_connection(tmp_path) -> None:
-    """★ PRAGMA 必须对**每条新连接**都生效，不能只在第一条上生效。
-
-    ★ 这是这套机制最容易理解错的地方：
-      SQLite 的这几项 PRAGMA 是**连接级**状态，不是数据库级配置。
-      连接池关掉一条再开一条，新连接是"白纸"。
-      所以监听器漏挂一次，池子里的新连接就全部没有外键校验——
-      而旧连接还是好的，于是表现为"有时候报错有时候不报"。
-
-    做法：把池子清空（模拟连接被回收），再取一条新连接检查。
-    """
+    """★ PRAGMA 必须对**每条新连接**都生效：SQLite 这几项是**连接级**状态，
+    池子关掉一条再开一条，新连接是"白纸"——监听器漏挂一次，池里的新连接就都
+    没外键校验（旧连接还是好的），表现为"有时候报错有时候不报"。"""
     eng = create_engine(
         f"sqlite:///{(tmp_path / 't.db').as_posix()}",
         # 池子大小为 1，方便精确控制"换一条连接"
@@ -104,15 +66,9 @@ def test_pragmas_reapply_on_every_new_connection(tmp_path) -> None:
 
 
 def test_foreign_keys_actually_reject_bad_rows(tmp_path) -> None:
-    """★ 不满足于"PRAGMA 值对了"，要验证**它真的在管事**。
-
-    PRAGMA 读出来是 1，但约束本身如果没建（比如 ForeignKey 写成
-    ForeignKey[str] 而没指向表），校验照样不会发生。
-    所以这里直接插一条指向不存在商品的价格历史，断言它被拒绝。
-
-    ★ 这条测试的意义在于：它把"外键开着"这个配置
-      变成了"脏数据插不进来"这个**可观测的行为**。
-    """
+    """★ 不满足于"PRAGMA 值对了"，要验证**它真的在管事**。PRAGMA 读出来是 1，
+    但约束本身没建时校验照样不会发生——这里直接插一条指向不存在商品的价格
+    历史断言被拒，把"外键开着"变成"脏数据插不进来"。"""
     from sqlalchemy.exc import IntegrityError
     from sqlalchemy.orm import sessionmaker
 
@@ -133,22 +89,13 @@ def test_foreign_keys_actually_reject_bad_rows(tmp_path) -> None:
     eng.dispose()
 
 
-# ===========================================================================
 # 二、生产 engine 的接线（不打开真实数据库就能检查）
-# ===========================================================================
 
 
 def test_app_engine_has_the_pragma_listener_registered() -> None:
-    """★ 断言 PRAGMA 监听器确实挂在了 app 的 engine 上。
-
-    ★ 为什么用 event.contains 而不是连上去读 PRAGMA 值：
-      读 PRAGMA 需要打开 data/ecom.db，那会让"跑测试"产生副作用
-      （文件不存在时会被创建），而且测的是"这一次连接"而不是"接线对不对"。
-
-      event.contains(engine, "connect", handler) 直接检查事件注册表，
-      没有副作用，而且**精确地**测到了我们关心的那件事：
-      模块级的 `register_sqlite_pragmas(engine)` 那行调用有没有被重构弄丢。
-    """
+    """★ 断言 PRAGMA 监听器确实挂在 app 的 engine 上——用 event.contains 而不是
+    连上去读 PRAGMA 值：读值要打开 data/ecom.db（有副作用），且测的是"这一次
+    连接"而不是接线对不对。"""
     assert event.contains(base_mod.engine, "connect", base_mod._apply_pragmas), (
         "app.db.base 的模块级 PRAGMA 注册丢了——生产库会以 SQLite 默认值运行"
         "（外键不校验、没有 busy_timeout、journal_mode 退回 DELETE）"
@@ -156,37 +103,18 @@ def test_app_engine_has_the_pragma_listener_registered() -> None:
 
 
 def test_listener_is_registered_on_the_instance_not_the_class() -> None:
-    """★ 监听器必须挂在 engine **实例** 上，不能挂在 Engine 类上。
-
-    ★ 挂到类上的危害不是"PRAGMA 不生效"——它照样生效，
-      而是**会波及同进程里所有引擎**：测试用的内存库、任何第三方库
-      自己创建的引擎，都会被塞进我们的 PRAGMA。
-
-    ★★ 这条测试的第一版写错了，在这里记一笔，因为它是个很典型的陷阱：
-
-      第一版写的是
-          other = create_engine("sqlite://")
-          assert not event.contains(other, "connect", handler)
-
-      看起来对，但**判别力为零**：实测 `event.contains(实例, ...)`
-      根本看不见类级注册——类级注册时它返回 False，
-      于是这个断言永远成立，无论监听器挂在哪。
-      （变异检验发现的：把 listens_for(engine) 改成 listens_for(Engine)，
-        这条测试**照样通过**。）
-
-      实测出的语义是：
-          event.contains(Engine, ...)   → 只对【类级】注册返回 True
-          event.contains(实例,  ...)    → 只对【该实例】的注册返回 True
-      所以下面用第一条做精确判别 + 第二条做行为验证。
-    """
+    """★ 监听器必须挂在 engine **实例**上，不能挂在 Engine 类上：挂到类上 PRAGMA 照样
+    生效，但**会波及同进程里所有引擎**（测试用的内存库、第三方库自建的引擎都会被塞
+    进我们的 PRAGMA）。
+    ★ 判别语义（第一版曾写错，变异检验实得）：`event.contains(实例, ...)` 看不见类级
+      注册，"对实例断言 contains 为假"判别力为零；只有 `event.contains(Engine, ...)`
+      对**类级**注册返回 True，故用它做精确判别，再取新引擎的实际 PRAGMA 值做行为验证。"""
     # ① 精确判别：类级注册表里不该有我们的处理函数
     assert not event.contains(Engine, "connect", base_mod._apply_pragmas), (
         "监听器挂到 Engine 类上了——它会污染同进程内所有其他引擎"
     )
 
-    # ② 行为验证：新建的引擎不该被我们的 PRAGMA 污染
-    #    ★ 不满足于检查事件注册表，还要看它造成的实际后果。
-    #      SQLite 的 foreign_keys 默认是 0（关），被污染会变成 1。
+    # ② 行为验证：新建引擎的 foreign_keys 默认是 0，被污染会变成 1
     from sqlalchemy import text
 
     other = create_engine("sqlite://")
@@ -198,46 +126,25 @@ def test_listener_is_registered_on_the_instance_not_the_class() -> None:
 
 
 def test_pragma_list_covers_the_four_documented_items() -> None:
-    """清单本身的内容也要钉住。
-
-    ★ 防止"重构时顺手删掉一条"：这四条各自对应一个具体的失败场景
-      （见 app/db/base.py 里的注释），删掉任何一条都会静默降低可靠性。
-    """
+    """清单本身的内容也要钉住：四条各对应一个失败场景（见 app/db/base.py
+    里的注释），删掉任何一条都会静默降低可靠性。"""
     joined = " ".join(SQLITE_PRAGMAS).lower()
     for key in ("journal_mode=wal", "synchronous=normal",
                 "foreign_keys=on", "busy_timeout=30000"):
         assert key in joined, f"PRAGMA 清单里少了 {key}"
 
 
-# ===========================================================================
-# 二之补、busy_timeout 的**到期路径**
-#
-# ★ 上面几条只验证了"配置写进去了"。`busy_timeout` 是一条**承诺**：
-#   "后到的写会等，而不是立刻抛 database is locked"。
-#   而它的另一半 —— "等不到的时候会怎样" —— 在 2026-09-29 之前
-#   **从没被构造过**：配置是 30 秒，但没人真的去等那 30 秒。
-#   承诺的一半没验证，等于没有承诺。
-#
-# ★ 实测结论（手工构造，数字见下面那条测试的 docstring）：
-#   到期后抛 `OperationalError: database is locked`，**不会永远挂住**。
-#   但真正的等待时长是 ~32.8 秒，不是 30 秒 —— 原因也已查清。详见下。
-# ===========================================================================
+# 二之补、busy_timeout 的**到期路径**：上面几条只验证了"配置写进去了"，"等不到时
+# 会怎样"从没被构造过。实测：到期抛 OperationalError: database is locked，不会永
+# 远挂住；真实等待 ~32.8 秒而不是 30 秒（原因见下面那段实测记录）。
 
 
 def test_a_blocked_writer_gives_up_instead_of_hanging(tmp_path) -> None:
     """拿住写锁不放，另一个连接必须**抛错**，而不是永远等下去。
-
-    ★ 这条把超时改短到 300 毫秒来跑（设完覆盖一次 PRAGMA），
-      因为真的等 30 秒会让整个测试套件慢 33 秒 ——
-      那是一条没人愿意跑的测试，等于没有测试。
-      代价是：它验证的是**机制**（到期会抛、不会挂死），
-      不是"30 秒这个具体数字"。那个数字由上面
-      `test_pragma_list_covers_the_four_documented_items` 单独钉住。
-      两条合起来才等于"配置正确 + 行为正确"。
-    """
-    # ★ 抓的是 `sqlite3.OperationalError`，**不是** SQLAlchemy 那个。
-    #   这里的连接来自 raw_connection()，是裸的 DBAPI 连接，
-    #   异常不会被 SQLAlchemy 包装。第一版就是在这里红的。
+    ★ 超时改短到 300 毫秒来跑（真等 30 秒会让套件慢 33 秒）——验证的是**机制**
+      （到期会抛、不会挂死），不是"30 秒"这个数字（数字由上面那条钉住）。"""
+    # ★ 抓的是 `sqlite3.OperationalError`，**不是** SQLAlchemy 那个：这里的
+    #   连接来自 raw_connection()，是裸的 DBAPI 连接，异常不会被包装。
     import sqlite3
 
     eng = create_engine(
@@ -270,71 +177,24 @@ def test_a_blocked_writer_gives_up_instead_of_hanging(tmp_path) -> None:
         eng.dispose()
 
 
-# ★ 下面这段是**实测记录**，不是测试（跑一次要 33 秒，不适合进套件）。
-#
-#   2026-09-29 手工构造，用**生产那一份** SQLITE_PRAGMAS 挂在临时库的引擎上：
-#
-#     PRAGMA busy_timeout = 30000 ms       ← 配置确实是 30 秒
-#     PRAGMA journal_mode = wal
-#     连接 B 等了 32.80 秒 / 32.85 秒（两次）后抛
-#       OperationalError: database is locked
-#
-#   ★ 32.8 ≠ 30。多出来的 2.8 秒一开始看着像测量误差，但两次复测
-#     只差 50 毫秒，是**系统性的**。短超时对照实验给出了规律：
-#
-#       500 ms → 实测  611 ms  (+22.3%)
-#      1000 ms → 实测 1203 ms  (+20.3%)
-#      2000 ms → 实测 2275 ms  (+13.8%)
-#      4000 ms → 实测 4451 ms  (+11.3%)
-#     30000 ms → 实测 32800 ms (+9.4%)
-#
-#   ★ 根因（已验证，不是猜的）：
-#       SQLite 的默认 busy handler 是**按 100 毫秒一档睡**的，
-#       每睡一档检查一次是否已超过 busy_timeout。
-#       而 Windows 的 `Sleep(100)` 实际会睡多久？
-#       实测（kernel32.Sleep 连打 50 次取平均）：
-#           Sleep(10)  → 15.5 ms  (+54.7%)
-#           Sleep(50)  → 62.4 ms  (+24.9%)
-#           Sleep(100) → 109.4 ms (+9.4%)   ← 对上 30 秒那次的 +9.4%
-#       原因是 Windows 默认计时器精度约 15.6 ms，Sleep 会向上取整到刻度。
-#
-#       于是：30000 ms ÷ 100 × 109.4 ms ≈ 32.8 秒  ← 与实测吻合。
-#
-#   ★ 这条实测的用处不是"30 秒变成了 32.8 秒"，而是它说明了一件事：
-#     **busy_timeout 是个下界，不是精确的墙钟承诺。**
-#     写文档/写注释时说"等 30 秒"是可以说得更准的。
-# ===========================================================================
+# ★ 实测（2026-09-29，跑一次 33 秒，不进套件）：用生产那份 SQLITE_PRAGMAS，
+#   配置 30000ms，连接 B 等了 32.80/32.85 秒后抛错——busy_timeout 是下界。
 
 
-# ===========================================================================
 # 三、时间约定
-# ===========================================================================
 
 
 def test_utcnow_is_timezone_naive() -> None:
-    """★ utcnow() 必须返回**不带时区**的 UTC。
-
-    这不是风格偏好，是 SQLite 的存储格式决定的：
-    SQLAlchemy 把 datetime 存成 "YYYY-MM-DD HH:MM:SS.ffffff" 字符串，
-    这个格式的**字典序等于时间序**，所以 ORDER BY / BETWEEN 都是对的。
-
-    一旦混进带时区的值，字符串会变成 "...+00:00"，
-    而 "+" 的 ASCII 码小于数字——比较
-        "2026-09-28 12:00:00+00:00"  和  "2026-09-28 13:00:00"
-    会得出前者更小的错误结论。于是 ORDER BY 在跨时区数据上悄悄排错。
-
-    → 由这条测试守住"全库一致"这个前提。展示时在前端转本地时区。
-    """
+    """★ utcnow() 必须返回**不带时区**的 UTC：SQLAlchemy 把 datetime 存成
+    "YYYY-MM-DD HH:MM:SS.ffffff" 字符串，其**字典序等于时间序**，ORDER BY 才对；
+    混进带时区的值会多出 "...+00:00"，而 "+" 的 ASCII 码小于数字，排序会悄悄排错。"""
     now = utcnow()
     assert now.tzinfo is None, "utcnow() 返回了带时区的值，会让 ORDER BY 排错"
 
 
 def test_utcnow_is_actually_utc() -> None:
-    """也不能是本地时间伪装成 naive。
-
-    ★ 用"和真正的 UTC 相差在 1 分钟内"来判断：
-      naive 的本地时间与 naive 的 UTC 在国内差 8 小时，一眼可辨。
-    """
+    """也不能是本地时间伪装成 naive：naive 的本地时间与 UTC 在国内差 8 小时，
+    用"和真正的 UTC 相差在 1 分钟内"判断，一眼可辨。"""
     import time
 
     # 取两次，避免刚好跨秒边界
@@ -351,12 +211,8 @@ def test_utcnow_is_actually_utc() -> None:
 
 
 def test_naive_utc_strings_sort_correctly() -> None:
-    """★ 用真实的字符串比较验证"字典序 == 时间序"这个前提。
-
-    上面两条测的是 utcnow() 的返回值，这条测的是**它带来的性质**——
-    即 SQLite 里 ORDER BY 确实按时间排。
-    性质被破坏时（比如有人给 datetime 加上了 tzinfo），这条会更有说服力地失败。
-    """
+    """★ 用真实的字符串比较验证"字典序 == 时间序"这个前提——上面两条测返回值，
+    这条测它带来的性质；性质被破坏时（比如给 datetime 加上 tzinfo）它会失败。"""
     times = [
         datetime(2026, 9, 28, 12, 0, 0),
         datetime(2026, 9, 28, 13, 0, 0),

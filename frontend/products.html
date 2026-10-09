@@ -60,9 +60,7 @@
       <table class="data">
         <thead>
           <tr>
-            <!-- 缩略图列。★ 表头留空：这一列的内容（一张图或一块灰）
-                 不需要标题，写个"图"只是噪声。宽度靠 th 上的 style 定，
-                 不靠图片自己撑——图还没加载出来时列宽不能跳。 -->
+            <!-- 缩略图列：表头留空；宽度靠 th 上的 style 定，不靠图片自己撑（图没加载出来时列宽不能跳）。 -->
             <th style="width:52px"></th>
             <th style="width:56px">ID</th>
             <th>标题</th>
@@ -98,16 +96,13 @@
     </div>
 
     <div class="notice" id="m-notice"></div>
-    <!-- 详情主图。★ 没有图时这里是空的、不占位置（不是一块灰），
-         因为弹窗是"看这一个商品"的地方，一块灰在这里只是噪声。 -->
+    <!-- 详情主图：没有图时留空、不占位置（弹窗里一块灰只是噪声）。 -->
     <div id="m-figure"></div>
     <div class="kv" id="m-kv"></div>
     <div class="chart" id="m-chart" style="height:300px"></div>
 
-    <!-- 「为这个商品配告警」的入口。
-         ★ 放这里而不是放列表行里：行本身就是"点开详情"的按钮，
-           在里面再塞一个按钮要处理冒泡，而且 20 行各一个按钮也很吵。
-           而"我正在看这个商品的详情"恰好是想给它配告警的那一刻。 -->
+    <!-- 配告警入口放详情里：行本身是"点开详情"的按钮，再塞一个按钮要处理冒泡；
+         而"正在看这个商品的详情"恰好是想给它配告警的那一刻。 -->
     <div class="modal-actions" id="m-actions"></div>
   </div>
 </div>
@@ -115,24 +110,14 @@
 <script src="static/js/api.js"></script>
 <script src="static/js/charts.js"></script>
 <script>
-/* ============================================================================
- * 商品列表页
- * ========================================================================== */
+/* 商品列表页 */
 
-// 页面状态。★ 集中放一个对象里，而不是散在几个全局变量：
-//   每次请求都要把「当前页 + 搜索词 + 排序」一起带上，
-//   散着放最容易出现"改了排序但翻页时用的还是旧排序"这类不同步的 bug。
+// 页面状态集中放一个对象：每次请求要同时带「当前页 + 搜索词 + 排序」，
+// 散着放最容易出现"改了排序但翻页时用的还是旧排序"这类不同步 bug。
 const state = { page: 1, size: 20, q: '', sort: 'last_crawled_at', order: 'desc' };
 
-/* 表格有几列，**从表头数出来**，不写死。
- *
- * ★ 空态和错误态那两行是 `colspan="N"`，N 写错的话：
- *     写小了 → 内容不居中，看起来只是"有点歪"
- *     写大了 → 多出来的格子把表撑宽，整页出现横向滚动条
- *   两种都不报错。而"加一列"是这一页最容易发生、也最容易忘的改动
- *   （加缩略图这一列时就刚刚发生过一次）。
- *   数出来就没有这个类别的问题了。
- */
+/* 表格列数从表头数出来，不写死：colspan 写错（大/小）都不报错，
+   而"加一列"是这页最容易发生、也最容易忘的改动（加缩略图这一列时就发生过）。 */
 const COL_COUNT = document.querySelectorAll('thead th').length;
 
 async function renderSwitcher() {
@@ -149,9 +134,7 @@ async function renderSwitcher() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.setAttribute('aria-pressed', String(s.id === active));
-    // ★ 「全部」的计数怎么来，规则在 api.js 的 sourceCount 一处。
-    //   原本这里自己求和、另外两页写 counts['all']（恒 undefined），
-    //   于是「全部」按钮在不同页面上长得不一样。
+    // "全部"的计数规则只在 api.js 的 sourceCount 一处。
     const n = sourceCount(s.id, counts);
     btn.innerHTML = n === undefined
       ? s.label
@@ -168,21 +151,17 @@ async function renderSwitcher() {
 }
 
 function rowHtml(p) {
-  // ★ 销量为空时显示"—"而不是 0。
-  //   0 是"一件没卖出去"，"—"是"不知道"——两件完全不同的事，
-  //   而真实采集的数据永远是后者。
+  // 销量为空时显示"—"而不是 0：0 是"一件没卖出去"，"—"是"不知道"。
   const sales = p.sales === null ? '<span class="muted">—</span>' : fmtInt(p.sales);
 
-  // ★ 价格区间（券后 199-299 这种）在列表里也要能看出来。
-  //   只在真的存在区间时才显示第二个数字，单值时保持表格干净。
+  // 价格区间仅在真的存在两个值时显示第二个数字，单值时保持表格干净。
   const hasRange = p.price_max !== null && p.price_max !== p.price;
   const price = p.price === null
     ? '<span class="muted">—</span>'
     : fmtPrice(p.price) + (hasRange ? `<span class="muted"> ~${fmtPrice(p.price_max)}</span>` : '');
 
-  // ★ 没有图时给一块**空占位**，不给破图图标，也不给"暂无图片"四个字。
-  //   因为"没有图"在这个列表里是常态（Mock 一条图都没有），
-  //   而一个每行都出现的提示词，会盖过真正有图的那几行。
+  // 没有图时给空占位，不给破图图标也不给提示词：无图是常态（Mock 一条图都没有），
+  // 每行都出现的提示词会盖过真正有图的那几行。
   const thumb = p.image_url
     ? `<img class="thumb" src="${proxyImageUrl(p.image_url)}" alt="" loading="lazy"
             onerror="imgFallback(this)">`
@@ -202,29 +181,11 @@ function rowHtml(p) {
     </tr>`;
 }
 
-/* ★ escapeHtml / escapeAttr 已经搬到 static/js/api.js 了。
- *
- *   搬家的理由不是"整理文件"，而是：**charts.js 也需要它，但拿不到。**
- *   本页的表格可以用 textContent 逐个建节点，而 ECharts 的 tooltip
- *   formatter 只能返回字符串、由 echarts 内部赋给 innerHTML——
- *   那条路上页面的转义纪律覆盖不到，只能由喂进去的字符串自己负责。
- *   放在 api.js（三个页面都引）才不会出现第二份拷贝。
- */
+/* escapeHtml / escapeAttr 已搬到 static/js/api.js：ECharts 的 tooltip formatter
+   只能返回字符串、由 echarts 内部赋给 innerHTML，那条路需要它；放在 api.js（三个页面都引）才不会出现第二份拷贝。 */
 
-/* ★ 请求序号：只认**最后发出**的那一次的结果。
- *
- *   这一页有四个地方会调 load()（翻页、排序、每页条数、搜索），
- *   而它们全是异步的。连点两下「下一页」会发出两个请求，
- *   **哪个先回来是不确定的**——先发的完全可能后到。
- *
- *   没有这个序号时的表现：表格里是第 2 页的数据，
- *   而 `state.page` 已经是 3、「第 N / M 页」那行也写着 3。
- *   下一步再点「下一页」就跳过了第 3 页——**静默丢页**，
- *   而且因为页码看起来是连着的，根本不会想到是竞态。
- *
- *   后端的排序是确定的（见 app/api/stats.py 顶部第 2 条），
- *   所以这里只要把"该听谁的"定下来就够了。
- */
+/* 请求序号：只认最后发出那一次的响应。四个地方会调 load()（全是异步），
+   连点「下一页」时先发的可能后到——没有它会出现"表格是第 2 页、页码写着 3"的静默丢页。 */
 let _loadSeq = 0;
 
 async function load() {
@@ -235,18 +196,11 @@ async function load() {
       page: state.page, size: state.size, sort: state.sort, order: state.order, q: state.q,
     });
 
-    // 已经有更新的请求发出去了 → 这份结果过期，整个丢掉。
-    // ★ 必须连错误分支一起挡：否则一个失败的老请求会把
-    //   新请求刚画好的表格替换成一行报错。
+    // 已经有更新的请求发出 → 这份结果过期，整个丢掉（错误分支也必须挡）。
     if (seq !== _loadSeq) return;
 
-    // ★ 页码翻过头了就拉回来。
-    //   「下一页」按钮要等响应回来才会被禁用，而在等待的这段时间里
-    //   每一次点击都已经把 state.page 加过一了——连点几下就会跑到
-    //   数据的页数之外。后端**不夹页码**（见 app/api/products.py：
-    //   直接 offset((page-1)*size)，page 原样回显），于是返回 items: []，
-    //   界面显示"该数据源暂无商品"——可库里明明有 1100 条。
-    //   真实原因是"你翻过头了"，和"没有数据"是完全不同的两件事。
+    // 页码翻过头就拉回来：等待响应期间每次点击都会给 state.page 加一，
+    // 而后端不夹页码，于是返回 items: []，界面显示"暂无商品"——真实原因是"你翻过头了"。
     if (data.page > data.pages) {
       state.page = data.pages;
       // 这一次的结果由下面那个新请求接管（它的序号更新，会更靠后生效）
@@ -274,8 +228,7 @@ async function load() {
     showNotice('page-notice', data.total === 0 && !state.q
       ? '该数据源暂无商品。' : null);
   } catch (err) {
-    // ★ 过期请求的错误也要丢掉。不挡的话，一个失败的老请求
-    //   会把新请求刚画好的表格替换成一行报错——而且报的还是上一页的错。
+    // 过期请求的错误也要丢掉，否则会把新请求画好的表格替换成报错（报的还是上一页的错）。
     if (seq !== _loadSeq) return;
     console.error(err);
     tbody.innerHTML = `<tr><td colspan="${COL_COUNT}" style="text-align:center;padding:40px">
@@ -283,15 +236,12 @@ async function load() {
   }
 }
 
-/* ---------------------------------------------------------------------------
- * 详情弹窗
- * ------------------------------------------------------------------------ */
+/* 详情弹窗 */
 
 async function openDetail(id) {
   const modal = document.getElementById('modal');
-  // ★ 先显示弹窗再画图。反过来的话 ECharts 会在一个 display:none
-  //   的容器上初始化，量到的宽高是 0，图画不出来——而且不报错，
-  //   表现为"点开是一块空白"，非常难查。
+  // 先显示弹窗再画图：否则 ECharts 在 display:none 的容器上初始化、量到宽高为 0，
+  // 图画不出来而且不报错，表现为"点开是一块空白"。
   modal.classList.add('show');
 
   const chartEl = document.getElementById('m-chart');
@@ -312,8 +262,7 @@ async function openDetail(id) {
     const kv = [
       ['当前价', p.price === null ? '—' : fmtPrice(p.price)],
       ['价格区间上限', p.price_max === null ? '—' : fmtPrice(p.price_max)],
-      // ★ 历史极值来自 price_history 现算，不是 products.price_max。
-      //   两者含义不同：price_max 是"这一次成交的区间上限"。
+      // 历史极值来自 price_history 现算，与 products.price_max（本次成交的区间上限）含义不同。
       ['历史最低 / 最高',
         p.historical_min === null ? '—' : `${fmtPrice(p.historical_min)} / ${fmtPrice(p.historical_max)}`],
       ['品牌 / 分类', `${p.brand || '—'} / ${p.category || '—'}`],
@@ -327,26 +276,19 @@ async function openDetail(id) {
     document.getElementById('m-kv').innerHTML = kv.map(([k, v]) => `
       <div><div class="k">${k}</div><div>${escapeHtml(v)}</div></div>`).join('');
 
-    // ★ 详情接口返回的 notice 直接显示——它解释的是"为什么只有一个点"，
-    //   那正是"事件归并"这条叙事的关键一环，不能让它看起来像 bug。
+    // 详情接口的 notice 解释"为什么只有一个点"，是"事件归并"叙事的关键一环。
     showNotice('m-notice', hist.notice, hist.notice ? 'info' : 'warn');
 
     renderPriceHistory('m-chart', hist);
 
-    /* 主图。
-     * ★ 走代理而不是直接 <img src="https://y.zdmimg.com/...">，理由见
-     *   app/api/images.py 顶部（防盗链 / 不把访客 IP 送给图床 / 一处收口）。
-     * ★ 用 createElement 而不是拼 innerHTML：这样能挂 onerror。
-     *   失败就**整个撤掉**，不留破图——详情弹窗里一个破图图标
-     *   比没有图难看得多，而失败是会发生的（断网、图床挂了、超过大小上限）。
-     */
+    /* 主图走代理（防盗链 / 不把访客 IP 送给图床 / 一处收口，见 app/api/images.py）；
+       用 createElement 而非 innerHTML 是为了挂 onerror，失败就整个撤掉、不留破图。 */
     const figure = document.getElementById('m-figure');
     figure.innerHTML = '';
     if (p.image_url) {
       const img = document.createElement('img');
       img.src = proxyImageUrl(p.image_url);
-      // ★ 详情页的主图是**内容**，不是装饰，所以 alt 必须写标题。
-      //   列表里的缩略图可以 alt=""（标题就在旁边），这里不行。
+      // 详情主图是内容不是装饰，alt 必须写标题（列表缩略图可 alt=""）。
       img.alt = p.title;
       img.onerror = () => { figure.innerHTML = ''; };
       figure.appendChild(img);
@@ -356,9 +298,8 @@ async function openDetail(id) {
     const actions = document.getElementById('m-actions');
     actions.innerHTML = '';
 
-    // 带商品 id 跳到告警页。★ 用 URL 参数而不是 localStorage：
-    //   这是"我要给这一个商品配告警"的一次性上下文，
-    //   像数据源那样长期记住它反而会让下次进来时莫名其妙地预选一个商品。
+    // 用 URL 参数而不是 localStorage：这是一次性上下文；像数据源那样长期记住它，
+    // 会让下次进来时莫名其妙地预选一个商品。
     const alertLink = document.createElement('a');
     alertLink.className = 'btn primary';
     alertLink.href = 'alerts.html?product_id=' + encodeURIComponent(id);
@@ -366,11 +307,8 @@ async function openDetail(id) {
     actions.appendChild(alertLink);
 
     // 回源站看原帖。
-    // ★ rel="noopener" 不能省：不带它的话，被打开的那个页面可以
-    //   通过 window.opener 把我们这一页导航走（反向 tabnabbing）——
-    //   而这里打开的恰好是一个**外部站点**。
-    //   noreferrer 是顺手：既然这个项目在意"不把访客信息送给第三方"，
-    //   那就别在这里漏一个 Referer 出去。
+    // rel="noopener" 不能省：这里打开的恰好是一个**外部站点**，不带它对方可经
+    // window.opener 把本页导航走（反向 tabnabbing）；noreferrer 顺手不漏 Referer。
     if (p.url) {
       const srcLink = document.createElement('a');
       srcLink.className = 'btn';
@@ -392,13 +330,10 @@ function closeDetail() {
   document.getElementById('modal').classList.remove('show');
 }
 
-/* ---------------------------------------------------------------------------
- * 事件绑定
- * ------------------------------------------------------------------------ */
+/* 事件绑定 */
 
 document.getElementById('m-close').onclick = closeDetail;
-// 点背景关闭。★ 必须判断 e.target 就是背景本身，
-//   否则点弹窗内部任何地方都会把弹窗关掉。
+// 点背景关闭：必须判断 e.target 就是背景本身，否则点弹窗内部任何地方都会关掉。
 document.getElementById('modal').onclick = (e) => {
   if (e.target.id === 'modal') closeDetail();
 };
@@ -415,14 +350,8 @@ document.getElementById('order').onchange = (e) => {
   state.order = e.target.value; state.page = 1; load();
 };
 
-/* 搜索防抖。
- *
- * ★ 不防抖的话，输入"充电宝"三个字会发三次请求，
- *   而且三次的响应**可能乱序返回**——最后显示的是哪一次的结果
- *   取决于网络快慢，于是搜索结果看起来是随机的。
- *   300ms 是打字停顿的常见经验值：比它短会在连续输入时误触发，
- *   比它长会有明显的卡顿感。
- */
+/* 搜索防抖：不防抖的话，"充电宝"三个字会发三次请求且响应可能乱序返回，
+   结果看起来是随机的；300ms 是打字停顿的常见经验值。 */
 let searchTimer = null;
 document.getElementById('q').oninput = (e) => {
   clearTimeout(searchTimer);
